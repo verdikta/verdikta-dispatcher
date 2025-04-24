@@ -1,0 +1,22 @@
+Install project dependencies:
+npm install
+
+Start a Base Sepolia fork in another terminal:
+export NODE_NO_WARNINGS=1
+INFURA_KEY=${INFURA_API_KEY}
+npx hardhat node --fork https://base-sepolia.infura.io/v3/$INFURA_KEY --chain-id 84532
+
+The forked node listens on http://127.0.0.1:8545 with 20 funded accounts.
+
+Deploy contracts to the fork (optional):
+npx hardhat deploy --network development
+
+This runs the deploy scripts in deploy/ in order:
+01_aggregator.js → 02_keeper.js → 03_config.js
+
+Run the test suite against the fork:
+export NODE_NO_WARNINGS=1
+npx hardhat test --network development
+
+Run the test scripts:
+./test.sh
