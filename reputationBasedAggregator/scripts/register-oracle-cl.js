@@ -1,16 +1,15 @@
 #!/usr/bin/env node
 /*
-  scripts/register-oracle-cl.js  – Hardhat version
+  scripts/register-oracle-cl.js – Hardhat + ethers
 
-  Registers one or more job IDs for a given oracle address. All contract
-  addresses are supplied via CLI flags (same UX as the original Truffle
-  script).  Uses minimal ABIs and Hardhat's ethers provider.
+  Register one or more job IDs for a given oracle, using flags identical to
+  the original Truffle script.
 
-  Example – two job IDs, two capability classes:
+  Example:
     npx hardhat run scripts/register-oracle-cl.js --network base_sepolia \
-      --aggregator     0x59067815e006e245449E1A24a1091dF176b3CF09 \
-      --link           0xE4aB69C077896252FAFBD49EFD26B5D171A32410 \
-      --oracle         0xD67D6508D4E5611cd6a463Dd0969Fa153Be91101 \
+      --aggregator      0x59067815e006e245449E1A24a1091dF176b3CF09 \
+      --link            0xE4aB69C077896252FAFBD49EFD26B5D171A32410 \
+      --oracle          0xD67D6508D4E5611cd6a463Dd0969Fa153Be91101 \
       --wrappedverdikta 0x6bF578606493b03026473F838bCD3e3b5bBa5515 \
       --jobids "38f19572c51041baa5f2dea284614590" "39515f75ac2947beb7f2eeae4d8eaf3e" \
       --classes 128 129
@@ -22,141 +21,108 @@ const { ethers } = hre;
 const yargs = require("yargs/yargs");
 const { hideBin } = require("yargs/helpers");
 
-/* ------------------------------------------------------------------------- */
-/* Minimal ABIs                                                              */
-/* ------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------- */
+/* Minimal ABIs                                                        */
+/* ------------------------------------------------------------------- */
 const AggregatorABI = [
-  { inputs: [], name: "reputationKeeper", outputs: [{ type: "address" }], stateMutability: "view", type: "function" },
-  { inputs: [], name: "getContractConfig", outputs: [
-      { name: "oracleAddr", type: "address" },
-      { name: "linkAddr",   type: "address" },
-      { name: "jobId",      type: "bytes32"  },
-      { name: "fee",        type: "uint256"  }
-    ], stateMutability: "view", type: "function" }
+  "function reputationKeeper() view returns (address)",
+  "function getContractConfig() view returns (address oracleAddr,address linkAddr,bytes32 jobId,uint256 fee)"
 ];
 
-const ReputationKeeperABI = [
-  { inputs: [
-      { name: "_oracle",   type: "address"  },
-      { name: "_jobId",    type: "bytes32"  },
-      { name: "fee",       type: "uint256"  },
-      { name: "_classes",  type: "uint64[]" }
-    ], name: "registerOracle", outputs: [], stateMutability: "nonpayable", type: "function" },
-  { inputs: [ { name: "_oracle", type: "address" }, { name: "_jobId", type: "bytes32" } ],
-    name: "getOracleInfo", outputs: [
-      { name: "isActive",        type: "bool"    },
-      { name: "qualityScore",    type: "int256"  },
-      { name: "timelinessScore", type: "int256"  },
-      { name: "callCount",       type: "uint256" },
-      { name: "jobId",           type: "bytes32" },
-      { name: "fee",             type: "uint256" },
-      { name: "stakeAmount",     type: "uint256" },
-      { name: "lockedUntil",     type: "uint256" },
-      { name: "blocked",         type: "bool"    }
-    ], stateMutability: "view", type: "function" }
+const KeeperABI = [
+  "function registerOracle(address,bytes32,uint256,uint64[])",
+  "function getOracleInfo(address,bytes32) view returns (bool isActive,int256,int256,uint256,bytes32,uint256,uint256,uint256,bool)"
 ];
 
-const ERC20ABI = [
-  { constant: true,  inputs: [ { name: "", type: "address" } ], name: "balanceOf", outputs: [ { type: "uint256" } ], stateMutability: "view", type: "function" },
-  { constant: true,  inputs: [ { name: "", type: "address" }, { name: "", type: "address" } ], name: "allowance", outputs: [ { type: "uint256" } ], stateMutability: "view", type: "function" },
-  { constant: false, inputs: [ { name: "spender", type: "address" }, { name: "amount", type: "uint256" } ], name: "approve", outputs: [ { type: "bool" } ], stateMutability: "nonpayable", type: "function" }
+const ERC20_ABI = [
+  "function balanceOf(address) view returns (uint256)",
+  "function allowance(address,address) view returns (uint256)",
+  "function approve(address,uint256) returns (bool)"
 ];
 
-/* ------------------------------------------------------------------------- */
-/* Helpers                                                                   */
-/* ------------------------------------------------------------------------- */
-const toBytes32 = (txt) => {
-  const bytes = ethers.toUtf8Bytes(txt);
-  if (bytes.length > 32) throw new Error(`Job ID string too long: ${txt}`);
-  return ethers.hexlify(bytes).padEnd(66, "0"); // 0x + 64 hex chars
+/* Helpers ------------------------------------------------------------ */
+const toBytes32 = (id) => {
+  if (/^0x[0-9a-f]{64}$/i.test(id)) return id;             // already bytes32
+  const bytes = ethers.toUtf8Bytes(id);
+  if (bytes.length > 32) throw new Error(`Job ID too long: ${id}`);
+  return ethers.hexlify(bytes).padEnd(66, "0");
 };
 
-/* ------------------------------------------------------------------------- */
-/* Main                                                                      */
-/* ------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------- */
+/* Main                                                                */
+/* ------------------------------------------------------------------- */
 (async () => {
   try {
+    /* Args ------------------------------------------------------------ */
     const argv = yargs(hideBin(process.argv))
-      .option("aggregator",     { alias: "a", type: "string", describe: "ReputationAggregator address", demandOption: true })
-      .option("link",           { alias: "l", type: "string", describe: "LINK token address",             demandOption: true })
-      .option("oracle",         { alias: "o", type: "string", describe: "Oracle contract address",         demandOption: true })
-      .option("wrappedverdikta",{ alias: "w", type: "string", describe: "WrappedVerdiktaToken address",    demandOption: true })
-      .option("jobids",         { alias: "j", type: "array",  describe: "Job ID strings",                 demandOption: true })
-      .option("classes",        { alias: "c", type: "array",  describe: "Capability classes",             demandOption: true })
+      .option("aggregator",      { alias: "a", type: "string", demandOption: true })
+      .option("link",            { alias: "l", type: "string", demandOption: true })
+      .option("oracle",          { alias: "o", type: "string", demandOption: true })
+      .option("wrappedverdikta", { alias: "w", type: "string", demandOption: true })
+      .option("jobids",          { alias: "j", type: "array",  demandOption: true })
+      .option("classes",         { alias: "c", type: "array",  demandOption: true })
       .strict()
       .argv;
 
-    /* ------------------------------------------------------------------- */
-    /* Setup signer & provider                                             */
-    /* ------------------------------------------------------------------- */
     const [signer] = await ethers.getSigners();
     const owner    = await signer.getAddress();
-    console.log("Using owner account:", owner);
+    console.log("Using owner:", owner);
 
-    /* ------------------------------------------------------------------- */
-    /* Contract instances                                                  */
-    /* ------------------------------------------------------------------- */
+    /* Contracts ------------------------------------------------------- */
     const provider   = ethers.provider;
     const aggregator = new ethers.Contract(argv.aggregator, AggregatorABI, provider);
+
     const keeperAddr = await aggregator.reputationKeeper();
     console.log("ReputationKeeper:", keeperAddr);
 
-    const keeper          = new ethers.Contract(keeperAddr, ReputationKeeperABI, signer);
-    const wrappedVerdikta = new ethers.Contract(argv.wrappedverdikta, ERC20ABI, signer);
-    const linkToken       = new ethers.Contract(argv.link,           ERC20ABI, signer);
+    const keeper     = new ethers.Contract(keeperAddr, KeeperABI, signer);
+    const verdikta   = new ethers.Contract(argv.wrappedverdikta, ERC20_ABI, signer);
+    const linkToken  = new ethers.Contract(argv.link,           ERC20_ABI, signer);
 
     const oracleAddr = argv.oracle;
     const classes    = argv.classes.map(Number);
 
-    /* ------------------------------------------------------------------- */
-    /* Constants (fee & stake)                                             */
-    /* ------------------------------------------------------------------- */
-    const linkFee  = ethers.parseUnits("0.05", 18);   // 0.05 LINK
-    const vdkaStake= ethers.parseUnits("100", 18);    // 100 wVDKA
+    /* Fees & stake ---------------------------------------------------- */
+    const LINK_FEE   = ethers.parseUnits("0.05", 18);  // 0.05 LINK
+    const VDKA_STAKE = ethers.parseUnits("100", 18);   // 100 wVDKA
+    const totalStake = VDKA_STAKE * BigInt(argv.jobids.length);
 
-    /* ------------------------------------------------------------------- */
-    /* Ensure wVDKA allowance                                              */
-    /* ------------------------------------------------------------------- */
-    const vdkaBal = await wrappedVerdikta.balanceOf(owner);
-    if (vdkaBal < vdkaStake) throw new Error("Insufficient wVDKA balance for staking");
+    /* wVDKA allowance (one approval covers every job) ----------------- */
+    const bal = await verdikta.balanceOf(owner);
+    if (bal < totalStake) throw new Error("Insufficient wVDKA");
 
-    let vdkaAllowance = await wrappedVerdikta.allowance(owner, keeperAddr);
-    if (vdkaAllowance < vdkaStake) {
-      console.log("Approving keeper to spend wVDKA…");
-      const tx = await wrappedVerdikta.approve(keeperAddr, vdkaStake);
-      await tx.wait();
+    let allow = await verdikta.allowance(owner, keeperAddr);
+    if (allow < totalStake) {
+      console.log(`Approving ${ethers.formatEther(totalStake)} wVDKA…`);
+      await (await verdikta.approve(keeperAddr, totalStake)).wait();
     }
 
-    /* ------------------------------------------------------------------- */
-    /* Iterate over job IDs                                                */
-    /* ------------------------------------------------------------------- */
-    for (const jobStr of argv.jobids) {
-      const jobId = toBytes32(jobStr);
-      console.log(`\nProcessing jobID ${jobStr} → ${jobId}`);
+    /* Register each job ID ------------------------------------------- */
+    for (const raw of argv.jobids) {
+      const jobId = toBytes32(raw);
+      console.log(`\nJobID ${raw} → ${jobId}`);
 
       const info = await keeper.getOracleInfo(oracleAddr, jobId);
       if (info.isActive) {
-        console.log("Already registered – skipping registerOracle, ensuring LINK approval");
-      } else {
-        console.log("Calling registerOracle…");
-        const tx = await keeper.registerOracle(oracleAddr, jobId, linkFee, classes);
-        await tx.wait();
-        console.log("Oracle registered.");
+        console.log("Already registered – skipping");
+        continue;
       }
+
+      console.log("Calling registerOracle…");
+      await (
+        await keeper.registerOracle(oracleAddr, jobId, LINK_FEE, classes)
+      ).wait();
+      console.log("✓ Registered");
     }
 
-    /* ------------------------------------------------------------------- */
-    /* Ensure LINK approval for aggregator                                 */
-    /* ------------------------------------------------------------------- */
-    const cfg = await aggregator.getContractConfig();
-    const linkAllowance = await linkToken.allowance(owner, argv.aggregator);
-    if (linkAllowance < linkFee) {
+    /* LINK allowance for aggregator ---------------------------------- */
+    const linkAllow = await linkToken.allowance(owner, argv.aggregator);
+    if (linkAllow < LINK_FEE) {
       console.log("Approving LINK for aggregator…");
-      const tx = await linkToken.approve(argv.aggregator, linkFee);
-      await tx.wait();
+      await (await linkToken.approve(argv.aggregator, LINK_FEE)).wait();
     }
 
-    console.log("\nSetup completed successfully");
+    console.log("\nAll done.");
     process.exit(0);
   } catch (err) {
     console.error("Error during oracle registration:", err);
