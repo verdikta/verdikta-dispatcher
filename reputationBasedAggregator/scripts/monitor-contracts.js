@@ -1,110 +1,122 @@
 #!/usr/bin/env node
 /*
-  scripts/monitor-contracts.js  – Hardhat version
-
-  Reads the **deployed addresses** of WrappedVerdiktaToken, ReputationKeeper and
-  ReputationAggregator from *hardhat‑deploy* artifacts and prints their on‑chain
-  status. No CLI flags needed – it mirrors the original Truffle `.deployed()`
-  behaviour.
-
+  scripts/monitor-contracts.js – Hardhat + ethers
   Usage:
+    npx hardhat run scripts/monitor-contracts.js --network development
     npx hardhat run scripts/monitor-contracts.js --network base_sepolia
-
-  Prerequisite: your deployment was performed with hardhat‑deploy, which writes
-  JSON files under `deployments/<network>/`. Those JSON files supply the
-  address + ABI for each contract.
 */
 
 require("dotenv").config();
-import("hardhat").then(async (hre) => {
-  const { ethers, deployments, network } = hre;
+const hre = require("hardhat");
+const { ethers, deployments } = hre;
 
+(async () => {
   try {
     console.log("Starting contract monitoring…\n");
 
-    /* ------------------------------------------------------------------- */
-    /* Attach to deployed contracts via hardhat‑deploy                      */
-    /* ------------------------------------------------------------------- */
-    const verdiktaInfo  = await deployments.get("WrappedVerdiktaToken");
-    const keeperInfo    = await deployments.get("ReputationKeeper");
-    const aggregatorInfo= await deployments.get("ReputationAggregator");
+    /* Provider & signer */
+    const provider = ethers.provider;
+    const accts    = await ethers.getSigners();
+    const signer   = accts.length ? accts[0] : provider;    // read-only fallback
 
-    const provider   = ethers.provider;
-    const verdikta   = new ethers.Contract(verdiktaInfo.address, verdiktaInfo.abi, provider);
-    const keeper     = new ethers.Contract(keeperInfo.address,   keeperInfo.abi,   provider);
-    const aggregator = new ethers.Contract(aggregatorInfo.address, aggregatorInfo.abi, provider);
+    /* Load deployment artifacts */
+    const keeperInfo     = await deployments.get("ReputationKeeper");
+    const aggregatorInfo = await deployments.get("ReputationAggregator");
 
-    /* ------------------------------------------------------------------- */
-    /* Network info                                                        */
-    /* ------------------------------------------------------------------- */
-    console.log("\n=== Deployment Information ===");
+    /* WrappedVerdiktaToken (deployment or env fallback) */
+    let verdiktaAddr, verdiktaAbi;
+    try {
+      const info = await deployments.get("WrappedVerdiktaToken");
+      verdiktaAddr = info.address;
+      verdiktaAbi  = info.abi;
+    } catch {
+      verdiktaAddr = process.env.WRAPPED_VERDIKTA_TOKEN;
+      if (!verdiktaAddr)
+        throw new Error("Token not deployed and WRAPPED_VERDIKTA_TOKEN env var missing");
+      verdiktaAbi = [
+        "function name() view returns (string)",
+        "function symbol() view returns (string)",
+        "function totalSupply() view returns (uint256)",
+        "function balanceOf(address) view returns (uint256)",
+      ];
+    }
+
+    /* Contract instances */
+    const verdikta   = new ethers.Contract(verdiktaAddr, verdiktaAbi, signer);
+    const keeper     = new ethers.Contract(keeperInfo.address,     keeperInfo.abi,     signer);
+    const aggregator = new ethers.Contract(aggregatorInfo.address, aggregatorInfo.abi, signer);
+
+    /* Network info */
     const net = await provider.getNetwork();
+    console.log("=== Deployment Information ===");
     console.log(`Network: ${net.name ?? "unknown"} (ID: ${net.chainId})`);
 
-    /* ------------------------------------------------------------------- */
-    /* WrappedVerdiktaToken                                                */
-    /* ------------------------------------------------------------------- */
-    console.log("\n=== WrappedVerdiktaToken Information ===");
-    const [tokenName, tokenSymbol, totalSupply] = await Promise.all([
+    /* WrappedVerdiktaToken */
+    console.log("\n=== WrappedVerdiktaToken ===");
+    const [tName, tSymbol, tSupply] = await Promise.all([
       verdikta.name(),
       verdikta.symbol(),
       verdikta.totalSupply(),
     ]);
-    console.log(`Address: ${verdikta.target}`);
-    console.log(`Name:    ${tokenName}`);
-    console.log(`Symbol:  ${tokenSymbol}`);
-    console.log(`Supply:  ${ethers.formatEther(totalSupply)} tokens`);
+    console.log(`Address: ${verdiktaAddr}`);
+    console.log(`Name:    ${tName}`);
+    console.log(`Symbol:  ${tSymbol}`);
+    console.log(`Supply:  ${ethers.formatEther(tSupply)} tokens`);
 
-    /* ------------------------------------------------------------------- */
-    /* ReputationKeeper                                                    */
-    /* ------------------------------------------------------------------- */
-    console.log("\n=== ReputationKeeper Information ===");
-    const [keeperBalance, keeperOwner] = await Promise.all([
+    /* ReputationKeeper */
+    console.log("\n=== ReputationKeeper ===");
+    const [kBalance, kOwner] = await Promise.all([
       provider.getBalance(keeper.target),
       keeper.owner(),
     ]);
-    console.log(`Address:  ${keeper.target}`);
-    console.log(`Owner:    ${keeperOwner}`);
-    console.log(`Balance:  ${ethers.formatEther(keeperBalance)} ETH`);
+    console.log(`Address: ${keeper.target}`);
+    console.log(`Owner:   ${kOwner}`);
+    console.log(`Balance: ${ethers.formatEther(kBalance)} ETH`);
 
-    /* ------------------------------------------------------------------- */
-    /* Registered oracles                                                  */
-    /* ------------------------------------------------------------------- */
-    console.log("\n=== Registered Oracles Information ===");
-    const events = await keeper.queryFilter(keeper.filters.OracleRegistered(), 0, "latest");
-    const seen = new Map();
-    for (const evt of events) {
-      const { oracle, jobId, fee } = evt.args;
-      const key = `${oracle}-${jobId}`;
-      if (!seen.has(key)) seen.set(key, { oracle, jobId, fee });
-    }
-    if (seen.size === 0) {
-      console.log("No registered oracles found");
+    /* Registered oracles */
+    console.log("\n=== Registered Oracles ===");
+    const regEvents = await keeper.queryFilter(
+      keeper.filters.OracleRegistered(),
+      0,
+      "latest"
+    );
+    const unique = new Map();
+    regEvents.forEach((e) => {
+      const { oracle, jobId } = e.args;
+      unique.set(`${oracle}-${jobId}`, { oracle, jobId });
+    });
+
+    if (!unique.size) {
+      console.log("No registered oracles.");
     } else {
       let active = 0;
-      for (const { oracle, jobId } of seen.values()) {
+      for (const { oracle, jobId } of unique.values()) {
         const info = await keeper.getOracleInfo(oracle, jobId);
         if (info.isActive) {
           console.log(`\nOracle: ${oracle}`);
-          console.log(`Job ID: ${jobId}`);
-          console.log(`Quality/Timeliness: ${info.qualityScore}/${info.timelinessScore}`);
+          console.log(`JobID:  ${jobId}`);
+          console.log(`Scores: ${info.qualityScore}/${info.timelinessScore}`);
           try {
             const classes = await keeper.getOracleClassesByKey(oracle, jobId);
             console.log(`Classes: ${classes}`);
-          } catch (_) {
-            console.log("Classes: n/a");
-          }
+          } catch {}
           active++;
         }
       }
-      if (active === 0) console.log("None of the registered oracles are active.");
+      if (!active) console.log("None of the registered oracles are active.");
     }
 
-    /* ------------------------------------------------------------------- */
-    /* ReputationAggregator                                                */
-    /* ------------------------------------------------------------------- */
-    console.log("\n=== ReputationAggregator Information ===");
-    const [aggBalance, aggOwner, oraclesToPoll, requiredResponses, clusterSize, responseTimeout, maxOracleFee] = await Promise.all([
+    /* ReputationAggregator */
+    console.log("\n=== ReputationAggregator ===");
+    const [
+      aggBal,
+      aggOwner,
+      poll,
+      resp,
+      cluster,
+      timeout,
+      maxFee,
+    ] = await Promise.all([
       provider.getBalance(aggregator.target),
       aggregator.owner(),
       aggregator.oraclesToPoll(),
@@ -113,37 +125,41 @@ import("hardhat").then(async (hre) => {
       aggregator.responseTimeoutSeconds(),
       aggregator.maxOracleFee(),
     ]);
-    let linkAddr = "(none)";
+
+    let linkAddr = "(n/a)";
     try {
       linkAddr = (await aggregator.getContractConfig()).linkAddr;
-    } catch (_) {/* may revert */}
+    } catch {}
 
     console.log(`Address:             ${aggregator.target}`);
     console.log(`Owner:               ${aggOwner}`);
-    console.log(`Oracles to Poll:     ${oraclesToPoll}`);
-    console.log(`Required Responses:  ${requiredResponses}`);
-    console.log(`Cluster Size:        ${clusterSize}`);
-    console.log(`Response Timeout:    ${responseTimeout} seconds`);
-    console.log(`Max Oracle Fee:      ${ethers.formatEther(maxOracleFee)} LINK`);
-    console.log(`LINK Token (if any): ${linkAddr}`);
-    console.log(`Aggregator Balance:  ${ethers.formatEther(aggBalance)} ETH`);
+    console.log(`Oracles to Poll:     ${poll}`);
+    console.log(`Required Responses:  ${resp}`);
+    console.log(`Cluster Size:        ${cluster}`);
+    console.log(`Response Timeout:    ${timeout} seconds`);
+    console.log(`Max Oracle Fee:      ${ethers.formatEther(maxFee)} LINK`);
+    console.log(`LINK Token:          ${linkAddr}`);
+    console.log(`Aggregator Balance:  ${ethers.formatEther(aggBal)} ETH`);
 
-    /* recent events */
+    /* Recent events (last 1000 blocks) */
     const head = await provider.getBlockNumber();
-    const recent = await aggregator.queryFilter({}, Math.max(0, head - 1000), head);
+    const recent = await aggregator.queryFilter(
+      "*",
+      Math.max(0, head - 1000),
+      head
+    );
     console.log("\nRecent Aggregator Events:");
-    if (!recent.length) {
-      console.log("(none in last 1,000 blocks)");
-    } else {
-      recent.forEach((evt) => {
-        console.log(`\nEvent: ${evt.event ?? "(anonymous)"}`);
-        console.log("Args:", evt.args);
-        console.log(`Block: ${evt.blockNumber}  Tx: ${evt.transactionHash}`);
-      });
-    }
+    if (!recent.length) console.log("(none)");
+    recent.forEach((evt) => {
+      console.log(`\nEvent: ${evt.event ?? "(anonymous)"}`);
+      console.log("Args:", evt.args);
+      console.log(`Block: ${evt.blockNumber}  Tx: ${evt.transactionHash}`);
+    });
 
-    const gasPrice = await provider.getGasPrice();
-    console.log(`\nCurrent Gas Price: ${ethers.formatUnits(gasPrice, "gwei")} gwei`);
+    const gas = await provider.getGasPrice();
+    console.log(
+      `\nCurrent Gas Price: ${ethers.formatUnits(gas, "gwei")} gwei`
+    );
 
     console.log("\nMonitoring completed successfully");
     process.exit(0);
@@ -151,5 +167,5 @@ import("hardhat").then(async (hre) => {
     console.error("Error during monitoring:", err);
     process.exit(1);
   }
-});
+})();
 
