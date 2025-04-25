@@ -1,2 +1,2 @@
-npx hardhat run scripts/register-oracle-base.js --network base_sepolia
+npx hardhat run scripts/register-oracle.js --network base_sepolia
 
