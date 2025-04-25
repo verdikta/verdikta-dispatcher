@@ -14,16 +14,16 @@ const { ethers, deployments } = hre;
   try {
     console.log("Starting contract monitoring…\n");
 
-    /* Provider & signer */
+    /* Provider & signer ------------------------------------------------- */
     const provider = ethers.provider;
     const accts    = await ethers.getSigners();
-    const signer   = accts.length ? accts[0] : provider;    // read-only fallback
+    const signer   = accts.length ? accts[0] : provider;   // read-only fallback
 
-    /* Load deployment artifacts */
+    /* Load deployment artifacts ---------------------------------------- */
     const keeperInfo     = await deployments.get("ReputationKeeper");
     const aggregatorInfo = await deployments.get("ReputationAggregator");
 
-    /* WrappedVerdiktaToken (deployment or env fallback) */
+    /* WrappedVerdiktaToken (deployment or env fallback) ---------------- */
     let verdiktaAddr, verdiktaAbi;
     try {
       const info = await deployments.get("WrappedVerdiktaToken");
@@ -41,17 +41,17 @@ const { ethers, deployments } = hre;
       ];
     }
 
-    /* Contract instances */
+    /* Contract instances ----------------------------------------------- */
     const verdikta   = new ethers.Contract(verdiktaAddr, verdiktaAbi, signer);
     const keeper     = new ethers.Contract(keeperInfo.address,     keeperInfo.abi,     signer);
     const aggregator = new ethers.Contract(aggregatorInfo.address, aggregatorInfo.abi, signer);
 
-    /* Network info */
+    /* Network info ------------------------------------------------------ */
     const net = await provider.getNetwork();
     console.log("=== Deployment Information ===");
     console.log(`Network: ${net.name ?? "unknown"} (ID: ${net.chainId})`);
 
-    /* WrappedVerdiktaToken */
+    /* WrappedVerdiktaToken --------------------------------------------- */
     console.log("\n=== WrappedVerdiktaToken ===");
     const [tName, tSymbol, tSupply] = await Promise.all([
       verdikta.name(),
@@ -63,7 +63,7 @@ const { ethers, deployments } = hre;
     console.log(`Symbol:  ${tSymbol}`);
     console.log(`Supply:  ${ethers.formatEther(tSupply)} tokens`);
 
-    /* ReputationKeeper */
+    /* ReputationKeeper -------------------------------------------------- */
     console.log("\n=== ReputationKeeper ===");
     const [kBalance, kOwner] = await Promise.all([
       provider.getBalance(keeper.target),
@@ -73,7 +73,7 @@ const { ethers, deployments } = hre;
     console.log(`Owner:   ${kOwner}`);
     console.log(`Balance: ${ethers.formatEther(kBalance)} ETH`);
 
-    /* Registered oracles */
+    /* Registered oracles ----------------------------------------------- */
     console.log("\n=== Registered Oracles ===");
     const regEvents = await keeper.queryFilter(
       keeper.filters.OracleRegistered(),
@@ -106,7 +106,7 @@ const { ethers, deployments } = hre;
       if (!active) console.log("None of the registered oracles are active.");
     }
 
-    /* ReputationAggregator */
+    /* ReputationAggregator --------------------------------------------- */
     console.log("\n=== ReputationAggregator ===");
     const [
       aggBal,
@@ -141,13 +141,9 @@ const { ethers, deployments } = hre;
     console.log(`LINK Token:          ${linkAddr}`);
     console.log(`Aggregator Balance:  ${ethers.formatEther(aggBal)} ETH`);
 
-    /* Recent events (last 1000 blocks) */
-    const head = await provider.getBlockNumber();
-    const recent = await aggregator.queryFilter(
-      "*",
-      Math.max(0, head - 1000),
-      head
-    );
+    /* Recent events (last 1000 blocks) --------------------------------- */
+    const head   = await provider.getBlockNumber();
+    const recent = await aggregator.queryFilter("*", Math.max(0, head - 1000), head);
     console.log("\nRecent Aggregator Events:");
     if (!recent.length) console.log("(none)");
     recent.forEach((evt) => {
@@ -156,10 +152,13 @@ const { ethers, deployments } = hre;
       console.log(`Block: ${evt.blockNumber}  Tx: ${evt.transactionHash}`);
     });
 
-    const gas = await provider.getGasPrice();
-    console.log(
-      `\nCurrent Gas Price: ${ethers.formatUnits(gas, "gwei")} gwei`
-    );
+    /* Gas price --------------------------------------------------------- */
+    const fee = await provider.getFeeData();          // ethers v6
+    if (fee.gasPrice) {
+      console.log(`\nCurrent Gas Price: ${ethers.formatUnits(fee.gasPrice, "gwei")} gwei`);
+    } else {
+      console.log("\nCurrent Gas Price: (not provided by RPC)");
+    }
 
     console.log("\nMonitoring completed successfully");
     process.exit(0);
