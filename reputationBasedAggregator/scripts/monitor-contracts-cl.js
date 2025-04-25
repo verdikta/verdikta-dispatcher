@@ -4,8 +4,9 @@
 
   Example:
     npx hardhat run scripts/monitor-contracts-cl.js --network base_sepolia \
-      --wrappedverdikta 0x6bF578606493b03026473F838bCD3e3b5bBa5515 \
-      --aggregator      0x59067815e006e245449E1A24a1091dF176b3CF09
+      -- \
+      --wrappedverdikta 0x2F1d1aF9d5C25A48C29f56f57c7BAFFa7cc910a3 \
+      --aggregator      0x262f48f06DEf1FE49e0568dB4234a3478A191cFd
 */
 
 require("dotenv").config();
