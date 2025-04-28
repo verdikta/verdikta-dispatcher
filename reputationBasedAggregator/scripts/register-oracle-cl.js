@@ -6,13 +6,17 @@
   the original Truffle script.
 
   Example:
-    npx hardhat run scripts/register-oracle-cl.js --network base_sepolia \
-      --aggregator      0x59067815e006e245449E1A24a1091dF176b3CF09 \
-      --link            0xE4aB69C077896252FAFBD49EFD26B5D171A32410 \
-      --oracle          0xD67D6508D4E5611cd6a463Dd0969Fa153Be91101 \
-      --wrappedverdikta 0x6bF578606493b03026473F838bCD3e3b5bBa5515 \
-      --jobids "38f19572c51041baa5f2dea284614590" "39515f75ac2947beb7f2eeae4d8eaf3e" \
-      --classes 128 129
+
+HARDHAT_NETWORK=base_sepolia \
+node scripts/register-oracle-cl.js \
+  --aggregator      0x262f48f06DEf1FE49e0568dB4234a3478A191cFd \
+  --link            0xE4aB69C077896252FAFBD49EFD26B5D171A32410 \
+  --oracle          0xD67D6508D4E5611cd6a463Dd0969Fa153Be91101 \
+  --wrappedverdikta 0x2F1d1aF9d5C25A48C29f56f57c7BAFFa7cc910a3 \
+  --jobids          "38f19572c51041baa5f2dea284614590" "39515f75ac2947beb7f2eeae4d8eaf3e" \
+  --classes         128 129
+
+
 */
 
 require("dotenv").config();
