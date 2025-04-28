@@ -3,10 +3,12 @@
   scripts/monitor-contracts-cl.js – Hardhat + ethers (CLI version)
 
   Example:
-    npx hardhat run scripts/monitor-contracts-cl.js --network base_sepolia \
-      -- \
-      --wrappedverdikta 0x2F1d1aF9d5C25A48C29f56f57c7BAFFa7cc910a3 \
-      --aggregator      0x262f48f06DEf1FE49e0568dB4234a3478A191cFd
+
+HARDHAT_NETWORK=base_sepolia \
+node scripts/monitor-contracts-cl.js \
+  --wrappedverdikta 0x2F1d1aF9d5C25A48C29f56f57c7BAFFa7cc910a3 \
+  --aggregator      0x262f48f06DEf1FE49e0568dB4234a3478A191cFd
+
 */
 
 require("dotenv").config();
