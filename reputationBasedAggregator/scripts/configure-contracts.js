@@ -7,6 +7,11 @@
 //
 // Usage:
 //   npx hardhat run scripts/configure-contracts.js --network base_sepolia
+//
+// Not generally needed. Only needed in the following cases:
+// Updating parameters later – changing maxOracleFee or responseTimeout without redeploying.
+// Re-pointing the keepier to a new wVDKA token if you swap tokens.
+// Granting aggregator rights to a new keeper if you deploy the contracts separately.
 // ------------------------------------------------------------
 
 require("dotenv").config();
