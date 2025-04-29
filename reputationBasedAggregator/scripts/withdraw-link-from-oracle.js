@@ -6,10 +6,13 @@
   destination address you supply on the CLI.
 
   Example (Base Sepolia):
-    npx hardhat run scripts/withdraw-link-from-oracle.js --network base_sepolia \
-      --operator 0xD67D6508D4E5611cd6a463Dd0969Fa153Be91101 \
-      --deposit  0xFBDE840eb654E0f8B9F3e6c69C354B309A9ffE6b \
-      --link     0xE4aB69C077896252FAFBD49EFD26B5D171A32410
+
+HARDHAT_NETWORK=base_sepolia node scripts/withdraw-link-from-oracle.js \
+  --operator 0xD67D6508D4E5611cd6a463Dd0969Fa153Be91101 \
+  --deposit  0xFBDE840eb654E0f8B9F3e6c69C354B309A9ffE6b \
+  --link     0xE4aB69C077896252FAFBD49EFD26B5D171A32410
+
+
 */
 
 require("dotenv").config();

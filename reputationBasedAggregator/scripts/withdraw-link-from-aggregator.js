@@ -6,9 +6,12 @@
   destination address.
 
   Usage:
-    npx hardhat run scripts/withdraw-link-from-aggregator.js --network base_sepolia \
-      --aggregator 0xbabE69DdF8CBbe63fEDB6f49904efB35522667Af \
-      --deposit    0xYourDepositAddress
+
+HARDHAT_NETWORK=base_sepolia node scripts/withdraw-link-from-aggregator.js \
+  --aggregator 0xbabE69DdF8CBbe63fEDB6f49904efB35522667Af \
+  --deposit    0xYourDepositAddress
+
+
 */
 
 require("dotenv").config();
