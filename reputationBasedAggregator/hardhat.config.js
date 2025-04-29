@@ -1,14 +1,15 @@
 require("dotenv").config();
 const https = require("https");
-
-// Plugins
 require("@nomicfoundation/hardhat-toolbox");
 require("hardhat-deploy");
 
-// Re‑usable accounts array
+// ──────────────────────────────────────────────────────────────────────────
+// 1. Keep the Truffle variable names
+//    PRIVATE_KEY  → primary / owner / deployer
+//    PRIVATE_KEY_2→ secondary (optional)
+// ──────────────────────────────────────────────────────────────────────────
 const ACCOUNTS = [process.env.PRIVATE_KEY, process.env.PRIVATE_KEY_2].filter(Boolean);
 
-// Optional keep‑alive agent for Infura RPCs
 const keepAliveAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 60_000 });
 
 /** @type import('hardhat/config').HardhatUserConfig */
@@ -25,7 +26,7 @@ module.exports = {
   networks: {
     development: {
       url: "http://127.0.0.1:8545",
-      accounts: ACCOUNTS.slice(0, 1),
+      accounts: ACCOUNTS,          // signer[0] == PRIVATE_KEY
     },
 
     sepolia: {
@@ -49,6 +50,12 @@ module.exports = {
     },
   },
 
+  // hardhat-deploy “named accounts”
+  namedAccounts: {
+    deployer: 0,   // signer[0]  → PRIVATE_KEY   (operator/keeper owner)
+    owner:    0,   // optional friendly alias
+  },
+
   etherscan: {
     apiKey: {
       sepolia:      process.env.ETHERSCAN_API_KEY,
@@ -56,22 +63,16 @@ module.exports = {
     },
     customChains: [
       {
-        network: "base_sepolia",
-        chainId: 84532,
+        network:  "base_sepolia",
+        chainId:  84532,
         urls: {
-          apiURL: "https://api-sepolia.basescan.org/api",
+          apiURL:     "https://api-sepolia.basescan.org/api",
           browserURL: "https://sepolia.basescan.org",
         },
       },
     ],
   },
 
-  namedAccounts: {
-    deployer: 0,
-  },
-
-  mocha: {
-    timeout: 100_000,
-  },
+  mocha: { timeout: 100_000 },
 };
 
