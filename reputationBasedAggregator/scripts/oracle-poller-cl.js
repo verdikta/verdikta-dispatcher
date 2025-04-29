@@ -6,9 +6,9 @@
   keeper address is discovered via the supplied ReputationAggregator address.
 
   Usage:
-    npx hardhat run scripts/oracle-poller-cl.js \
-      --network base_sepolia \
-      --aggregator 0xYourAggregatorAddress
+
+HARDHAT_NETWORK=base_sepolia node scripts/oracle-poller-cl.js \
+  --aggregator 0x262f48f06DEf1FE49e0568dB4234a3478A191cFd
 
   Required flag:
     -a, --aggregator    ReputationAggregator contract address
