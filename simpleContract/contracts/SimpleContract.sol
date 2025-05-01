@@ -56,8 +56,8 @@ contract SimpleContract is ChainlinkClient {
      * @param _requiredClass The required oracle class.
      */
     constructor(address _oracle, bytes32 _jobId, uint256 _fee, address _link, uint64 _requiredClass) {
-        setChainlinkToken(_link);
-        setChainlinkOracle(_oracle);
+        _setChainlinkToken(_link);
+        _setChainlinkOracle(_oracle);
         oracle = _oracle;
         jobId = _jobId;
         fee = _fee;
@@ -103,12 +103,12 @@ contract SimpleContract is ChainlinkClient {
 
         // Pull exactly the fee amount from the caller.
         require(
-            LinkTokenInterface(chainlinkTokenAddress()).transferFrom(msg.sender, address(this), fee),
+            LinkTokenInterface(_chainlinkTokenAddress()).transferFrom(msg.sender, address(this), fee),
             "transferFrom for fee failed"
         );
 
         // Build the Chainlink request.
-        Chainlink.Request memory request = buildOperatorRequest(jobId, this.fulfill.selector);
+        Chainlink.Request memory request = _buildOperatorRequest(jobId, this.fulfill.selector);
 
         // Concatenate CIDs (comma delimited) and append the optional addendum.
         bytes memory concatenatedBytes;
@@ -120,10 +120,10 @@ contract SimpleContract is ChainlinkClient {
             cidsConcatenated = string(abi.encodePacked(cidsConcatenated, ":", addendumText));
         }
 
-        request.add("cid", cidsConcatenated);
+        request._add("cid", cidsConcatenated);
 
         // Send the request using the fee just pulled from the caller.
-        requestId = sendOperatorRequest(request, fee);
+        requestId = _sendOperatorRequest(request, fee);
         emit RequestAIEvaluation(requestId, cids);
     }
 
@@ -186,7 +186,7 @@ contract SimpleContract is ChainlinkClient {
         bytes32 jobid,
         uint256 currentFee
     ) {
-        return (oracle, chainlinkTokenAddress(), jobId, fee);
+        return (oracle, _chainlinkTokenAddress(), jobId, fee);
     }
 
     /**
