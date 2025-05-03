@@ -23,7 +23,8 @@ NET=${NET:-base_sepolia}   # override by exporting NET=<network>
 echo "=== Verdikta Deployment Script (Hardhat) ==="
 echo "Deploying keeper + aggregator + config to ${NET}..."
 
-npx hardhat deploy --network "${NET}" --tags keeper,aggregator,config
+# Use --reset to force redeployment even when compiled bytecode is the same
+npx hardhat deploy --network "${NET}" --tags keeper,aggregator,config --reset
 
 echo "✅  All deployments finished."
 
