@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.19;
 
 // import "https://raw.githubusercontent.com/smartcontractkit/chainlink/master/contracts/src/v0.8/operatorforwarder/Operator.sol";
 import "../lib/chainlink/src/v0.8/operatorforwarder/Operator.sol";
@@ -72,7 +72,8 @@ contract ArbiterOperator is Operator {
             gasleft()
         );
 
-        (success, bytes memory ret) = callbackAddress.call(
+        bytes memory ret;
+        (success, ret) = callbackAddress.call(
             abi.encodePacked(callbackFunctionId, data)
         ); // solhint-disable-line avoid-low-level-calls
 
