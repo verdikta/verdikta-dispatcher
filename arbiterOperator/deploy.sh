@@ -1,4 +1,1 @@
-npm run compile
-# npm test           
-npm run deploy:base
-
+npx hardhat run scripts/deploy.js --network base_sepolia

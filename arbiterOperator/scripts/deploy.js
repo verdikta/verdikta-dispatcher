@@ -1,29 +1,31 @@
-// scripts/deploy.js
-const hre = require("hardhat");
+const hre   = require("hardhat");
+const fs    = require("fs");
+const path  = require("path");
 
 async function main() {
-  // 1) Pick the right LINK token address for the network you pass on the CLI
-  const LINK = {
-    base_sepolia: "0x4200000000000000000000000000000000000006",
-    sepolia:      "0x779877A7B0D9E8603169DdbD7836e478b4624789",
-  }[hre.network.name];
+  const networkName = hre.network.name;   // e.g. "base_sepolia"
 
-  if (!LINK) throw new Error(`No LINK token address configured for ${hre.network.name}`);
+  // Read JSON once
+  const ADDRS = JSON.parse(
+    fs.readFileSync(path.join(__dirname, "..", "deployment-addresses.json"), "utf8")
+  )[networkName];
 
-  // 2) Show deployer address
+  if (!ADDRS || !ADDRS.linkTokenAddress) {
+    throw new Error(`No linkTokenAddress in deployment-addresses.json for ${networkName}`);
+  }
+  const LINK = ADDRS.linkTokenAddress;
+
   const [deployer] = await hre.ethers.getSigners();
-  console.log("Deploying from:", deployer.address);
+  console.log(`Deploying ArbiterOperator from ${deployer.address}`);
+  console.log(`Using LINK token:          ${LINK}`);
 
-  // 3) Deploy
   const ArbiterOperator = await hre.ethers.getContractFactory("ArbiterOperator");
   const op = await ArbiterOperator.deploy(LINK);
-  await op.waitForDeployment();                     // <-- v6
+  await op.waitForDeployment();
 
-  console.log("ArbiterOperator deployed to:", await op.getAddress()); // v6 getter
+  console.log("ArbiterOperator deployed to", await op.getAddress());
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exitCode = 1;
-});
+main().catch((err) => { console.error(err); process.exitCode = 1; });
+
 
