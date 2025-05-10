@@ -1,0 +1,26 @@
+{
+  "sepolia": {
+    "verdiktaTokenAddress": "0xbb7079F45367ce928789cc40d8C9D4E3A19b0a49",
+    "linkTokenAddress":      "0x779877A7B0D9E8603169DdbD7836e478b4624789"
+  },
+  "base_sepolia": {
+    "verdiktaTokenAddress":        "0xe46F6b494F111d958CDBB52536AD78c4eEeB0149",
+    "wrappedVerdiktaTokenAddress": "0x2F1d1aF9d5C25A48C29f56f57c7BAFFa7cc910a3",
+    "linkTokenAddress":            "0xE4aB69C077896252FAFBD49EFD26B5D171A32410"   
+  },
+  "base": {
+    "linkTokenAddress":            "0xd886e2286fd1073df82462ea1822119600af80b6"
+  },
+  "development": {
+    "verdiktaTokenAddress":        "0xF8288cb07307684E56EfbA012744a27bCaeC47C7",
+    "wrappedVerdiktaTokenAddress": "0x8621700980Cb1c4896cFE2b59228b63Aed44F08D",
+    "linkTokenAddress":            "0x0000000000000000000000000000000000000000"
+  },
+  "hardhat": {
+    "linkTokenAddress":            "0x0000000000000000000000000000000000000000"
+  },
+  "localhost": {
+    "linkTokenAddress":            "0x0000000000000000000000000000000000000000"
+  }
+}
+
