@@ -3,13 +3,13 @@ module.exports = async ({ getNamedAccounts, deployments }) => {
   const { deploy } = deployments;
   const { deployer } = await getNamedAccounts();
 
-  // pull from your JSON
-  const { keeper } = require("../deployment-addresses.json").base_sepolia;
-  const LINK = "0x..."; // LINK token on Base Sepolia
+  // pull keeper & LINK from your JSON
+  const { keeper, linkToken } =
+    require("../deployment-addresses.json").base_sepolia;
 
   const singleton = await deploy("ReputationSingleton", {
     from: deployer,
-    args: [ LINK, keeper ],
+    args: [ linkToken, keeper ],
     log: true,
   });
 
