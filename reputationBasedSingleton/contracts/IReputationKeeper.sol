@@ -36,5 +36,7 @@ interface IReputationKeeper {
             uint256 lockedUntil,
             bool blocked
         );
+
+    function approveContract(address contractAddress) external;
 }
 
