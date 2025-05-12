@@ -1,16 +1,42 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
-// import "https://raw.githubusercontent.com/smartcontractkit/chainlink/master/contracts/src/v0.8/operatorforwarder/Operator.sol";
+/* ────────────────────────────────────────────────────────────── */
+/*  Imports                                                      */
+/* ────────────────────────────────────────────────────────────── */
+
 import "../lib/chainlink/src/v0.8/operatorforwarder/Operator.sol";
+import "@openzeppelin/contracts/utils/introspection/ERC165.sol";
 
-contract ArbiterOperator is Operator {
-    /*──────────────────────  CONFIG  ──────────────────────*/
+/* ────────────────────────────────────────────────────────────── */
+/*  ERC-165 Interface that only ArbiterOperator implements        */
+/* ────────────────────────────────────────────────────────────── */
 
-    /// Matches Chainlink upstream default (node sends 500 000 gas)
+interface IArbiterOperator {
+    function fulfillOracleRequest3(
+        bytes32 requestId,
+        uint256 payment,
+        address callbackAddress,
+        bytes4  callbackFunctionId,
+        uint256 expiration,
+        bytes   calldata data
+    ) external returns (bool success);
+}
+
+/* ────────────────────────────────────────────────────────────── */
+/*  ArbiterOperator                                              */
+/* ────────────────────────────────────────────────────────────── */
+
+/// @notice Chainlink Operator variant that exposes `fulfillOracleRequest3`
+///         and advertises its interface via ERC-165 so that on-chain
+///         registries can verify the contract type.
+contract ArbiterOperator is Operator, ERC165, IArbiterOperator {
+    /*──────────────  CONFIG  ──────────────*/
+
+    /// Matches Chainlink upstream default (node sends 500 000 gas).
     uint256 private constant MY_MINIMUM_CONSUMER_GAS_LIMIT = 400_000;
 
-    /*──────────────────────  EVENTS  ───────────────────────*/
+    /*──────────────  EVENTS  ──────────────*/
 
     /// Emitted just before the external callback
     event OracleCallbackAttempt(
@@ -28,12 +54,28 @@ contract ArbiterOperator is Operator {
         uint256  gasAfter
     );
 
-    /*──────────────────────  CONSTRUCTOR  ─────────────────*/
+    /*────────────  CONSTRUCTOR  ───────────*/
 
     constructor(address linkToken) Operator(linkToken, msg.sender) {}
 
-    /*───────────────────  FULFILMENT v3  ───────────────────*/
+    /*────────────  ERC-165  ───────────────*/
 
+    /// @dev Advertise support for IArbiterOperator as well as any
+    ///      interfaces claimed by the parent contract(s).
+    function supportsInterface(bytes4 interfaceId)
+        public
+        view
+        override(ERC165)
+        returns (bool)
+    {
+        return
+            interfaceId == type(IArbiterOperator).interfaceId ||
+            super.supportsInterface(interfaceId);
+    }
+
+    /*──────── fulfillOracleRequest3 ───────*/
+
+    /// @inheritdoc IArbiterOperator
     function fulfillOracleRequest3(
         bytes32 requestId,
         uint256 payment,
@@ -55,7 +97,7 @@ contract ArbiterOperator is Operator {
             callbackAddress,
             callbackFunctionId,
             expiration,
-            2   // dataVersion
+            2 // dataVersion
         );
 
         emit OracleResponse(requestId);
