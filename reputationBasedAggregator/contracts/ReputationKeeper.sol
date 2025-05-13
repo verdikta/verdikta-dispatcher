@@ -4,6 +4,10 @@ pragma solidity ^0.8.21;
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
+///TODO import "@openzeppelin/contracts/utils/introspection/IERC165.sol";
+///TODO import "./IArbiterOperator.sol";   // same interface as above
+///TODO bytes4 private constant _ARBITER_IFACE = type(IArbiterOperator).interfaceId;
+
 /// @notice Minimal interface to query an oracle contract's owner.
 interface IOracleOwner {
     function owner() external view returns (address);
@@ -110,6 +114,8 @@ contract ReputationKeeper is Ownable {
         uint256 fee,
         uint64[] memory _classes
     ) external {
+        ///TODO require(IERC165(oracle).supportsInterface(_ARBITER_IFACE),
+        ///TODO    "Oracle must be ArbiterOperator");
         bytes32 key = _oracleKey(_oracle, _jobId);
         // Ensure the oracle is not already registered.
         require(oracles[key].stakeAmount == 0, "Oracle already registered");
