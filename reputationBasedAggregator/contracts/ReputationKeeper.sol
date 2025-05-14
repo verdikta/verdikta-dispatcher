@@ -4,6 +4,8 @@ pragma solidity ^0.8.21;
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
+/// *There are five TODO lines that should be commented out and tested next cycle.
+/// This code checks at registration that the contract is an ArtiberOperator.
 ///TODO import "@openzeppelin/contracts/utils/introspection/IERC165.sol";
 ///TODO import "./IArbiterOperator.sol";   // same interface as above
 ///TODO bytes4 private constant _ARBITER_IFACE = type(IArbiterOperator).interfaceId;
