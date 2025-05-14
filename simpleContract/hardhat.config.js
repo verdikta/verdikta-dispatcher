@@ -4,7 +4,6 @@ require("@nomicfoundation/hardhat-toolbox");
 require("hardhat-deploy");
 
 // ──────────────────────────────────────────────────────────────────────────
-// 1. Keep the Truffle variable names
 //    PRIVATE_KEY  → primary / owner / deployer
 //    PRIVATE_KEY_2→ secondary (optional)
 // ──────────────────────────────────────────────────────────────────────────
