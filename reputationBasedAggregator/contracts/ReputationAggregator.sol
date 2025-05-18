@@ -240,6 +240,9 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
             cidsConcatenated = string(abi.encodePacked(cidsConcatenated, ":", addendumText));
         }
 
+        // add explicit mode 0
+        cidsConcatenated = string(abi.encodePacked("0:", cidsConcatenated));
+
         bytes32 aggregatorRequestId = keccak256(
             abi.encodePacked(
                 block.timestamp,
