@@ -96,11 +96,11 @@ contract ReputationSingleton is ChainlinkClient, Ownable, ReentrancyGuard {
         for (uint256 i = 0; i < cids.length; i++) require(bytes(cids[i]).length <= MAX_CID_LENGTH, "CID long");
         require(bytes(addendumText).length <= MAX_ADDENDUM_LENGTH, "Addendum long");
 
-        // Build payload "cid1,cid2,...[:addendum]"
+        // Build payload "0:cid1,cid2,...[:addendum]"
         bytes memory buf;
         for (uint256 i = 0; i < cids.length; i++) buf = abi.encodePacked(buf, cids[i], i < cids.length - 1 ? "," : "");
         if (bytes(addendumText).length > 0) buf = abi.encodePacked(buf, ":", addendumText);
-        string memory payload = string(buf);
+        string memory payload = string(abi.encodePacked("0:", buf)); // mode 0
 
         requestId = _singletonRequest(payload, _alpha, _maxOracleFee, _estimatedBaseCost, _maxFeeBasedScalingFactor, _requestedClass);
         emit RequestAIEvaluation(requestId, cids);
