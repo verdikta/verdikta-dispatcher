@@ -1,14 +1,10 @@
+// hardhat.config.js
 require("dotenv").config();
 const https = require("https");
 require("@nomicfoundation/hardhat-toolbox");
 require("hardhat-deploy");
 
-// ──────────────────────────────────────────────────────────────────────────
-//    PRIVATE_KEY  → primary / owner / deployer
-//    PRIVATE_KEY_2→ secondary (optional)
-// ──────────────────────────────────────────────────────────────────────────
 const ACCOUNTS = [process.env.PRIVATE_KEY, process.env.PRIVATE_KEY_2].filter(Boolean);
-
 const keepAliveAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 60_000 });
 
 /** @type import('hardhat/config').HardhatUserConfig */
@@ -25,9 +21,8 @@ module.exports = {
   networks: {
     development: {
       url: "http://127.0.0.1:8545",
-      accounts: ACCOUNTS,          // signer[0] == PRIVATE_KEY
+      accounts: ACCOUNTS,
     },
-
     sepolia: {
       url: `https://sepolia.infura.io/v3/${process.env.INFURA_API_KEY}`,
       httpAgent: keepAliveAgent,
@@ -37,7 +32,6 @@ module.exports = {
       gasPrice: 10_000_000_000,
       accounts: ACCOUNTS,
     },
-
     base_sepolia: {
       url: `https://base-sepolia.infura.io/v3/${process.env.INFURA_API_KEY}`,
       httpAgent: keepAliveAgent,
@@ -49,10 +43,12 @@ module.exports = {
     },
   },
 
-  // hardhat-deploy “named accounts”
+  // Tell hardhat-deploy to *always* use ordinary CREATE (no CREATE2)
+  deterministicDeployment: false,          // <-- add this line
+
   namedAccounts: {
-    deployer: 0,   // signer[0]  → PRIVATE_KEY   (operator/keeper owner)
-    owner:    0,   // optional friendly alias
+    deployer: 0,
+    owner:    0,
   },
 
   etherscan: {
