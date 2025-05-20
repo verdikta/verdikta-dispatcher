@@ -77,6 +77,13 @@ event DebugRevealProcessing(
     string cleanCid,
     uint256 saltValue
 );
+event DebugHashComparison(
+    bytes32 requestId, 
+    bytes16 computedHash, 
+    bytes16 storedHash, 
+    bool isMatch
+);
+event HashMismatch(bytes32 requestId, bytes16 computedHash, bytes16 storedHash);
 
     // ----------------------------------------------------------------------
     //                               STRUCTS
@@ -333,8 +340,8 @@ emit DebugRequestIdMapping(_operatorRequestId, aggId, aggId != bytes32(0));
         if (!agg.commitPhaseComplete) {
             // ----------------------- COMMIT PHASE --------------------------
             // require(likelihoods.length == 1, "Commit must have 1 value");
-            bytes16 hash128 = bytes16(uint128(likelihoods[0]));
-            // bytes16 hash128 = bytes16(bytes32(uint256(likelihoods[0]) << 128));
+            // bytes16 hash128 = bytes16(uint128(likelihoods[0]));
+            bytes16 hash128 = bytes16(bytes32(uint256(likelihoods[0]) << 128));
             agg.commitHashPerSlot[slot] = hash128;
             agg.commitReceived += 1;
             emit DebugCommit(aggId, likelihoods[0], hash128);
@@ -384,10 +391,21 @@ emit DebugRevealProcessing(
 bytes16 recomputed = bytes16(
     sha256(abi.encode(likelihoods, saltUint))
 );
-//require(
-//    recomputed == agg.commitHashPerSlot[slot],
-//    "bad reveal / hash mismatch"
-//);
+
+emit DebugHashComparison(
+    _operatorRequestId, 
+    recomputed, 
+    agg.commitHashPerSlot[slot], 
+    recomputed == agg.commitHashPerSlot[slot]
+);
+
+require(
+     recomputed == agg.commitHashPerSlot[slot],
+     "Hash mismatch: reveal hash doesn't match commit hash"
+);
+// if (recomputed != agg.commitHashPerSlot[slot]) {
+//    emit HashMismatch(_operatorRequestId, recomputed, agg.commitHashPerSlot[slot]);
+// }
 
 
         bool selected = (agg.responses.length < agg.requiredResponses);
