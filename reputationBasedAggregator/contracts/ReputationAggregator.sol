@@ -8,17 +8,17 @@ import "./ReputationKeeper.sol";
 
 /**
  * @title ReputationAggregator commit-reveal edition (ASCII only)
- * @notice Two phase polling:
+ * @notice Two phase polling system for secure oracle aggregation:
  *         K = commitOraclesToPoll  - oracles polled in commit phase (Mode 1)
  *         M = oraclesToPoll        - first M commits promoted to reveal (Mode 2)
  *         N = requiredResponses    - first N reveals aggregated
  *         P = clusterSize          - size of best match cluster for bonus
  *
- *         Flow
+ *         Flow:
  *         1. requestAIEvaluationWithApproval sends Mode 1 requests to K oracles.
  *         2. When first M commitments arrive, the contract sends Mode 2
  *            requests (reveal) back to those M oracles.
- *         3. After N valid reveals responses are clustered and scored.
+ *         3. After N valid reveals, responses are clustered and scored.
  */
 contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     using Chainlink for Chainlink.Request;
@@ -26,21 +26,21 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     // ----------------------------------------------------------------------
     //                          CONFIGURATION STORAGE
     // ----------------------------------------------------------------------
-    uint256 public commitOraclesToPoll;   // K  – commit‑phase polls (new)
-    uint256 public oraclesToPoll;         // M  – reveals requested (was oraclesToPoll)
-    uint256 public requiredResponses;     // N
-    uint256 public clusterSize;           // P
+    uint256 public commitOraclesToPoll;     // K – commit‑phase polls
+    uint256 public oraclesToPoll;           // M – reveals requested
+    uint256 public requiredResponses;       // N
+    uint256 public clusterSize;             // P
     uint256 public responseTimeoutSeconds = 300; // default 5 min
-    uint256 public alpha = 500;                         // reputation weight
+    uint256 public alpha = 500;             // reputation weight
 
-    // owner‑settable LINK fee limits ---------------------------------------
+    // owner‑settable LINK fee limits
     uint256 public maxOracleFee;
-    uint256 public baseFeePct          = 1;  // 1 % of maxOracleFee
+    uint256 public baseFeePct = 1;          // 1% of maxOracleFee
     uint256 public maxFeeBasedScalingFactor = 10;
 
-    // limits for user input -----------------------------------------------
-    uint256 public constant MAX_CID_COUNT   = 10;
-    uint256 public constant MAX_CID_LENGTH  = 100;
+    // limits for user input
+    uint256 public constant MAX_CID_COUNT = 10;
+    uint256 public constant MAX_CID_LENGTH = 100;
     uint256 public constant MAX_ADDENDUM_LENGTH = 1000;
 
     ReputationKeeper public reputationKeeper;
@@ -55,35 +55,9 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     event RevealRequestDispatched(bytes32 indexed aggRequestId, uint256 pollIndex, bytes16 commitHash);
     event NewOracleResponseRecorded(bytes32 requestId, uint256 pollIndex, address operator);
     event BonusPayment(address indexed operator, uint256 bonusFee);
-    event DebugBonusTransfer(address indexed operator, uint256 bonusFee, uint256 balBefore, uint256 balAfter, bool success);
     event EvaluationTimedOut(bytes32 indexed aggRequestId);
     event OracleScoreUpdateSkipped(address oracle, bytes32 jobId, string reason);
-    event DebugCommit(bytes32 aggId, uint256 rawDecimal, bytes16 storedHash);
-    event DebugCallReceived(address sender, bytes32 requestId);
-    event DebugRequestIdMapping(bytes32 operatorRequestId, bytes32 aggregatorId, bool exists);
-event DebugSaltProcessing(
-    string rawJustificationCID,
-    uint256 cidLength,
-    string extractedCid,
-    uint256 extractedSalt
-);
-event DebugFallback(address sender, bytes data);
-event DebugReceive(address sender, uint256 value);
-event DebugRevealProcessing(
-    bytes32 requestId,
-    uint256 firstLikelihood,
-    bytes16 commitHash,
-    string justificationRaw,
-    string cleanCid,
-    uint256 saltValue
-);
-event DebugHashComparison(
-    bytes32 requestId, 
-    bytes16 computedHash, 
-    bytes16 storedHash, 
-    bool isMatch
-);
-event HashMismatch(bytes32 requestId, bytes16 computedHash, bytes16 storedHash);
+    event HashMismatch(bytes32 requestId, bytes16 computedHash, bytes16 storedHash);
 
     // ----------------------------------------------------------------------
     //                               STRUCTS
@@ -100,34 +74,34 @@ event HashMismatch(bytes32 requestId, bytes16 computedHash, bytes16 storedHash);
     }
 
     struct AggregatedEvaluation {
-        // phase bookkeeping -----------------
-        bool commitPhaseComplete;          // true → we are in reveal phase
-        uint256 commitExpected;            // K
-        uint256 commitReceived;            // # of commits so far
+        // phase bookkeeping
+        bool commitPhaseComplete;           // true → we are in reveal phase
+        uint256 commitExpected;             // K
+        uint256 commitReceived;             // # of commits so far
 
-        // commit hashes per poll slot -------
+        // commit hashes per poll slot
         mapping(uint256 => bytes16) commitHashPerSlot;  // 0‑based poll index ⇒ 128‑bit hash
 
-        // reveal bookkeeping ----------------
-        Response[] responses;              // only *reveal* responses are stored here
-        uint256 responseCount;             // reveal response counter
-        uint256 requiredResponses;         // N (reveals to aggregate)
-        uint256 clusterSize;               // P
+        // reveal bookkeeping
+        Response[] responses;               // only *reveal* responses are stored here
+        uint256 responseCount;              // reveal response counter
+        uint256 requiredResponses;          // N (reveals to aggregate)
+        uint256 clusterSize;                // P
         uint256[] aggregatedLikelihoods;
 
-        // oracle selection  -----------------
+        // oracle selection
         ReputationKeeper.OracleIdentity[] polledOracles;  // length == K
-        uint256[] pollFees;                                // same length
+        uint256[] pollFees;                               // same length
 
-        // accounting ------------------------
-        mapping(bytes32 => bool) requestIds;     // valid requestIds (commit & reveal)
-        bool   userFunded;
+        // accounting
+        mapping(bytes32 => bool) requestIds;    // valid requestIds (commit & reveal)
+        bool userFunded;
         address requester;
         uint256 startTimestamp;
 
-        // output ----------------------------
+        // output
         string combinedJustificationCIDs;
-        bool   isComplete;
+        bool isComplete;
     }
 
     // ----------------------------------------------------------------------
@@ -146,9 +120,9 @@ event HashMismatch(bytes32 requestId, bytes16 computedHash, bytes16 storedHash);
 
         // default parameters keep the old behaviour: K=M=4, N=3, P=2
         commitOraclesToPoll = 5;  // K (default – one extra oracle)
-        oraclesToPoll       = 4;  // M
-        requiredResponses   = 3;  // N
-        clusterSize         = 2;  // P
+        oraclesToPoll = 4;        // M
+        requiredResponses = 3;    // N
+        clusterSize = 2;          // P
 
         responseTimeoutSeconds = 5 minutes;
         maxOracleFee = 0.1 * 10 ** 18; // 0.1 LINK
@@ -195,7 +169,7 @@ event HashMismatch(bytes32 requestId, bytes16 computedHash, bytes16 storedHash);
     }
 
     /**
-     * @dev Estimate the maximum LINK needed for *both* commit + reveal + bonus.
+     * @dev Estimate the maximum LINK needed for both commit + reveal + bonus.
      *      total = fee × (K + M + P)
      */
     function maxTotalFee(uint256 requestedMaxOracleFee) public view returns (uint256) {
@@ -208,13 +182,13 @@ event HashMismatch(bytes32 requestId, bytes16 computedHash, bytes16 storedHash);
     // ----------------------------------------------------------------------
     function requestAIEvaluationWithApproval(
         string[] memory cids,
-        string   memory addendumText,
-        uint256  _alpha,
-        uint256  _maxOracleFee,
-        uint256  _estimatedBaseCost,
-        uint256  _maxFeeBasedScalingFactor,
-        uint64   _requestedClass
-    )   public nonReentrant returns (bytes32) {
+        string memory addendumText,
+        uint256 _alpha,
+        uint256 _maxOracleFee,
+        uint256 _estimatedBaseCost,
+        uint256 _maxFeeBasedScalingFactor,
+        uint64 _requestedClass
+    ) public nonReentrant returns (bytes32) {
         require(address(reputationKeeper) != address(0), "ReputationKeeper not set");
         require(cids.length > 0, "Empty CID list");
         require(cids.length <= MAX_CID_COUNT, "Too many CIDs");
@@ -223,7 +197,7 @@ event HashMismatch(bytes32 requestId, bytes16 computedHash, bytes16 storedHash);
         }
         require(bytes(addendumText).length <= MAX_ADDENDUM_LENGTH, "Addendum too long");
 
-        // build CID payload -------------------------------------------------
+        // build CID payload
         bytes memory cat;
         for (uint256 i = 0; i < cids.length; i++) {
             cat = abi.encodePacked(cat, cids[i], i < cids.length - 1 ? "," : "");
@@ -234,18 +208,18 @@ event HashMismatch(bytes32 requestId, bytes16 computedHash, bytes16 storedHash);
         }
         cidConcat = string(abi.encodePacked("1:", cidConcat));  // Mode 1 – commit
 
-        // generate aggregator request id -----------------------------------
+        // generate aggregator request id
         bytes32 aggId = keccak256(abi.encodePacked(block.timestamp, msg.sender, cidConcat));
         AggregatedEvaluation storage agg = aggregatedEvaluations[aggId];
-        agg.commitExpected      = commitOraclesToPoll;
-        agg.requiredResponses   = requiredResponses;
-        agg.clusterSize         = clusterSize;
-        agg.userFunded          = true;
-        agg.requester           = msg.sender;
-        agg.startTimestamp      = block.timestamp;
+        agg.commitExpected = commitOraclesToPoll;
+        agg.requiredResponses = requiredResponses;
+        agg.clusterSize = clusterSize;
+        agg.userFunded = true;
+        agg.requester = msg.sender;
+        agg.startTimestamp = block.timestamp;
         agg.commitPhaseComplete = false;
 
-        // select oracles (K) -----------------------------------------------
+        // select oracles (K)
         ReputationKeeper.OracleIdentity[] memory sel = reputationKeeper.selectOracles(
             commitOraclesToPoll,
             _alpha,
@@ -256,7 +230,7 @@ event HashMismatch(bytes32 requestId, bytes16 computedHash, bytes16 storedHash);
         );
         reputationKeeper.recordUsedOracles(sel);
 
-        // dispatch Mode 1 requests -----------------------------------------
+        // dispatch Mode 1 requests
         for (uint256 i = 0; i < sel.length; i++) {
             agg.polledOracles.push(sel[i]);
 
@@ -267,8 +241,8 @@ event HashMismatch(bytes32 requestId, bytes16 computedHash, bytes16 storedHash);
 
             bytes32 opReq = _sendSingleOracleRequest(sel[i].oracle, jobId, fee, cidConcat);
             requestIdToAggregatorId[opReq] = aggId;
-            requestIdToPollIndex[opReq]    = i;  // slot == i
-            agg.requestIds[opReq]          = true;
+            requestIdToPollIndex[opReq] = i;  // slot == i
+            agg.requestIds[opReq] = true;
             agg.pollFees.push(fee);
         }
 
@@ -279,7 +253,6 @@ event HashMismatch(bytes32 requestId, bytes16 computedHash, bytes16 storedHash);
     // ----------------------------------------------------------------------
     //                         TIMEOUT HANDLING
     // ----------------------------------------------------------------------
-    
     function finalizeEvaluationTimeout(bytes32 aggId) external nonReentrant {
         AggregatedEvaluation storage agg = aggregatedEvaluations[aggId];
         require(!agg.isComplete, "Aggregation already completed");
@@ -306,32 +279,24 @@ event HashMismatch(bytes32 requestId, bytes16 computedHash, bytes16 storedHash);
     // ----------------------------------------------------------------------
     //                                FULFILL (NODE CALLBACK)
     // ----------------------------------------------------------------------
-    //function fulfill(
-    //    bytes32 _operatorRequestId,
-    //    uint256[] memory likelihoods,
-    //    string   memory justificationCID
-    //) public recordChainlinkFulfillment(_operatorRequestId) {
-function fulfill(
-    bytes32 requestId, // Changed from _operatorRequestId
-    uint256[] memory response, // Changed from likelihoods
-    string memory cid // Changed from justificationCID
-) public recordChainlinkFulfillment(requestId) {
-    // Inside the function can use original variable names
-    bytes32 _operatorRequestId = requestId;
-    uint256[] memory likelihoods = response;
-    string memory justificationCID = cid;
-
-        emit DebugCallReceived(msg.sender, _operatorRequestId);
-
-        bytes32 aggId = requestIdToAggregatorId[_operatorRequestId];
-emit DebugRequestIdMapping(_operatorRequestId, aggId, aggId != bytes32(0));
-
+    /**
+     * @dev Called by Chainlink nodes in both commit and reveal phases.
+     *      COMMIT PHASE: response[0] contains the pre-computed hash of (actualLikelihoods, salt)
+     *      REVEAL PHASE: response contains actual likelihood scores, cid contains "cleanCid:salt"
+     */
+    function fulfill(
+        bytes32 requestId,
+        uint256[] memory response,
+        string memory cid
+    ) public recordChainlinkFulfillment(requestId) {
+        bytes32 aggId = requestIdToAggregatorId[requestId];
         require(aggId != bytes32(0), "Unknown reqId");
+        
         AggregatedEvaluation storage agg = aggregatedEvaluations[aggId];
         require(!agg.isComplete, "Aggregation done");
-        require(agg.requestIds[_operatorRequestId], "Invalid reqId");
+        require(agg.requestIds[requestId], "Invalid reqId");
 
-        uint256 slot = requestIdToPollIndex[_operatorRequestId];
+        uint256 slot = requestIdToPollIndex[requestId];
         ReputationKeeper.OracleIdentity memory id = agg.polledOracles[slot];
 
         // ------------------------------------------------------------------
@@ -339,16 +304,16 @@ emit DebugRequestIdMapping(_operatorRequestId, aggId, aggId != bytes32(0));
         // ------------------------------------------------------------------
         if (!agg.commitPhaseComplete) {
             // ----------------------- COMMIT PHASE --------------------------
-            // require(likelihoods.length == 1, "Commit must have 1 value");
-            // bytes16 hash128 = bytes16(uint128(likelihoods[0]));
-            bytes16 hash128 = bytes16(bytes32(uint256(likelihoods[0]) << 128));
+            // During commit phase, response[0] contains the hash that the oracle
+            // computed off-chain using: sha256(abi.encode(actualLikelihoods, salt))
+            // We store the first 128 bits of this hash for later verification
+            bytes16 hash128 = bytes16(bytes32(uint256(response[0]) << 128));
             agg.commitHashPerSlot[slot] = hash128;
             agg.commitReceived += 1;
-            emit DebugCommit(aggId, likelihoods[0], hash128);
 
             emit CommitReceived(aggId, slot, msg.sender, hash128);
 
-            // once the first M have committed → dispatch reveal requests ----
+            // once the first M have committed → dispatch reveal requests
             if (agg.commitReceived == oraclesToPoll) {
                 agg.commitPhaseComplete = true;
                 emit CommitPhaseComplete(aggId);
@@ -358,61 +323,33 @@ emit DebugRequestIdMapping(_operatorRequestId, aggId, aggId != bytes32(0));
         }
 
         // ------------------------- REVEAL PHASE ----------------------------
-
-        require(likelihoods.length > 0, "Empty likelihoods");
-        // **reveal must have the real score vector**
+        require(response.length > 0, "Empty likelihoods");
+        
         // the first reveal fixes the expected length
         if (agg.aggregatedLikelihoods.length == 0) {
-            // remember how many outcomes we have
-            agg.aggregatedLikelihoods = new uint256[](likelihoods.length);
+            agg.aggregatedLikelihoods = new uint256[](response.length);
         } else {
-            require(
-                likelihoods.length == agg.aggregatedLikelihoods.length,
-                "Wrong number of scores"
-            );
+            require(response.length == agg.aggregatedLikelihoods.length, "Wrong number of scores");
         }
 
-        //  Strip ":<salt>" so we store/emit a clean IPFS CID
-        // string memory cleanCid = _stripSalt(justificationCID);
+        // Split "cleanCid:20hexSalt" → (cid, saltUint)
+        (string memory cleanCid, uint256 saltUint) = _splitCidAndSalt(cid);
 
-// 1. Split "<cid>:<20hex>"  →  (cid, saltUint)
-(string memory cleanCid, uint256 saltUint) = _splitCidAndSalt(justificationCID);
-emit DebugRevealProcessing(
-   _operatorRequestId,
-   likelihoods.length > 0 ? likelihoods[0] : 0,
-   agg.commitHashPerSlot[slot],
-   justificationCID,
-   cleanCid,
-   saltUint
-);
-
-// 2. Re-compute the 128-bit commitment and verify
-//    adapter uses:  bytes16( sha256( abi.encode(scores, salt) ) )
-bytes16 recomputed = bytes16(
-    sha256(abi.encode(likelihoods, saltUint))
-);
-
-emit DebugHashComparison(
-    _operatorRequestId, 
-    recomputed, 
-    agg.commitHashPerSlot[slot], 
-    recomputed == agg.commitHashPerSlot[slot]
-);
-
-require(
-     recomputed == agg.commitHashPerSlot[slot],
-     "Hash mismatch: reveal hash doesn't match commit hash"
-);
-// if (recomputed != agg.commitHashPerSlot[slot]) {
-//    emit HashMismatch(_operatorRequestId, recomputed, agg.commitHashPerSlot[slot]);
-// }
-
+        // Re-compute the 128-bit commitment hash and verify against stored commit
+        // Oracle computed: sha256(abi.encode(actualLikelihoods, salt))
+        // We verify: first 128 bits match what was committed
+        bytes16 recomputed = bytes16(sha256(abi.encode(response, saltUint)));
+        
+        if (recomputed != agg.commitHashPerSlot[slot]) {
+            emit HashMismatch(requestId, recomputed, agg.commitHashPerSlot[slot]);
+            revert("Hash mismatch: reveal hash doesn't match commit hash");
+        }
 
         bool selected = (agg.responses.length < agg.requiredResponses);
         Response memory resp = Response({
-            likelihoods: likelihoods,
-            justificationCID: cleanCid,   // ← use the cleaned CID
-            requestId: _operatorRequestId,
+            likelihoods: response,
+            justificationCID: cleanCid,   // use the cleaned CID
+            requestId: requestId,
             selected: selected,
             timestamp: block.timestamp,
             operator: msg.sender,
@@ -423,7 +360,7 @@ require(
         agg.responses.push(resp);
         agg.responseCount += 1;
 
-        emit NewOracleResponseRecorded(_operatorRequestId, slot, msg.sender);
+        emit NewOracleResponseRecorded(requestId, slot, msg.sender);
 
         if (agg.responseCount >= agg.requiredResponses) {
             _finalizeAggregation(aggId);
@@ -442,6 +379,7 @@ require(
                 // this oracle did not commit fast enough
                 continue;
             }
+            
             ReputationKeeper.OracleIdentity memory oid = agg.polledOracles[slot];
             uint256 fee = agg.pollFees[slot];
 
@@ -450,8 +388,8 @@ require(
             string memory cid2 = string(abi.encodePacked("2:", _bytes16ToHexStringLower(hash128)));
             bytes32 opReq = _sendSingleOracleRequest(oid.oracle, oid.jobId, fee, cid2);
             requestIdToAggregatorId[opReq] = aggId;
-            requestIdToPollIndex[opReq]    = slot;
-            agg.requestIds[opReq]          = true;
+            requestIdToPollIndex[opReq] = slot;
+            agg.requestIds[opReq] = true;
 
             emit RevealRequestDispatched(aggId, slot, hash128);
         }
@@ -481,11 +419,13 @@ require(
         for (uint256 i = 0; i < agg.responses.length; i++) {
             if (agg.responses[i].selected) selectedCount++;
         }
+        
         uint256[] memory selIdx = new uint256[](selectedCount);
         uint256 k = 0;
         for (uint256 i = 0; i < agg.responses.length; i++) {
             if (agg.responses[i].selected) selIdx[k++] = i;
         }
+        
         uint256[] memory cluster = (selectedCount >= 2)
             ? _findBestClusterFromResponses(agg.responses, selIdx)
             : new uint256[](selectedCount);
@@ -493,6 +433,7 @@ require(
         if (agg.responses.length > 0) {
             agg.aggregatedLikelihoods = new uint256[](agg.responses[0].likelihoods.length);
         }
+        
         uint256 clusterCount = 0;
         uint256 m = agg.polledOracles.length;
         for (uint256 slot = 0; slot < m; slot++) {
@@ -508,6 +449,7 @@ require(
                 }
             }
         }
+        
         if (clusterCount > 0) {
             for (uint256 j = 0; j < agg.aggregatedLikelihoods.length; j++) {
                 agg.aggregatedLikelihoods[j] /= clusterCount;
@@ -520,11 +462,12 @@ require(
         for (uint256 i = 0; i < selIdx.length; i++) {
             if (cluster[i] == 1) {
                 uint256 r = selIdx[i];
-                string memory cid = agg.responses[r].justificationCID;
-                combined = first ? cid : string(abi.encodePacked(combined, ",", cid));
+                string memory cidStr = agg.responses[r].justificationCID;
+                combined = first ? cidStr : string(abi.encodePacked(combined, ",", cidStr));
                 first = false;
             }
         }
+        
         agg.combinedJustificationCIDs = combined;
         agg.isComplete = true;
         emit FulfillAIEvaluation(aggId, agg.aggregatedLikelihoods, combined);
@@ -545,6 +488,7 @@ require(
             emit OracleScoreUpdateSkipped(id.oracle, id.jobId, "Inactive at finalization");
             return (false, 0);
         }
+        
         (bool responded, uint256 respIndex) = _getResponseForSlot(agg.responses, slot);
         if (responded) {
             Response memory resp = agg.responses[respIndex];
@@ -577,15 +521,17 @@ require(
             }
             return (true, 0);
         }
-        return (false, 0); // Default fallback
+        return (false, 0);
     }
 
-    // helper conversions ---------------------------------------------------
+    // ----------------------------------------------------------------------
+    //                       HELPER: CONVERSIONS
+    // ----------------------------------------------------------------------
     function _bytes16ToHexStringLower(bytes16 data) internal pure returns (string memory) {
         bytes memory hexChars = new bytes(32);
         for (uint256 i = 0; i < 16; i++) {
             uint8 b = uint8(data[i]);
-            hexChars[2 * i]     = _lowerHexChar(b >> 4);
+            hexChars[2 * i] = _lowerHexChar(b >> 4);
             hexChars[2 * i + 1] = _lowerHexChar(b & 0x0f);
         }
         return string(hexChars);
@@ -596,9 +542,8 @@ require(
     }
 
     // ----------------------------------------------------------------------
-    //                  HELPER FUNCTIONS 
+    //                          HELPER FUNCTIONS
     // ----------------------------------------------------------------------
-    
     /**
      * @dev Pay bonus to an operator
      */
@@ -616,10 +561,7 @@ require(
                 require(link.transferFrom(requester, operator, amount), "bonus xferFrom failed");
             } else {
                 // Otherwise transfer from contract
-                uint256 balBefore = link.balanceOf(address(this));
                 bool success = link.transfer(operator, amount);
-                uint256 balAfter = link.balanceOf(address(this));
-                emit DebugBonusTransfer(operator, amount, balBefore, balAfter, success);
                 require(success, "bonus transfer failed");
             }
             
@@ -673,9 +615,7 @@ require(
      * @dev Find the best cluster from responses
      */
     function _findBestClusterFromResponses(Response[] memory responses, uint256[] memory selectedResponseIndices)
-        internal
-        pure
-        returns (uint256[] memory)
+        internal pure returns (uint256[] memory)
     {
         uint256 count = selectedResponseIndices.length;
         require(count >= 2, "Need at least 2 responses");
@@ -720,6 +660,43 @@ require(
         return sum;
     }
 
+    /**
+     * @dev Split "cleanCid:20hexSalt" into (cid, saltUint)
+     */
+    function _splitCidAndSalt(string memory packed)
+        private pure returns (string memory cidOnly, uint256 salt)
+    {
+        bytes memory b = bytes(packed);
+        require(b.length > 21, "cid+salt too short");      // ':' + 20 hex chars
+
+        // find the last ':' (allows ':' inside CID multibase)
+        uint256 i = b.length;
+        while (i > 0 && b[i-1] != ":") { 
+            unchecked { --i; } 
+        }
+        require(i > 0 && (b.length - i) == 20, "need 20 hex after ':'");
+
+        // copy CID part
+        bytes memory cidBytes = new bytes(i - 1);
+        for (uint256 j = 0; j < cidBytes.length; ++j) {
+            cidBytes[j] = b[j];
+        }
+
+        // parse 20 hex chars → uint256 (fits in lower 80 bits)
+        unchecked {
+            for (uint256 j = i; j < b.length; ++j) {
+                uint8 c = uint8(b[j]);
+                uint8 v = (c >= 97) ? c - 87     // 'a'-'f'
+                       : (c >= 65) ? c - 55     // 'A'-'F'
+                       : (c >= 48) ? c - 48     // '0'-'9'
+                       : 255;
+                require(v < 16, "non-hex");
+                salt = (salt << 4) | v;
+            }
+        }
+        return (string(cidBytes), salt);
+    }
+
     // ----------------------------------------------------------------------
     //             EVALUATION GETTERS & WITHDRAW
     // ----------------------------------------------------------------------
@@ -734,9 +711,7 @@ require(
     }
 
     function getContractConfig()
-        public
-        view
-        returns (
+        public view returns (
             address oracleAddr,
             address linkAddr,
             bytes32 jobId,
@@ -756,49 +731,4 @@ require(
         LinkTokenInterface link = LinkTokenInterface(_chainlinkTokenAddress());
         require(link.transfer(_to, _amount), "LINK transfer failed");
     }
-
-/// @dev splits "<cid>:<20-hex-char>" into (cid, saltUint)
-function _splitCidAndSalt(string memory packed)
-        private
-        pure
-        returns (string memory cidOnly, uint256 salt)
-{
-    bytes memory b = bytes(packed);
-    require(b.length > 21, "cid+salt too short");      // ':' + 20 hex chars
-
-    // find the last ':' (allows ':' inside CID multibase)
-    uint256 i = b.length;
-    while (i > 0 && b[i-1] != ":") { unchecked { --i; } }
-    require(i > 0 && (b.length - i) == 20, "need 20 hex after ':'");
-
-    // copy CID part
-    bytes memory cidBytes = new bytes(i - 1);
-    for (uint256 j = 0; j < cidBytes.length; ++j) {
-        cidBytes[j] = b[j];
-    }
-
-    // parse 20 hex chars → uint256 (fits in lower 80 bits)
-    unchecked {
-        for (uint256 j = i; j < b.length; ++j) {
-            uint8 c = uint8(b[j]);
-            uint8 v = (c >= 97) ? c - 87     // 'a'-'f'
-                   : (c >= 65) ? c - 55     // 'A'-'F'
-                   : (c >= 48) ? c - 48     // '0'-'9'
-                   : 255;
-            require(v < 16, "non-hex");
-            salt = (salt << 4) | v;
-        }
-    }
-    return (string(cidBytes), salt);
 }
-
-fallback() external {
-    emit DebugFallback(msg.sender, msg.data);
-}
-
-receive() external payable {
-    emit DebugReceive(msg.sender, msg.value);
-}
-
-}
-
