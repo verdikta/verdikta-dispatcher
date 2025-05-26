@@ -4,12 +4,7 @@
 # Deploy sequence:
 #   1. ReputationKeeper
 #   2. ReputationAggregator
-#   3. Post‑deployment config
-#
-# All three are tagged in their deploy scripts as:
-#   module.exports.tags = ["keeper"];      // 003_keeper.js
-#   module.exports.tags = ["aggregator"];  // 004_agg.js
-#   module.exports.tags = ["config"];      // 005_config.js
+#   3. Post-deployment config
 #
 # Run with:
 #   ./scripts/deploy.sh
@@ -24,7 +19,7 @@ echo "=== Verdikta Deployment Script (Hardhat) ==="
 echo "Deploying keeper + aggregator + config to ${NET}..."
 
 # Use --reset to force redeployment even when compiled bytecode is the same
-npx hardhat deploy --network "${NET}" --tags keeper,aggregator,config --reset
+npx hardhat deploy --network "${NET}" --tags aggregator,keeper,config --reset
 
 echo "✅  All deployments finished."
 
