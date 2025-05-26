@@ -4,11 +4,8 @@ pragma solidity ^0.8.21;
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-/// *There are five TODO lines that should be commented out and tested next cycle.
-/// This code checks at registration that the contract is an ArtiberOperator.
-///TODO import "@openzeppelin/contracts/utils/introspection/IERC165.sol";
-///TODO import "./IArbiterOperator.sol";   // same interface as above
-///TODO bytes4 private constant _ARBITER_IFACE = type(IArbiterOperator).interfaceId;
+import "@openzeppelin/contracts/utils/introspection/IERC165.sol";
+import "./IArbiterOperator.sol";   // same interface as above
 
 /// @notice Minimal interface to query an oracle contract's owner.
 interface IOracleOwner {
@@ -26,6 +23,8 @@ contract ReputationKeeper is Ownable {
         bytes32 jobId;
         uint64[] classes; // list of classes (up to 5) supported by this oracle
     }
+
+    bytes4 private constant ARBITERIFACE = type(IArbiterOperator).interfaceId;
 
     bytes16[2] public entropyBuf;    // updated by aggregators - 0=latest, 1=prev-block
     uint256 public entropyBlock;     // block.number when last updated
@@ -123,8 +122,11 @@ contract ReputationKeeper is Ownable {
         uint256 fee,
         uint64[] memory _classes
     ) external {
-        ///TODO require(IERC165(oracle).supportsInterface(_ARBITER_IFACE),
-        ///TODO    "Oracle must be ArbiterOperator");
+        require(_oracle != address(0), "oracle is a zero addr");
+        require(_oracle.code.length > 0, "oracle address has no code");
+        //TODO: Uncomment the line below once only the new ArbiterOperator is being used. Then it will pass.
+        //require(IERC165(_oracle).supportsInterface(ARBITERIFACE), "Oracle must be ArbiterOperator");
+
         bytes32 key = _oracleKey(_oracle, _jobId);
         // Ensure the oracle is not already registered.
         require(oracles[key].stakeAmount == 0, "Oracle already registered");
