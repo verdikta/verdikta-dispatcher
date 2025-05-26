@@ -33,7 +33,11 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     uint256 public responseTimeoutSeconds = 300; // default 5 min
     uint256 public alpha = 500;             // reputation weight
 
-    // owner‑settable LINK fee limits
+    // rolling entropy
+    bytes16 public rollingEntropy;     // init to 0x0 and build over time
+    uint256 public lastEntropyBlock;   // block.number the keeper saw last
+
+    // owner-settable LINK fee limits
     uint256 public maxOracleFee;
     uint256 public baseFeePct = 1;          // 1% of maxOracleFee
     uint256 public maxFeeBasedScalingFactor = 10;
@@ -58,6 +62,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     event EvaluationTimedOut(bytes32 indexed aggRequestId);
     event OracleScoreUpdateSkipped(address oracle, bytes32 jobId, string reason);
     event HashMismatch(bytes32 requestId, bytes16 computedHash, bytes16 storedHash);
+    event ReputationKeeperChanged(address indexed oldKeeper, address indexed newKeeper);
 
     // ----------------------------------------------------------------------
     //                               STRUCTS
@@ -117,6 +122,10 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     constructor(address _link, address _reputationKeeper) Ownable(msg.sender) {
         _setChainlinkToken(_link);
         reputationKeeper = ReputationKeeper(_reputationKeeper);
+
+        // rolling entropy
+        rollingEntropy = 0x0;
+        lastEntropyBlock = block.number;
 
         // default parameters keep the old behaviour: K=M=4, N=3, P=2
         commitOraclesToPoll = 5;  // K (default – one extra oracle)
@@ -345,6 +354,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
             revert("Hash mismatch: reveal hash doesn't match commit hash");
         }
 
+        _updateEntropy(bytes10(uint80(saltUint)));
         bool selected = (agg.responses.length < agg.requiredResponses);
         Response memory resp = Response({
             likelihoods: response,
@@ -697,6 +707,27 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         return (string(cidBytes), salt);
     }
 
+    // Mix salt into 128-bit entropy    
+    function _updateEntropy(bytes10 salt10) internal {
+        // Mix previous entropy, new salt, and parent block-hash (prevents
+        // extension-attack on keccak, adds 50% unknown bits).
+        rollingEntropy = bytes16(
+            keccak256(
+                abi.encodePacked(
+                    rollingEntropy,
+                    salt10,
+                    blockhash(block.number - 1)
+                )
+            )
+        );
+
+        // Push to keeper once per block to save gas.
+        if (block.number > lastEntropyBlock) {
+            reputationKeeper.pushEntropy(rollingEntropy);
+            lastEntropyBlock = block.number;
+        }
+    }
+
     // ----------------------------------------------------------------------
     //             EVALUATION GETTERS & WITHDRAW
     // ----------------------------------------------------------------------
@@ -731,4 +762,37 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         LinkTokenInterface link = LinkTokenInterface(_chainlinkTokenAddress());
         require(link.transfer(_to, _amount), "LINK transfer failed");
     }
+
+    function setReputationKeeper(address newKeeper) external onlyOwner {
+        require(newKeeper != address(0), "ReputationKeeper: zero address");
+        address old = address(reputationKeeper);
+        reputationKeeper = ReputationKeeper(newKeeper);
+        emit ReputationKeeperChanged(old, newKeeper);
+    }
+
+    function setConfig(
+        uint256 _k,
+        uint256 _m,
+        uint256 _n,
+        uint256 _timeoutSecs
+    ) external onlyOwner {
+        // same safety checks as individual setters
+        require(_k >= _m, "K >= M");
+        require(_m >= _n, "M >= N");
+        require(_n >= 1,  "N >= 1");
+
+        commitOraclesToPoll   = _k;
+        oraclesToPoll         = _m;
+        requiredResponses     = _n;
+        responseTimeoutSeconds = _timeoutSecs;
+    }
+
+/// Accept plain transfers (0-ETH is fine) so front-end “Send” does not revert
+receive() external payable { }
+
+/// Optional: catch unexpected calldata and show it in logs
+fallback() external payable {
+    // emit an event or leave empty
+}
+
 }

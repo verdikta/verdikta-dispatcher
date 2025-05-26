@@ -27,6 +27,9 @@ contract ReputationKeeper is Ownable {
         uint64[] classes; // list of classes (up to 5) supported by this oracle
     }
 
+    bytes16[2] public entropyBuf;    // updated by aggregators - 0=latest, 1=prev-block
+    uint256 public entropyBlock;     // block.number when last updated
+
     // A single record of (qualityScore, timelinessScore).
     struct ScoreRecord {
         int256 qualityScore;
@@ -97,6 +100,7 @@ contract ReputationKeeper is Ownable {
     event ContractRemoved(address indexed contractAddress);
     // Optional event for pausing/unpausing an oracle.
     event OracleActiveStatusUpdated(address indexed oracle, bytes32 jobId, bool isActive);
+    event EntropyPushed(bytes16 entropy, uint256 blockNumber);
     
     /// @dev Generates a composite key from an oracle address and its job ID.
     function _oracleKey(address _oracle, bytes32 _jobId) internal pure returns (bytes32) {
@@ -105,6 +109,9 @@ contract ReputationKeeper is Ownable {
     
     constructor(address _verdiktaToken) Ownable(msg.sender) {
         verdiktaToken = IERC20(_verdiktaToken);
+        entropyBuf[0] = 0x0;
+        entropyBuf[1] = 0x0;
+        entropyBlock  = block.number;
     }
     
     /**
@@ -455,7 +462,11 @@ contract ReputationKeeper is Ownable {
         }
         OracleIdentity[] memory selectedOracles = new OracleIdentity[](count);
         for (uint256 i = 0; i < count; i++) {
-            uint256 seed = uint256(keccak256(abi.encodePacked(block.timestamp, block.prevrandao, i)));
+
+            // choose entropy: prev if push happened this block, else latest
+            bytes16 chosenEntropy = (block.number == entropyBlock) ? entropyBuf[1] : entropyBuf[0];
+            bytes32 seedFull = keccak256( abi.encodePacked(chosenEntropy, block.prevrandao, block.timestamp, i));
+            uint256 seed = uint256(seedFull);
             uint256 selection = seed % totalWeight;
             uint256 sum = 0;
             for (uint256 j = 0; j < shortlistCount; j++) {
@@ -582,6 +593,17 @@ contract ReputationKeeper is Ownable {
     function removeContract(address contractAddress) external onlyOwner {
         approvedContracts[contractAddress].isApproved = false;
         emit ContractRemoved(contractAddress);
+    }
+
+    function pushEntropy(bytes16 e) external {
+        require(approvedContracts[msg.sender].isApproved, "not aggregator");
+
+        if (block.number > entropyBlock) {
+            entropyBuf[1] = entropyBuf[0];   // shift
+            entropyBuf[0] = e;               // store newest
+            entropyBlock  = block.number;
+            emit EntropyPushed(e, entropyBlock);
+        }
     }
 }
 
