@@ -282,8 +282,9 @@ contract ReputationKeeper is Ownable {
             info.recentScores.pop();
         }
         
-        // Apply penalties if necessary.
+        // Apply penalties if necessary. Auto-unblock if appropriate.
         if (block.timestamp >= info.lockedUntil) {
+            if (info.blocked) info.blocked = false;   // auto-unblock
             if (info.qualityScore < severeThreshold || info.timelinessScore < severeThreshold) {
                 if (info.stakeAmount >= slashAmountConfig) {
                     info.stakeAmount -= slashAmountConfig;
