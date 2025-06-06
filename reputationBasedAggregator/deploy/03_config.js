@@ -39,6 +39,15 @@ const keeper = await ethers.getContractAt(
   signer
 );
 
+console.log("Keeper      :", keeper.target);      // ethers v6 uses .target
+console.log("Aggregator  :", aggregator.target);
+
+if (keeper.target === aggregator.target) {
+  throw new Error(
+    "Keeper and Aggregator addresses are identical – deployments.get() returned the wrong file"
+  );
+}
+
   const TOKEN_ADDR = process.env.WRAPPED_VERDIKTA_TOKEN;
   if (!ethers.isAddress(TOKEN_ADDR)) {
     throw new Error("WRAPPED_VERDIKTA_TOKEN env var missing or invalid");
