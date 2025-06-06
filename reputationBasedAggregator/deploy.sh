@@ -19,7 +19,8 @@ echo "=== Verdikta Deployment Script (Hardhat) ==="
 echo "Deploying keeper + aggregator + config to ${NET}..."
 
 # Use --reset to force redeployment even when compiled bytecode is the same
-npx hardhat deploy --network "${NET}" --tags aggregator,keeper,config --reset
+# npx hardhat deploy --network "${NET}" --tags aggregator,keeper,config --reset
+npx hardhat deploy --network "${NET}" --tags aggregator,keeper,config
 
 echo "✅  All deployments finished."
 
