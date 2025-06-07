@@ -68,6 +68,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     event NewOracleResponseRecorded(bytes32 requestId, uint256 pollIndex, address operator);
     event BonusPayment(address indexed operator, uint256 bonusFee);
     event EvaluationTimedOut(bytes32 indexed aggRequestId);
+    event EvaluationFailed  (bytes32 indexed aggRequestId, string phase);
     event OracleScoreUpdateSkipped(address oracle, bytes32 jobId, string reason);
     event HashMismatch(bytes32 requestId, bytes16 computedHash, bytes16 storedHash);
     event ReputationKeeperChanged(address indexed oldKeeper, address indexed newKeeper);
@@ -115,6 +116,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         // output
         string combinedJustificationCIDs;
         bool isComplete;
+        bool failed;
     }
 
     // ----------------------------------------------------------------------
@@ -270,28 +272,42 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     // ----------------------------------------------------------------------
     //                         TIMEOUT HANDLING
     // ----------------------------------------------------------------------
-    function finalizeEvaluationTimeout(bytes32 aggId) external nonReentrant {
-        AggregatedEvaluation storage agg = aggregatedEvaluations[aggId];
-        require(!agg.isComplete, "Aggregation already completed");
-        require(block.timestamp >= agg.startTimestamp + responseTimeoutSeconds, "Evaluation not yet timed out");
-        
-        if (!agg.commitPhaseComplete) {
-            // If commit phase hasn't completed, but we have enough commits for reveal phase
-            if (agg.commitReceived >= oraclesToPoll) {
-                agg.commitPhaseComplete = true;
-                emit CommitPhaseComplete(aggId);
-                _dispatchRevealRequests(aggId, agg);
-            } else {
-                revert("Not enough commits received before timeout");
-            }
-        } else {
-            // We're in reveal phase, check if enough responses
-            require(agg.responseCount >= agg.requiredResponses, "Not enough responses received before timeout");
-            _finalizeAggregation(aggId);
+
+function finalizeEvaluationTimeout(bytes32 aggId) external nonReentrant {
+    AggregatedEvaluation storage agg = aggregatedEvaluations[aggId];
+    require(!agg.isComplete, "Aggregation already completed");
+    require(block.timestamp >= agg.startTimestamp + responseTimeoutSeconds,
+            "Evaluation not yet timed out");
+
+    /* ----------------- commit phase timed out ----------------- */
+    if (!agg.commitPhaseComplete) {
+        if (agg.commitReceived >= oraclesToPoll) {
+            // enough commits → try to progress to reveal
+            agg.commitPhaseComplete = true;
+            emit CommitPhaseComplete(aggId);
+            _dispatchRevealRequests(aggId, agg);
+            return;   // give them another timeout window
         }
-        
-        emit EvaluationTimedOut(aggId);
+        // < M commits → fail job
+        _applyTimeoutPenalties(agg, true);  // penalise non-committing oracles only
+        agg.failed    = true;
+        agg.isComplete = true;
+        emit EvaluationFailed(aggId, "commit");
+        return;
     }
+
+    /* ----------------- reveal phase timed out ----------------- */
+    if (agg.responseCount < agg.requiredResponses) {
+        _applyTimeoutPenalties(agg, false); // penalise non-revealing oracles
+        agg.failed    = true;
+        agg.isComplete = true;
+        emit EvaluationFailed(aggId, "reveal");
+        return;
+    }
+
+    // enough responses after all → finish normally
+    _finalizeAggregation(aggId);
+}
 
     // ----------------------------------------------------------------------
     //                                FULFILL (NODE CALLBACK)
@@ -795,6 +811,36 @@ function setBonusMultiplier(uint256 _m) external onlyOwner {
     bonusMultiplier = _m;
 }
 
+function _applyTimeoutPenalties(
+        AggregatedEvaluation storage agg,
+        bool commitPhase            // true  = commit timeout
+    ) private {
+
+    uint256 m = agg.polledOracles.length;
+    for (uint256 slot = 0; slot < m; slot++) {
+
+        bool shouldPenalise;
+
+        if (commitPhase) {
+            // commitHashPerSlot == 0  ⇒  oracle never committed
+            shouldPenalise = (agg.commitHashPerSlot[slot] == bytes16(0));
+        } else {
+            // reveal phase ⇒ penalise only if no reveal received
+            (bool responded, ) = _getResponseForSlot(agg.responses, slot);
+            shouldPenalise = !responded;
+        }
+
+        if (shouldPenalise) {
+            ReputationKeeper.OracleIdentity memory id = agg.polledOracles[slot];
+            try reputationKeeper.updateScores(id.oracle, id.jobId, int8(0), int8(-2)) { }
+            catch { emit OracleScoreUpdateSkipped(id.oracle, id.jobId, "timeout penalty"); }
+        }
+    }
+}
+
+function isFailed(bytes32 aggId) external view returns (bool) {
+    return aggregatedEvaluations[aggId].failed;
+}
 /// Accept plain transfers (0-ETH is fine) so front-end “Send” does not revert
 receive() external payable { }
 
