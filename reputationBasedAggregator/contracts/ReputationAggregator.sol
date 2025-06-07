@@ -520,13 +520,13 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
                     }
                 }
             } else {
-                try reputationKeeper.updateScores(id.oracle, resp.jobId, int8(0), int8(-4)) {} catch {
+                try reputationKeeper.updateScores(id.oracle, resp.jobId, int8(0), int8(-2)) {} catch {
                     emit OracleScoreUpdateSkipped(resp.operator, resp.jobId, "updateScores failed for responded but not selected");
                 }
                 return (true, 0);
             }
         } else {
-            try reputationKeeper.updateScores(id.oracle, id.jobId, int8(0), int8(-4)) {} catch {
+            try reputationKeeper.updateScores(id.oracle, id.jobId, int8(0), int8(-2)) {} catch {
                 emit OracleScoreUpdateSkipped(id.oracle, id.jobId, "updateScores failed for no response");
             }
             return (true, 0);
