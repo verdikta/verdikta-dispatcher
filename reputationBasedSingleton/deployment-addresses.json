@@ -5,7 +5,7 @@
   "base_sepolia": {
     "wrappedVerdiktaTokenAddress": "0x2F1d1aF9d5C25A48C29f56f57c7BAFFa7cc910a3",
     "verdiktaTokenAddress": "0xe46F6b494F111d958CDBB52536AD78c4eEeB0149",
-    "keeper": "0x6def65a003F9d9d80Cb9f6216dBF0282c8563a27",
+    "keeper": "0x305ED311Fb06942E423CEE3a213d02F39753210b",
     "linkToken": "0xE4aB69C077896252FAFBD49EFD26B5D171A32410"
   },
   "development": {
