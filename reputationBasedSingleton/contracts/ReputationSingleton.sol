@@ -9,8 +9,8 @@ import "./IReputationKeeper.sol";
 /*
  * ReputationSingleton
  * -------------------
- * Minimal one‑oracle version of the reputation aggregator.  Front‑end
- * compatibility: exposes `getEvaluation()` (like the multi‑oracle
+ * Minimal one-oracle version of the reputation aggregator.  Frontend
+ * compatibility: exposes `getEvaluation()` (like the multi-oracle
  * Aggregator) and names the outputs of `getContractConfig()` so the dApp
  * can read `.linkAddr` directly.
  */
@@ -18,8 +18,9 @@ contract ReputationSingleton is ChainlinkClient, Ownable, ReentrancyGuard {
     using Chainlink for Chainlink.Request;
 
     // Configuration
-    uint256 public alpha  = 500;   // 0‑1000 reputation weight
-    uint256 public maxOracleFee;   // LINK‑wei ceiling when selecting an oracle
+    uint256 public alpha  = 500;   // 0-1000 reputation weight
+    uint256 public maxOracleFee;   // LINK-wei ceiling when selecting an oracle
+    uint256 public responseTimeoutSeconds = 300;   // 5 min
     uint256 public baseFeePct = 1; // 1 percent of maxOracleFee used as floor
     uint256 public maxFeeBasedScalingFactor = 10;
 
@@ -29,9 +30,18 @@ contract ReputationSingleton is ChainlinkClient, Ownable, ReentrancyGuard {
 
     IReputationKeeper public reputationKeeper;
 
+    struct ReqMeta {
+        uint256 started;   // block.timestamp when request sent
+        bool    done;      // set true in fulfill() or on failure
+        bool    failed;    // true - timed-out without a response
+    }
+
+    mapping(bytes32 => ReqMeta) private _reqMeta;
+
     // Events
     event RequestAIEvaluation(bytes32 indexed requestId, string[] cids);
     event EvaluationFulfilled(bytes32 indexed requestId, uint256[] likelihoods, string justificationCID);
+    event EvaluationFailed(bytes32 indexed requestId);
 
     // Simple result storage so `getEvaluation()` works for the UI
     mapping(bytes32 => uint256[]) public likelihoodByRequest;
@@ -79,6 +89,11 @@ contract ReputationSingleton is ChainlinkClient, Ownable, ReentrancyGuard {
 
     function getEstimatedBaseCost() public view returns (uint256) {
         return (maxOracleFee * baseFeePct) / 100;
+    }
+
+    function setResponseTimeout(uint256 secs) external onlyOwner {
+        require(secs >= 30 && secs <= 1 days, "timeout 30s to 1d");
+        responseTimeoutSeconds = secs;
     }
 
     // Public request entry point
@@ -130,7 +145,16 @@ contract ReputationSingleton is ChainlinkClient, Ownable, ReentrancyGuard {
         require(LinkTokenInterface(_chainlinkTokenAddress()).transferFrom(msg.sender, address(this), _maxOracleFee), "LINK pull failed");
         Chainlink.Request memory req = _buildOperatorRequest(chosen[0].jobId, this.fulfill.selector);
         req._add("cid", payload);
-        return _sendOperatorRequestTo(chosen[0].oracle, req, _maxOracleFee);
+
+        bytes32 reqId = _sendOperatorRequestTo(chosen[0].oracle, req, _maxOracleFee);
+
+        _reqMeta[reqId] = ReqMeta({
+            started: block.timestamp,
+            done:    false,
+            failed:  false
+        });
+
+        return reqId;
     }
 
     // Chainlink callback
@@ -138,17 +162,37 @@ contract ReputationSingleton is ChainlinkClient, Ownable, ReentrancyGuard {
         public
         recordChainlinkFulfillment(requestId)
     {
+        _reqMeta[requestId].done = true;
         likelihoodByRequest[requestId]    = likelihoods;
         justificationByRequest[requestId] = justificationCID;
         emit EvaluationFulfilled(requestId, likelihoods, justificationCID);
     }
 
-    // Front‑end helpers
+    /// Anyone can close a request that missed the deadline.
+    /// Never reverts once time has elapsed.
+    function finalizeEvaluationTimeout(bytes32 requestId) external nonReentrant {
+        ReqMeta storage m = _reqMeta[requestId];
+
+        require(!m.done, "already complete");
+        require(block.timestamp >= m.started + responseTimeoutSeconds,
+                "not timed-out");
+
+        m.done   = true;
+        m.failed = true;
+
+        emit EvaluationFailed(requestId);
+    }
+
+    // Frontend helpers
     function getEvaluation(bytes32 requestId) external view returns (uint256[] memory, string memory, bool) {
         uint256[] memory l = likelihoodByRequest[requestId];
         string   memory j = justificationByRequest[requestId];
         bool exists = l.length > 0 || bytes(j).length > 0;
         return (l, j, exists);
+    }
+
+    function isFailed(bytes32 requestId) external view returns (bool) {
+        return _reqMeta[requestId].failed;
     }
 
     // Named outputs so ethers v6 adds properties like .linkAddr
