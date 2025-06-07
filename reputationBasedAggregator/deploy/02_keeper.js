@@ -9,6 +9,7 @@
 // -----------------------------------------------------------------------------
 
 require("dotenv").config();
+const { execute } = deployments;
 
 module.exports = async ({ deployments, getNamedAccounts, ethers, network }) => {
   if (process.env.SKIP_MIGRATIONS) {
@@ -75,10 +76,10 @@ module.exports = async ({ deployments, getNamedAccounts, ethers, network }) => {
     signer
   );
 
-  const currentNonce1 = await ethers.provider.getTransactionCount(deployer, "latest");
-  const pendingNonce1 = await ethers.provider.getTransactionCount(deployer, "pending");
-  const baseNonce = Math.max(currentNonce1, pendingNonce1, safeNonce+1);
-  console.log(`Contract interaction nonce: ${baseNonce} (current: ${currentNonce1}, pending: ${pendingNonce1})`);
+ // const currentNonce1 = await ethers.provider.getTransactionCount(deployer, "latest");
+ // const pendingNonce1 = await ethers.provider.getTransactionCount(deployer, "pending");
+ // const baseNonce = Math.max(currentNonce1, pendingNonce1, safeNonce+1);
+ // console.log(`Contract interaction nonce: ${baseNonce} (current: ${currentNonce1}, pending: ${pendingNonce1})`);
 
   console.log("Approving aggregator in keeper…");
   if (!aggInfo?.address || aggInfo.address === ethers.ZeroAddress) {
@@ -89,51 +90,59 @@ module.exports = async ({ deployments, getNamedAccounts, ethers, network }) => {
   // await (await keeper["approveContract(address)"]( aggInfo.address, { nonce: baseNonce } )).wait();
 
   // Check if aggregator is already approved in keeper
-  const isApproved = await keeper.approvedContracts(aggInfo.address);
+  const isApproved = await keeper.isContractApproved(aggInfo.address);
   console.log("Aggregator already approved in Keeper:", isApproved);
-  if (!isApproved) {
-    try {
-      const tx1 = await keeper["approveContract(address)"](aggInfo.address, {
-        nonce: baseNonce,
-        gasLimit: 200000  // Add explicit gas limit (out-of-gas was a problem)
-      });
-      console.log("Approve-Aggregator-Contract-in-Keeper Transaction sent:", tx1.hash);
-      await tx1.wait();
-      console.log("Approval successful!");
-    } catch (error) {
-      console.log("Approval failed:", error.message);
-      throw error;
-    }
+if (!isApproved) {
+  try {
+    console.log("Approving aggregator using hardhat-deploy...");
+    await execute(
+      "ReputationKeeper",           // Contract name
+      { 
+        from: deployer, 
+        log: true,
+        gasLimit: 800000,           // Keep your working gas settings
+        gasPrice: ethers.parseUnits("10", "gwei")
+      },
+      "approveContract",            // Function name  
+      aggInfo.address              // Function argument
+    );
+    console.log("Approval successful!");
+  } catch (error) {
+    console.log("Approval failed:", error.message);
+    throw error;
+  }
+
   } else {
     console.log("Aggregator already approved, skipping...");
   }
 
-  console.log("Setting Keeper address inside Aggregator…");
-  //await (await aggregator.setReputationKeeper(keepInfo.address, { nonce: baseNonce+1 })).wait();
-  //await (await aggregator["setReputationKeeper(address)"]( keepInfo.address, { nonce: baseNonce + 1 } )).wait();
+console.log("Setting Keeper address inside Aggregator…");
+const currentKeeper = await aggregator.reputationKeeper();
+console.log("Current keeper in aggregator:", currentKeeper);
+console.log("Expected keeper:", keepInfo.address);
 
-  // Check if keeper is already set in aggregator
-  const currentKeeper = await aggregator.reputationKeeper();
-  console.log("Current keeper in aggregator:", currentKeeper);
-  console.log("Expected keeper:", keepInfo.address);
-  
-  if (currentKeeper.toLowerCase() !== keepInfo.address.toLowerCase()) {
-    try {
-      const tx2 = await aggregator["setReputationKeeper(address)"](keepInfo.address, { 
-        nonce: baseNonce + 1,
-        gasLimit: 100000
-      });
-      console.log("Set-Keeper-in-Aggregator Transaction sent:", tx2.hash);
-      await tx2.wait();
-      console.log("Keeper address set successfully!");
-    } catch (error) {
-      console.log("Set keeper failed:", error.message);
-      throw error;
-    }
-  } else {
-    console.log("Keeper already set correctly, skipping...");
+if (currentKeeper.toLowerCase() !== keepInfo.address.toLowerCase()) {
+  try {
+    console.log("Setting keeper using hardhat-deploy...");
+    await execute(
+      "ReputationAggregator",       // Contract name
+      { 
+        from: deployer, 
+        log: true,
+        gasLimit: 300000,           // Adjust gas as needed
+        gasPrice: ethers.parseUnits("10", "gwei")
+      },
+      "setReputationKeeper",        // Function name
+      keepInfo.address             // Function argument
+    );
+    console.log("Keeper address set successfully!");
+  } catch (error) {
+    console.log("Set keeper failed:", error.message);
+    throw error;
   }
-
+} else {
+  console.log("Keeper already set correctly, skipping...");
+}
   console.log("Keeper wired to aggregator ✓");
 };
 
