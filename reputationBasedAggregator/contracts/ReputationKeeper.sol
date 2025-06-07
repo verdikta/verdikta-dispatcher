@@ -589,6 +589,13 @@ contract ReputationKeeper is Ownable {
         approvedContracts[contractAddress].isApproved = true;
         emit ContractApproved(contractAddress);
     }
+
+/**
+ * @notice Lightweight getter. Returns true if contract address has been approved.
+ */
+function isContractApproved(address contractAddress) external view returns (bool) {
+    return approvedContracts[contractAddress].isApproved;
+}
     
     /**
      * @notice Remove a contract's approval.
