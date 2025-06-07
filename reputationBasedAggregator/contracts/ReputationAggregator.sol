@@ -14,11 +14,18 @@ import "./ReputationKeeper.sol";
  *         N = requiredResponses    - first N reveals aggregated
  *         P = clusterSize          - size of best match cluster for bonus
  *
+ *         By default, K,M,N,P = 5,4,3,2
+ *
  *         Flow:
  *         1. requestAIEvaluationWithApproval sends Mode 1 requests to K oracles.
  *         2. When first M commitments arrive, the contract sends Mode 2
  *            requests (reveal) back to those M oracles.
  *         3. After N valid reveals, responses are clustered and scored.
+ *        
+ *         Payment:
+ *         1. All oracles get 1x fee up front.
+ *         2. There is a bonus multiplier B, nominally 3.
+ *         3. Clustered oracles get an additional Bx fee at finish.
  */
 contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     using Chainlink for Chainlink.Request;
@@ -26,10 +33,11 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     // ----------------------------------------------------------------------
     //                          CONFIGURATION STORAGE
     // ----------------------------------------------------------------------
-    uint256 public commitOraclesToPoll;     // K – commit‑phase polls
+    uint256 public commitOraclesToPoll;     // K – commiti-phase polls
     uint256 public oraclesToPoll;           // M – reveals requested
     uint256 public requiredResponses;       // N
     uint256 public clusterSize;             // P
+    uint256 public bonusMultiplier = 3;     // B
     uint256 public responseTimeoutSeconds = 300; // default 5 min
     uint256 public alpha = 500;             // reputation weight
 
@@ -183,11 +191,11 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
      */
     function maxTotalFee(uint256 requestedMaxOracleFee) public view returns (uint256) {
         uint256 eff = requestedMaxOracleFee < maxOracleFee ? requestedMaxOracleFee : maxOracleFee;
-        return eff * (commitOraclesToPoll + oraclesToPoll + clusterSize);
+        return eff * (commitOraclesToPoll + bonusMultiplier*clusterSize);
     }
 
     // ----------------------------------------------------------------------
-    //                      USER‑FUNDED REQUEST ENTRYPOINT
+    //                      USER FUNDED REQUEST ENTRYPOINT
     // ----------------------------------------------------------------------
     function requestAIEvaluationWithApproval(
         string[] memory cids,
@@ -381,7 +389,6 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     //                      INTERNAL: DISPATCH REVEAL REQUESTS
     // ----------------------------------------------------------------------
     function _dispatchRevealRequests(bytes32 aggId, AggregatedEvaluation storage agg) internal {
-        LinkTokenInterface link = LinkTokenInterface(_chainlinkTokenAddress());
 
         for (uint256 slot = 0; slot < agg.polledOracles.length; slot++) {
             bytes16 hash128 = agg.commitHashPerSlot[slot];
@@ -391,12 +398,8 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
             }
             
             ReputationKeeper.OracleIdentity memory oid = agg.polledOracles[slot];
-            uint256 fee = agg.pollFees[slot];
-
-            require(link.transferFrom(agg.requester, address(this), fee), "reveal fee xferFrom failed");
-
             string memory cid2 = string(abi.encodePacked("2:", _bytes16ToHexStringLower(hash128)));
-            bytes32 opReq = _sendSingleOracleRequest(oid.oracle, oid.jobId, fee, cid2);
+            bytes32 opReq = _sendSingleOracleRequest(oid.oracle, oid.jobId, 0, cid2);
             requestIdToAggregatorId[opReq] = aggId;
             requestIdToPollIndex[opReq] = slot;
             agg.requestIds[opReq] = true;
@@ -509,7 +512,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
                         try reputationKeeper.updateScores(id.oracle, resp.jobId, int8(4), int8(4)) {} catch {
                             emit OracleScoreUpdateSkipped(resp.operator, resp.jobId, "updateScores failed for clustered selected response");
                         }
-                        uint256 bonus = agg.pollFees[slot];
+                        uint256 bonus = agg.pollFees[slot]*bonusMultiplier;
                         _payBonus(agg.requester, agg.userFunded, bonus, resp.operator);
                         return (true, 1);
                     } else {
@@ -786,6 +789,11 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         requiredResponses     = _n;
         responseTimeoutSeconds = _timeoutSecs;
     }
+
+function setBonusMultiplier(uint256 _m) external onlyOwner {
+    require(_m <= 20, "bonus 0-20x");
+    bonusMultiplier = _m;
+}
 
 /// Accept plain transfers (0-ETH is fine) so front-end “Send” does not revert
 receive() external payable { }
