@@ -42,8 +42,8 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     uint256 public alpha = 500;             // reputation weight
 
     // rolling entropy
-    bytes16 public rollingEntropy;     // init to 0x0 and build over time
-    uint256 public lastEntropyBlock;   // block.number the keeper saw last
+    bytes16 public rollingEntropy;          // init to 0x0 and build over time
+    uint256 public lastEntropyBlock;        // block.number the keeper saw last
 
     // owner-settable LINK fee limits
     uint256 public maxOracleFee;
@@ -68,7 +68,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     event NewOracleResponseRecorded(bytes32 requestId, uint256 pollIndex, address operator);
     event BonusPayment(address indexed operator, uint256 bonusFee);
     event EvaluationTimedOut(bytes32 indexed aggRequestId);
-    event EvaluationFailed  (bytes32 indexed aggRequestId, string phase);
+    event EvaluationFailed(bytes32 indexed aggRequestId, string phase);
     event OracleScoreUpdateSkipped(address oracle, bytes32 jobId, string reason);
     event HashMismatch(bytes32 requestId, bytes16 computedHash, bytes16 storedHash);
     event ReputationKeeperChanged(address indexed oldKeeper, address indexed newKeeper);
@@ -138,13 +138,13 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         lastEntropyBlock = block.number;
 
         // default parameters keep the old behaviour: K=M=4, N=3, P=2
-        commitOraclesToPoll = 5;  // K (default – one extra oracle)
-        oraclesToPoll = 4;        // M
-        requiredResponses = 3;    // N
-        clusterSize = 2;          // P
+        commitOraclesToPoll = 5;        // K (default – one extra oracle)
+        oraclesToPoll = 4;              // M
+        requiredResponses = 3;          // N
+        clusterSize = 2;                // P
 
         responseTimeoutSeconds = 5 minutes;
-        maxOracleFee = 0.1 * 10 ** 18; // 0.1 LINK
+        maxOracleFee = 0.1 * 10 ** 18;  // 0.1 LINK
     }
 
     // ----------------------------------------------------------------------
@@ -193,7 +193,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
      */
     function maxTotalFee(uint256 requestedMaxOracleFee) public view returns (uint256) {
         uint256 eff = requestedMaxOracleFee < maxOracleFee ? requestedMaxOracleFee : maxOracleFee;
-        return eff * (commitOraclesToPoll + bonusMultiplier*clusterSize);
+        return eff * (commitOraclesToPoll + bonusMultiplier * clusterSize);
     }
 
     // ----------------------------------------------------------------------
@@ -272,42 +272,43 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     // ----------------------------------------------------------------------
     //                         TIMEOUT HANDLING
     // ----------------------------------------------------------------------
+    function finalizeEvaluationTimeout(bytes32 aggId) external nonReentrant {
+        AggregatedEvaluation storage agg = aggregatedEvaluations[aggId];
+        require(!agg.isComplete, "Aggregation already completed");
+        require(
+            block.timestamp >= agg.startTimestamp + responseTimeoutSeconds,
+            "Evaluation not yet timed out"
+        );
 
-function finalizeEvaluationTimeout(bytes32 aggId) external nonReentrant {
-    AggregatedEvaluation storage agg = aggregatedEvaluations[aggId];
-    require(!agg.isComplete, "Aggregation already completed");
-    require(block.timestamp >= agg.startTimestamp + responseTimeoutSeconds,
-            "Evaluation not yet timed out");
-
-    /* ----------------- commit phase timed out ----------------- */
-    if (!agg.commitPhaseComplete) {
-        if (agg.commitReceived >= oraclesToPoll) {
-            // enough commits → try to progress to reveal
-            agg.commitPhaseComplete = true;
-            emit CommitPhaseComplete(aggId);
-            _dispatchRevealRequests(aggId, agg);
-            return;   // give them another timeout window
+        /* ----------------- commit phase timed out ----------------- */
+        if (!agg.commitPhaseComplete) {
+            if (agg.commitReceived >= oraclesToPoll) {
+                // enough commits → try to progress to reveal
+                agg.commitPhaseComplete = true;
+                emit CommitPhaseComplete(aggId);
+                _dispatchRevealRequests(aggId, agg);
+                return;   // give them another timeout window
+            }
+            // < M commits → fail job
+            _applyTimeoutPenalties(agg, true);  // penalise non-committing oracles only
+            agg.failed = true;
+            agg.isComplete = true;
+            emit EvaluationFailed(aggId, "commit");
+            return;
         }
-        // < M commits → fail job
-        _applyTimeoutPenalties(agg, true);  // penalise non-committing oracles only
-        agg.failed    = true;
-        agg.isComplete = true;
-        emit EvaluationFailed(aggId, "commit");
-        return;
-    }
 
-    /* ----------------- reveal phase timed out ----------------- */
-    if (agg.responseCount < agg.requiredResponses) {
-        _applyTimeoutPenalties(agg, false); // penalise non-revealing oracles
-        agg.failed    = true;
-        agg.isComplete = true;
-        emit EvaluationFailed(aggId, "reveal");
-        return;
-    }
+        /* ----------------- reveal phase timed out ----------------- */
+        if (agg.responseCount < agg.requiredResponses) {
+            _applyTimeoutPenalties(agg, false); // penalise non-revealing oracles
+            agg.failed = true;
+            agg.isComplete = true;
+            emit EvaluationFailed(aggId, "reveal");
+            return;
+        }
 
-    // enough responses after all → finish normally
-    _finalizeAggregation(aggId);
-}
+        // enough responses after all → finish normally
+        _finalizeAggregation(aggId);
+    }
 
     // ----------------------------------------------------------------------
     //                                FULFILL (NODE CALLBACK)
@@ -405,7 +406,6 @@ function finalizeEvaluationTimeout(bytes32 aggId) external nonReentrant {
     //                      INTERNAL: DISPATCH REVEAL REQUESTS
     // ----------------------------------------------------------------------
     function _dispatchRevealRequests(bytes32 aggId, AggregatedEvaluation storage agg) internal {
-
         for (uint256 slot = 0; slot < agg.polledOracles.length; slot++) {
             bytes16 hash128 = agg.commitHashPerSlot[slot];
             if (hash128 == bytes16(0)) {
@@ -528,7 +528,7 @@ function finalizeEvaluationTimeout(bytes32 aggId) external nonReentrant {
                         try reputationKeeper.updateScores(id.oracle, resp.jobId, int8(4), int8(4)) {} catch {
                             emit OracleScoreUpdateSkipped(resp.operator, resp.jobId, "updateScores failed for clustered selected response");
                         }
-                        uint256 bonus = agg.pollFees[slot]*bonusMultiplier;
+                        uint256 bonus = agg.pollFees[slot] * bonusMultiplier;
                         _payBonus(agg.requester, agg.userFunded, bonus, resp.operator);
                         return (true, 1);
                     } else {
@@ -748,6 +748,34 @@ function finalizeEvaluationTimeout(bytes32 aggId) external nonReentrant {
     }
 
     // ----------------------------------------------------------------------
+    //             TIMEOUT PENALTY HELPERS
+    // ----------------------------------------------------------------------
+    function _applyTimeoutPenalties(
+        AggregatedEvaluation storage agg,
+        bool commitPhase            // true  = commit timeout
+    ) private {
+        uint256 m = agg.polledOracles.length;
+        for (uint256 slot = 0; slot < m; slot++) {
+            bool shouldPenalise;
+
+            if (commitPhase) {
+                // commitHashPerSlot == 0  ⇒  oracle never committed
+                shouldPenalise = (agg.commitHashPerSlot[slot] == bytes16(0));
+            } else {
+                // reveal phase ⇒ penalise only if no reveal received
+                (bool responded, ) = _getResponseForSlot(agg.responses, slot);
+                shouldPenalise = !responded;
+            }
+
+            if (shouldPenalise) {
+                ReputationKeeper.OracleIdentity memory id = agg.polledOracles[slot];
+                try reputationKeeper.updateScores(id.oracle, id.jobId, int8(0), int8(-2)) { }
+                catch { emit OracleScoreUpdateSkipped(id.oracle, id.jobId, "timeout penalty"); }
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------------
     //             EVALUATION GETTERS & WITHDRAW
     // ----------------------------------------------------------------------
     function getEvaluation(bytes32 reqId) public view returns (uint256[] memory, string memory, bool) {
@@ -806,47 +834,20 @@ function finalizeEvaluationTimeout(bytes32 aggId) external nonReentrant {
         responseTimeoutSeconds = _timeoutSecs;
     }
 
-function setBonusMultiplier(uint256 _m) external onlyOwner {
-    require(_m <= 20, "bonus 0-20x");
-    bonusMultiplier = _m;
-}
-
-function _applyTimeoutPenalties(
-        AggregatedEvaluation storage agg,
-        bool commitPhase            // true  = commit timeout
-    ) private {
-
-    uint256 m = agg.polledOracles.length;
-    for (uint256 slot = 0; slot < m; slot++) {
-
-        bool shouldPenalise;
-
-        if (commitPhase) {
-            // commitHashPerSlot == 0  ⇒  oracle never committed
-            shouldPenalise = (agg.commitHashPerSlot[slot] == bytes16(0));
-        } else {
-            // reveal phase ⇒ penalise only if no reveal received
-            (bool responded, ) = _getResponseForSlot(agg.responses, slot);
-            shouldPenalise = !responded;
-        }
-
-        if (shouldPenalise) {
-            ReputationKeeper.OracleIdentity memory id = agg.polledOracles[slot];
-            try reputationKeeper.updateScores(id.oracle, id.jobId, int8(0), int8(-2)) { }
-            catch { emit OracleScoreUpdateSkipped(id.oracle, id.jobId, "timeout penalty"); }
-        }
+    function setBonusMultiplier(uint256 _m) external onlyOwner {
+        require(_m <= 20, "bonus 0-20x");
+        bonusMultiplier = _m;
     }
-}
 
-function isFailed(bytes32 aggId) external view returns (bool) {
-    return aggregatedEvaluations[aggId].failed;
-}
-/// Accept plain transfers (0-ETH is fine) so front-end “Send” does not revert
-receive() external payable { }
+    function isFailed(bytes32 aggId) external view returns (bool) {
+        return aggregatedEvaluations[aggId].failed;
+    }
 
-/// Optional: catch unexpected calldata and show it in logs
-fallback() external payable {
-    // emit an event or leave empty
-}
+    /// Accept plain transfers (0-ETH is fine) so front-end "Send" does not revert
+    receive() external payable { }
 
+    /// Optional: catch unexpected calldata and show it in logs
+    fallback() external payable {
+        // emit an event or leave empty
+    }
 }
