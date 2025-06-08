@@ -3,7 +3,7 @@
 // Post‑deployment wiring & parameters
 //   • Set Verdikta token address inside ReputationKeeper (defensive)           
 //   • Configure ReputationAggregator (cluster, responses, fee, timeout)       
-//   • Set max oracle fee (0.08 LINK)                                          
+//   • Set max oracle fee (0.05 LINK)                                          
 //                                                                             
 // Tags:    config                                                              
 // Depends: aggregator, keeper                                                  
@@ -68,7 +68,7 @@ if (keeper.target === aggregator.target) {
   console.log("Configuring aggregator parameters…");
   await (await aggregator.setConfig(4, 3, 2, 300)).wait();
 
-  const maxFee = ethers.parseEther("0.08"); // 0.08 LINK
+  const maxFee = ethers.parseEther("0.05"); // In LINK as maximum fee increment.
   await (await aggregator.setMaxOracleFee(maxFee)).wait();
 
   console.log("Aggregator configured ✓");
