@@ -123,24 +123,28 @@ contract ReputationSingleton is ChainlinkClient, Ownable, ReentrancyGuard {
                 1,_alpha,_maxOracleFee,_estimatedBaseCost,_maxFeeBasedScalingFactor,_requestedClass);
         reputationKeeper.recordUsedOracles(chosen);
 
-        /* 2. pull base fee */
-        require(LinkTokenInterface(_chainlinkTokenAddress())
-                .transferFrom(msg.sender,address(this),_maxOracleFee),"LINK pull failed");
+        /* 2️⃣. ask the keeper for that oracle’s registered fee */
+        ( /*active*/, , , , , uint256 oracleFee, , , ) =
+              reputationKeeper.getOracleInfo(chosen[0].oracle, chosen[0].jobId);
 
-        /* 3. send request */
+        /* 3. pull base fee */
+        require(LinkTokenInterface(_chainlinkTokenAddress())
+                .transferFrom(msg.sender,address(this),oracleFee),"LINK pull failed");
+
+        /* 4. send request */
         Chainlink.Request memory req =
             _buildOperatorRequest(chosen[0].jobId,this.fulfill.selector);
         req._add("cid",payload);
-        bytes32 reqId = _sendOperatorRequestTo(chosen[0].oracle,req,_maxOracleFee);
+        bytes32 reqId = _sendOperatorRequestTo(chosen[0].oracle,req,oracleFee);
 
-        /* 4. record meta */
+        /* 5. record meta */
         _reqMeta[reqId]=ReqMeta({
             started:   block.timestamp,
             done:      false,
             failed:    false,
             requester: msg.sender,
             oracle:    chosen[0].oracle,
-            feeUsed: _maxOracleFee
+            feeUsed:   oracleFee
         });
         return reqId;
     }
