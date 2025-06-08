@@ -150,6 +150,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     // ----------------------------------------------------------------------
     //                            CONFIGURATION API
     // ----------------------------------------------------------------------
+    // setPhaseCounts is DEPRECATED - Use setConfig instead
     /**
      * @dev Set all phase counts at once (K, M, N, P)
      * @param _k Number of oracles to poll in commit phase
@@ -821,16 +822,19 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         uint256 _k,
         uint256 _m,
         uint256 _n,
+        uint256 _p,
         uint256 _timeoutSecs
     ) external onlyOwner {
         // same safety checks as individual setters
         require(_k >= _m, "K >= M");
         require(_m >= _n, "M >= N");
-        require(_n >= 1,  "N >= 1");
+        require(_n >= _p, "N >= P");
+        require(_p >= 1,  "P >= 1");
 
         commitOraclesToPoll   = _k;
         oraclesToPoll         = _m;
         requiredResponses     = _n;
+        clusterSize           = _p;
         responseTimeoutSeconds = _timeoutSecs;
     }
 
@@ -841,13 +845,5 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
 
     function isFailed(bytes32 aggId) external view returns (bool) {
         return aggregatedEvaluations[aggId].failed;
-    }
-
-    /// Accept plain transfers (0-ETH is fine) so front-end "Send" does not revert
-    receive() external payable { }
-
-    /// Optional: catch unexpected calldata and show it in logs
-    fallback() external payable {
-        // emit an event or leave empty
     }
 }
