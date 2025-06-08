@@ -19,6 +19,7 @@ module.exports = async ({ deployments, getNamedAccounts, ethers, network }) => {
 
   const { deploy }   = deployments;
   const { deployer } = await getNamedAccounts();
+  const CONFIRMATIONS = network.name === "base_sepolia" ? 2 : 1;
 
   /* ----------------------------------------------------------------------- */
   /* Resolve token address                                                   */
@@ -32,23 +33,22 @@ module.exports = async ({ deployments, getNamedAccounts, ethers, network }) => {
   /* ----------------------------------------------------------------------- */
   /* Deploy ReputationKeeper                                                 */
   /* ----------------------------------------------------------------------- */
-  // Wait for aggregator deployment to settle
-  // await new Promise(resolve => setTimeout(resolve, 5000)); // 5-second delay
-  const currentNonce = await ethers.provider.getTransactionCount(deployer, "latest");
-  const pendingNonce = await ethers.provider.getTransactionCount(deployer, "pending");
-  const safeNonce = Math.max(currentNonce, pendingNonce);
-
-  console.log(`Using nonce ${safeNonce} (current: ${currentNonce}, pending: ${pendingNonce})`);
+  const cNonce = await ethers.provider.getTransactionCount(deployer, "latest");
+  const pNonce = await ethers.provider.getTransactionCount(deployer, "pending");
+  const sNonce = Math.max(cNonce, pNonce);
+  console.log(`For Keeper deployment, probably using nonce ${sNonce} (current: ${cNonce}, pending: ${pNonce})`);
 
   const keeperRes = await deploy("ReputationKeeper", {
     from: deployer,
     args: [TOKEN_ADDR],
     log: true,
+    waitConfirmations: CONFIRMATIONS
     // gasLimit: 5_000_000,
-    nonce: safeNonce
+    // nonce: safeNonce
   });
+
   const keeperAddr = keeperRes.address;
-  console.log("ReputationKeeper deployed:", keeperAddr);
+  console.log("ReputationKeeper deployment completed:", keeperAddr);
 
   /* ----------------------------------------------------------------------- */
   /* Wire keeper ↔ aggregator                                                */
@@ -95,13 +95,14 @@ module.exports = async ({ deployments, getNamedAccounts, ethers, network }) => {
 if (!isApproved) {
   try {
     console.log("Approving aggregator using hardhat-deploy...");
-    await execute(
+    const txApp = await execute(
       "ReputationKeeper",           // Contract name
       { 
         from: deployer, 
         log: true,
         // gasLimit: 800000,           // Keep your working gas settings
-        gasPrice: ethers.parseUnits("10", "gwei")
+        gasPrice: ethers.parseUnits("10", "gwei"),
+	waitConfirmations: CONFIRMATIONS
       },
       "approveContract",            // Function name  
       aggInfo.address              // Function argument
@@ -124,13 +125,14 @@ console.log("Expected keeper:", keepInfo.address);
 if (currentKeeper.toLowerCase() !== keepInfo.address.toLowerCase()) {
   try {
     console.log("Setting keeper using hardhat-deploy...");
-    await execute(
+    const txSet = await execute(
       "ReputationAggregator",       // Contract name
       { 
         from: deployer, 
         log: true,
         // gasLimit: 300000,           // Adjust gas as needed
-        gasPrice: ethers.parseUnits("10", "gwei")
+        gasPrice: ethers.parseUnits("10", "gwei"),
+	waitConfirmations: CONFIRMATIONS
       },
       "setReputationKeeper",        // Function name
       keepInfo.address             // Function argument
