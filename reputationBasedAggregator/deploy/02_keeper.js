@@ -101,7 +101,7 @@ if (!isApproved) {
         from: deployer, 
         log: true,
         // gasLimit: 800000,           // Keep your working gas settings
-        gasPrice: ethers.parseUnits("10", "gwei"),
+        // gasPrice: ethers.parseUnits("10", "gwei"),
 	waitConfirmations: CONFIRMATIONS
       },
       "approveContract",            // Function name  
@@ -131,7 +131,7 @@ if (currentKeeper.toLowerCase() !== keepInfo.address.toLowerCase()) {
         from: deployer, 
         log: true,
         // gasLimit: 300000,           // Adjust gas as needed
-        gasPrice: ethers.parseUnits("10", "gwei"),
+        // gasPrice: ethers.parseUnits("10", "gwei"),
 	waitConfirmations: CONFIRMATIONS
       },
       "setReputationKeeper",        // Function name
