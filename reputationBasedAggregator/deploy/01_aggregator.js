@@ -16,6 +16,7 @@ module.exports = async ({ deployments, getNamedAccounts, network }) => {
 
   const { deploy }   = deployments;
   const { deployer } = await getNamedAccounts();
+  const CONFIRMATIONS = network.name === "base_sepolia" ? 2 : 1;
 
   // LINK token address lookup (per‑network)
   const LINK_TOKEN_ADDRESS = {
@@ -38,6 +39,7 @@ module.exports = async ({ deployments, getNamedAccounts, network }) => {
     from: deployer,
     args: [linkAddr, ZERO],
     log: true,
+    waitConfirmations: CONFIRMATIONS
   });
 };
 
