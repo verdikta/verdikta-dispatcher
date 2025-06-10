@@ -449,42 +449,80 @@ contract ReputationKeeper is Ownable {
     }
     
     /**
-     * @dev Internal helper to perform weighted selection on a given shortlist.
+     * @dev Internal helper to perform weighted selection on a given shortlist (while avoiding duplicates if possible).
      */
-    function _weightedSelect(
-        OracleIdentity[] memory shortlist,
-        SelectionParams memory params,
-        uint256 count
-    ) internal view returns (OracleIdentity[] memory) {
-        uint256 shortlistCount = shortlist.length;
-        uint256 totalWeight = 0;
-        uint256[] memory weights = new uint256[](shortlistCount);
-        for (uint256 i = 0; i < shortlistCount; i++) {
-            weights[i] = getSelectionScore(shortlist[i].oracle, shortlist[i].jobId, params);
-            totalWeight += weights[i];
-        }
-        OracleIdentity[] memory selectedOracles = new OracleIdentity[](count);
-        for (uint256 i = 0; i < count; i++) {
+function _weightedSelect(
+    OracleIdentity[] memory shortlist,
+    SelectionParams memory params,
+    uint256 count
+) internal view returns (OracleIdentity[] memory) {
 
-            // choose entropy: prev if push happened this block, else latest
-            bytes16 chosenEntropy = (block.number == entropyBlock) ? entropyBuf[1] : entropyBuf[0];
-            bytes32 seedFull = keccak256( abi.encodePacked(chosenEntropy, block.prevrandao, block.timestamp, i));
-            uint256 seed = uint256(seedFull);
-            uint256 selection = seed % totalWeight;
-            uint256 sum = 0;
-            for (uint256 j = 0; j < shortlistCount; j++) {
-                sum += weights[j];
-                if (sum > selection) {
-                    selectedOracles[i] = shortlist[j];
-                    break;
+    // Pick arbiter-provided entropy from earlier block to prevent manipulation
+    bytes16 chosenEntropy =
+        (block.number == entropyBlock) ? entropyBuf[1] : entropyBuf[0];
+
+    uint256 n = shortlist.length;
+
+    // Pre-compute weights once
+    uint256[] memory weights = new uint256[](n);
+    uint256 totalWeight = 0;
+    for (uint256 i; i < n; ++i) {
+        weights[i] = getSelectionScore(
+            shortlist[i].oracle,
+            shortlist[i].jobId,
+            params
+        );
+        totalWeight += weights[i];
+    }
+
+    // Keep a copy of the *full* total for later reuse
+    uint256 fullWeight = totalWeight;
+
+    OracleIdentity[] memory selected = new OracleIdentity[](count);
+    bool[] memory taken = new bool[](n);
+
+    /* ---------- 1st pass: unique selections ---------- */
+    uint256 uniqueDraws = count > n ? n : count;
+    for (uint256 k; k < uniqueDraws; ++k) {
+        bytes32 seed = keccak256(
+            abi.encodePacked(chosenEntropy, block.prevrandao, block.timestamp, k)
+        );
+        uint256 pivot = uint256(seed) % totalWeight;
+
+        uint256 acc = 0;
+        uint256 j;
+        for (j = 0; j < n; ++j) {
+            if (taken[j]) continue;
+            acc += weights[j];
+            if (acc > pivot) break;
+        }
+        selected[k] = shortlist[j];
+        taken[j] = true;
+
+        // Burn this weight so it can’t be drawn again in the unique phase
+        totalWeight -= weights[j];
+    }
+
+    /* ---------- 2nd pass: duplicates allowed (only if needed) ---------- */
+    if (count > n) {
+        for (uint256 k = uniqueDraws; k < count; ++k) {
+            bytes32 seed = keccak256(
+                abi.encodePacked(chosenEntropy, block.prevrandao, block.timestamp, k)
+            );
+            uint256 pivot = uint256(seed) % fullWeight;   // use *full* weight
+
+            uint256 acc = 0;
+            for (uint256 j; j < n; ++j) {
+                acc += weights[j];
+                if (acc > pivot) {
+                    selected[k] = shortlist[j];
+                    break;              // duplicates now permitted
                 }
             }
-            if (selectedOracles[i].oracle == address(0)) {
-                selectedOracles[i] = shortlist[0];
-            }
         }
-        return selectedOracles;
     }
+    return selected;
+}
     
     /**
      * @notice Records that a set of oracle identities were used by an approved contract.
