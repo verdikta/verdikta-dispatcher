@@ -5,12 +5,16 @@ pragma solidity ^0.8.19;
 /*  Imports                                                      */
 /* ────────────────────────────────────────────────────────────── */
 
-import "../lib/chainlink/src/v0.8/operatorforwarder/Operator.sol";
+import "../lib/chainlink/src/v0.8/operatorforwarder/OperatorMod.sol";
 import "@openzeppelin/contracts/utils/introspection/ERC165.sol";
 
 /* ────────────────────────────────────────────────────────────── */
-/*  ERC-165 Interface that only ArbiterOperator implements        */
+/*  Lightweight external interfaces                              */
 /* ────────────────────────────────────────────────────────────── */
+
+interface IReputationKeeper {
+    function isContractApproved(address contractAddress) external view returns (bool);
+}
 
 interface IArbiterOperator {
     function fulfillOracleRequest3(
@@ -27,26 +31,33 @@ interface IArbiterOperator {
 /*  ArbiterOperator                                              */
 /* ────────────────────────────────────────────────────────────── */
 
-/// @notice Chainlink Operator variant that exposes `fulfillOracleRequest3`
-///         and advertises its interface via ERC-165 so that on-chain
-///         registries can verify the contract type.
-contract ArbiterOperator is Operator, ERC165, IArbiterOperator {
+/// @notice Chainlink Operator variant that
+///         1) exposes `fulfillOracleRequest3` (multi-word)
+///         2) enforces an allow-list of consumers approved by one or more
+///            ReputationKeeper contracts *before* the OracleRequest event
+///            is emitted (so nodes never start un-approved jobs).
+contract ArbiterOperator is OperatorMod, ERC165, IArbiterOperator {
     /*──────────────  CONFIG  ──────────────*/
 
-    /// Matches Chainlink upstream default (node sends 500 000 gas).
+    /// Matches Chainlink upstream (node sends ≈500 k gas).
     uint256 private constant MY_MINIMUM_CONSUMER_GAS_LIMIT = 400_000;
 
-    /*──────────────  EVENTS  ──────────────*/
+    /*────────  RK allow-list STORAGE  ─────*/
 
-    /// Emitted just before the external callback
+    mapping(address => bool) private rk;      // ReputationKeeper → true/false
+    address[]               private rkList;   // enumeration for _approved()
+
+    event ReputationKeeperAdded(address indexed rk);
+    event ReputationKeeperRemoved(address indexed rk);
+
+    /*────────  EVENTS (callback tracing)  ─*/
+
     event OracleCallbackAttempt(
         bytes32 indexed requestId,
         address callback,
         bytes4  selector,
         uint256 gasBefore
     );
-
-    /// Emitted right after the external callback returns
     event OracleCallbackResult(
         bytes32 indexed requestId,
         bool     success,
@@ -56,12 +67,65 @@ contract ArbiterOperator is Operator, ERC165, IArbiterOperator {
 
     /*────────────  CONSTRUCTOR  ───────────*/
 
-    constructor(address linkToken) Operator(linkToken, msg.sender) {}
+    constructor(address linkToken)
+        OperatorMod(linkToken, msg.sender)   // pass straight through
+    {}
 
-    /*────────────  ERC-165  ───────────────*/
+    /*────────────  RK management  ─────────*/
 
-    /// @dev Advertise support for IArbiterOperator as well as any
-    ///      interfaces claimed by the parent contract(s).
+    function addReputationKeeper(address rkAddr) external onlyOwner {
+        require(rkAddr.code.length > 0, "RK: not contract");
+        require(!rk[rkAddr],            "RK: exists");
+
+        // sanity-check interface
+        (bool ok, ) = rkAddr.staticcall(
+            abi.encodeWithSignature("isContractApproved(address)", address(this))
+        );
+        require(ok, "RK: interface");
+
+        rk[rkAddr] = true;
+        rkList.push(rkAddr);
+        emit ReputationKeeperAdded(rkAddr);
+    }
+
+    function removeReputationKeeper(address rkAddr) external onlyOwner {
+        require(rk[rkAddr], "RK: unknown");
+        delete rk[rkAddr];
+
+        for (uint256 i; i < rkList.length; ++i) {
+            if (rkList[i] == rkAddr) {
+                rkList[i] = rkList[rkList.length - 1];
+                rkList.pop();
+                break;
+            }
+        }
+        emit ReputationKeeperRemoved(rkAddr);
+    }
+
+    /*────────────  public probes  ─────────*/
+
+    function isReputationKeeper(address rkAddr) external view returns (bool) {
+        return rk[rkAddr];
+    }
+    function isReputationKeeperListEmpty() external view returns (bool) {
+        return rkList.length == 0;
+    }
+
+    /*────────── internal helper ───────────*/
+
+    function _approved(address requester) internal view returns (bool) {
+        if (rkList.length == 0) return true;               // gate disabled
+        for (uint256 i; i < rkList.length; ++i) {
+            (bool ok, bytes memory out) = rkList[i].staticcall(
+                abi.encodeWithSignature("isContractApproved(address)", requester)
+            );
+            if (ok && abi.decode(out, (bool))) return true;
+        }
+        return false;
+    }
+
+    /*────────── ERC-165 override ──────────*/
+
     function supportsInterface(bytes4 interfaceId)
         public
         view
@@ -71,6 +135,17 @@ contract ArbiterOperator is Operator, ERC165, IArbiterOperator {
         return
             interfaceId == type(IArbiterOperator).interfaceId ||
             super.supportsInterface(interfaceId);
+    }
+
+    /*───────── Hook from OperatorMod ──────*/
+
+    /// Called *before* `OracleRequest` is emitted by OperatorMod.
+    function _beforeOracleRequest(address requester)
+        internal
+        view
+        override
+    {
+        require(_approved(requester), "Operator: requester not approved");
     }
 
     /*──────── fulfillOracleRequest3 ───────*/
@@ -91,6 +166,9 @@ contract ArbiterOperator is Operator, ERC165, IArbiterOperator {
         validateMultiWordResponseId(requestId, data)
         returns (bool success)
     {
+        // secondary check (paranoia): block if consumer no longer approved
+        require(_approved(callbackAddress), "Operator: requester not approved");
+
         _verifyOracleRequestAndProcessPayment(
             requestId,
             payment,
