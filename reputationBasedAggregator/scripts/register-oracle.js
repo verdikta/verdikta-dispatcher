@@ -14,7 +14,7 @@ const ORACLE_ADDR = "0xD67D6508D4E5611cd6a463Dd0969Fa153Be91101";
 const JOB_IDS = [
   "38f19572c51041baa5f2dea284614590",
   "39515f75ac2947beb7f2eeae4d8eaf3e",
-  "cdee0a127bc74a5188cbabf7aadcc84f",
+  "cdee0a127bc74a5188cbabf7aadcc84f"
 ];
 const LINK_FEE   = ethers.parseUnits("0.006", 18);  // 0.02 LINK
 const VDKA_STAKE = ethers.parseUnits("100", 18);   // 100 wVDKA
