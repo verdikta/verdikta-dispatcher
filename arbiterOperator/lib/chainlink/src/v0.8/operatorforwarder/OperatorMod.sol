@@ -15,7 +15,7 @@ import {SafeCast} from "../vendor/openzeppelin-solidity/v4.8.3/contracts/utils/m
 // @title The Chainlink Operator contract
 // @notice Node operators can deploy this contract to fulfill requests sent to them
 // solhint-disable gas-custom-errors
-contract Operator is AuthorizedReceiver, ConfirmedOwner, LinkTokenReceiver, OperatorInterface, IWithdrawal {
+contract OperatorMod is AuthorizedReceiver, ConfirmedOwner, LinkTokenReceiver, OperatorInterface, IWithdrawal {
   struct Commitment {
     bytes31 paramsHash;
     uint8 dataVersion;
@@ -40,6 +40,13 @@ contract Operator is AuthorizedReceiver, ConfirmedOwner, LinkTokenReceiver, Oper
   mapping(address => bool) private s_owned;
   // Tokens sent for requests that have not been fulfilled yet
   uint256 private s_tokensInEscrow = ONE_FOR_CONSISTENT_GAS_COST;
+
+/* ================================================================
+ *  MOD HOOK — subclasses may override to run logic BEFORE the
+ *  OracleRequest event is emitted (i.e., before nodes start work).
+ *  Default implementation does nothing.
+ * ============================================================= */
+function _beforeOracleRequest(address /*requester*/) internal view virtual {}
 
   event OracleRequest(
     bytes32 indexed specId,
@@ -92,6 +99,10 @@ contract Operator is AuthorizedReceiver, ConfirmedOwner, LinkTokenReceiver, Oper
     uint256 dataVersion,
     bytes calldata data
   ) external override validateFromLINK {
+
+    // MOD - Add check
+    _beforeOracleRequest(sender);
+
     (bytes32 requestId, uint256 expiration) = _verifyAndProcessOracleRequest(
       sender,
       payment,
@@ -122,6 +133,8 @@ contract Operator is AuthorizedReceiver, ConfirmedOwner, LinkTokenReceiver, Oper
     uint256 dataVersion,
     bytes calldata data
   ) external override validateFromLINK {
+    // MOD - Add check
+    _beforeOracleRequest(sender);
     (bytes32 requestId, uint256 expiration) = _verifyAndProcessOracleRequest(
       sender,
       payment,
