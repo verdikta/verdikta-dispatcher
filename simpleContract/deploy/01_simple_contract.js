@@ -6,11 +6,11 @@ module.exports = async (hre) => {
   /* ------------------------------------------------------------------ */
   /* CONFIG                                                             */
   // Set this to the address of your deployed operator contract:
-  const oracleAddress = "0x0e9C48924c5918ab7aED7B9EFBfcd6d6A9d21D0b";
+  const oracleAddress = "0xb8b2302759e1FB7144d35f6F41057f11dbFAdDbD";
 
   // ---- raw 16-byte job-ID (32 hex chars, no hyphens) -----------------
   // Set this to the job ID you recieved when configuring the Chainlink job:
-  const rawJobId = "c6a5a82aa4814f8296c30fa44aff715e";
+  const rawJobId = "6c751f1a36f348dc8655c11e0f804b31";
 
   // ---- pad it on the *right* to 32 bytes -----------------------------
   function rightPadToBytes32(id16) {
@@ -20,7 +20,7 @@ module.exports = async (hre) => {
   }
   const jobId = rightPadToBytes32(rawJobId);
 
-  const fee           = ethers.parseEther("0.05");  // 0.05 LINK
+  const fee           = ethers.parseEther("0.01");  // 0.01 LINK
   const linkToken     = "0xE4aB69C077896252FAFBD49EFD26B5D171A32410";
   const requiredClass = 128;
   /* ------------------------------------------------------------------ */
