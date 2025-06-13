@@ -16,7 +16,7 @@ const { ethers, deployments } = hre;
 /* ------------------------------------------------------------------- */
 /* Constants                                                           */
 /* ------------------------------------------------------------------- */
-const ORACLE_ADDR = "0xD67D6508D4E5611cd6a463Dd0969Fa153Be91101";
+const ORACLE_ADDR = "0xb8b2302759e1FB7144d35f6F41057f11dbFAdDbD";
 const JOB_IDS = [
   "38f19572c51041baa5f2dea284614590",
   "39515f75ac2947beb7f2eeae4d8eaf3e",
