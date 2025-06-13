@@ -10,13 +10,16 @@ const hre = require("hardhat");
 const { ethers, deployments } = hre;
 
 /* --------------------------------------------------------------------- */
-const ORACLE_ADDR = "0xD67D6508D4E5611cd6a463Dd0969Fa153Be91101";
+const ORACLE_ADDR = "0xb8b2302759e1FB7144d35f6F41057f11dbFAdDbD";
 const JOB_IDS = [
-  "38f19572c51041baa5f2dea284614590",
+  "6c751f1a36f348dc8655c11e0f804b31",
+  "4d48270ca94f45188b3ec06f0dba8742",
+  "c6a5a82aa4814f8296c30fa44aff715e",
+  "cdee0a127bc74a5188cbabf7aadcc84f",
   "39515f75ac2947beb7f2eeae4d8eaf3e",
-  "cdee0a127bc74a5188cbabf7aadcc84f"
+  "38f19572c51041baa5f2dea284614590"
 ];
-const LINK_FEE   = ethers.parseUnits("0.006", 18);  // 0.02 LINK
+const LINK_FEE   = ethers.parseUnits("0.007", 18);  // 0.007 LINK
 const VDKA_STAKE = ethers.parseUnits("100", 18);   // 100 wVDKA
 /* --------------------------------------------------------------------- */
 
