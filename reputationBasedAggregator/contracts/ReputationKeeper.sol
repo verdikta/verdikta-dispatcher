@@ -124,8 +124,7 @@ contract ReputationKeeper is Ownable {
     ) external {
         require(_oracle != address(0), "oracle is a zero addr");
         require(_oracle.code.length > 0, "oracle address has no code");
-        //TODO: Uncomment the line below once only the new ArbiterOperator is being used. Then it will pass.
-        //require(IERC165(_oracle).supportsInterface(ARBITERIFACE), "Oracle must be ArbiterOperator");
+        require(IERC165(_oracle).supportsInterface(ARBITERIFACE), "Oracle must be ArbiterOperator");
 
         bytes32 key = _oracleKey(_oracle, _jobId);
         // Ensure the oracle is not already registered.
