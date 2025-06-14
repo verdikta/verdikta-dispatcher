@@ -149,5 +149,5 @@ if (currentKeeper.toLowerCase() !== keepInfo.address.toLowerCase()) {
 };
 
 module.exports.tags = ["keeper"];
-module.exports.dependencies = ["aggregator"];
+// module.exports.dependencies = ["aggregator"];
 
