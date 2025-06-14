@@ -122,16 +122,18 @@ contract ReputationKeeper is Ownable {
         uint256 fee,
         uint64[] memory _classes
     ) external {
-        require(_oracle != address(0), "oracle is a zero addr");
-        require(_oracle.code.length > 0, "oracle address has no code");
-        require(IERC165(_oracle).supportsInterface(ARBITERIFACE), "Oracle must be ArbiterOperator");
+        require(_oracle != address(0), "Oracle is a zero address");
+        require(_oracle.code.length > 0, "Oracle address has no code");
+        require(IERC165(_oracle).supportsInterface(ARBITERIFACE), "Oracle not ArbiterOperator type");
+        IArbiterOperator op = IArbiterOperator(_oracle);
+        require(op.isReputationKeeperListEmpty() || op.isReputationKeeper(address(this)), "Oracle does not support Reputation Keeper");
 
         bytes32 key = _oracleKey(_oracle, _jobId);
         // Ensure the oracle is not already registered.
-        require(oracles[key].stakeAmount == 0, "Oracle already registered");
+        require(oracles[key].stakeAmount == 0, "Oracle is already registered");
         require(fee > 0, "Fee must be greater than 0");
         require(_classes.length > 0, "At least one class must be provided");
-        require(_classes.length <= 5, "A maximum of 5 classes allowed");
+        require(_classes.length <= 5, "A maximum of 5 classes are allowed");
         
         require(
             msg.sender == owner() || msg.sender == IOracleOwner(_oracle).owner(),
