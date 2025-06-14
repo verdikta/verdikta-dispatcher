@@ -10,7 +10,7 @@ const hre = require("hardhat");
 const { ethers, deployments } = hre;
 
 /* --------------------------------------------------------------------- */
-const ORACLE_ADDR = "0xb8b2302759e1FB7144d35f6F41057f11dbFAdDbD";
+const ORACLE_ADDR = "0x00A08b75178de0e0d7FF13Fdd4ef925AC3572503";
 const JOB_IDS = [
   "6c751f1a36f348dc8655c11e0f804b31",
   "4d48270ca94f45188b3ec06f0dba8742",
