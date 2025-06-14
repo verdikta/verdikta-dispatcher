@@ -1,0 +1,1 @@
+After deploying with ./deploy.sh, you must authorize the chainlink node with the operator using ./setAuthorizedSenders.sh
