@@ -16,11 +16,14 @@ const { ethers, deployments } = hre;
 /* ------------------------------------------------------------------- */
 /* Constants                                                           */
 /* ------------------------------------------------------------------- */
-const ORACLE_ADDR = "0xb8b2302759e1FB7144d35f6F41057f11dbFAdDbD";
+const ORACLE_ADDR = "0x00A08b75178de0e0d7FF13Fdd4ef925AC3572503";
 const JOB_IDS = [
-  "38f19572c51041baa5f2dea284614590",
-  "39515f75ac2947beb7f2eeae4d8eaf3e",
+  "6c751f1a36f348dc8655c11e0f804b31",
+  "4d48270ca94f45188b3ec06f0dba8742",
+  "c6a5a82aa4814f8296c30fa44aff715e",
   "cdee0a127bc74a5188cbabf7aadcc84f",
+  "39515f75ac2947beb7f2eeae4d8eaf3e",
+  "38f19572c51041baa5f2dea284614590"
 ];
 /* ------------------------------------------------------------------- */
 
