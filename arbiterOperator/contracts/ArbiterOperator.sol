@@ -7,17 +7,32 @@ pragma solidity ^0.8.19;
 
 import "../lib/chainlink/src/v0.8/operatorforwarder/OperatorMod.sol";
 import "@openzeppelin/contracts/utils/introspection/ERC165.sol";
+import "@openzeppelin/contracts/utils/introspection/IERC165.sol";
 
 /* ────────────────────────────────────────────────────────────── */
-/*  Lightweight external interfaces                              */
+/*  External interfaces                                          */
 /* ────────────────────────────────────────────────────────────── */
 
+/// @notice Minimal view used by ArbiterOperator to consult allow-lists.
 interface IReputationKeeper {
     function isContractApproved(address contractAddress) external view returns (bool);
 }
 
-interface IArbiterOperator {
-    function fulfillOracleRequest3(
+/**
+ * @title IArbiterOperator
+ * @notice Marker + allow-list interface implemented **only** by ArbiterOperator.
+ *
+ *         interfaceId = 0xd9f812f9
+ *           = bytes4(
+ *               keccak256("fulfillOracleRequestV(bytes32,uint256,address,bytes4,uint256,bytes)")
+ *             )
+ *             ^ 0x1132d7b2  // isReputationKeeper(address)
+ *             ^ 0xb7834e7d  // isReputationKeeperListEmpty()
+ *         A vanilla Chainlink Operator returns `false` for this ID.
+ */
+interface IArbiterOperator is IERC165 {
+    /*────────  Chainlink multi-word fulfilment  ────────*/
+    function fulfillOracleRequestV(
         bytes32 requestId,
         uint256 payment,
         address callbackAddress,
@@ -25,6 +40,10 @@ interface IArbiterOperator {
         uint256 expiration,
         bytes   calldata data
     ) external returns (bool success);
+
+    /*────────  Allow-list probes  ──────────────────────*/
+    function isReputationKeeper(address rkAddr) external view returns (bool);
+    function isReputationKeeperListEmpty() external view returns (bool);
 }
 
 /* ────────────────────────────────────────────────────────────── */
@@ -32,7 +51,7 @@ interface IArbiterOperator {
 /* ────────────────────────────────────────────────────────────── */
 
 /// @notice Chainlink Operator variant that
-///         1) exposes `fulfillOracleRequest3` (multi-word)
+///         1) exposes `fulfillOracleRequestV` (multi-word response)
 ///         2) enforces an allow-list of consumers approved by one or more
 ///            ReputationKeeper contracts *before* the OracleRequest event
 ///            is emitted (so nodes never start un-approved jobs).
@@ -104,10 +123,11 @@ contract ArbiterOperator is OperatorMod, ERC165, IArbiterOperator {
 
     /*────────────  public probes  ─────────*/
 
-    function isReputationKeeper(address rkAddr) external view returns (bool) {
+    function isReputationKeeper(address rkAddr) external view override returns (bool) {
         return rk[rkAddr];
     }
-    function isReputationKeeperListEmpty() external view returns (bool) {
+
+    function isReputationKeeperListEmpty() external view override returns (bool) {
         return rkList.length == 0;
     }
 
@@ -129,11 +149,11 @@ contract ArbiterOperator is OperatorMod, ERC165, IArbiterOperator {
     function supportsInterface(bytes4 interfaceId)
         public
         view
-        override(ERC165)
+        override(ERC165, IERC165)
         returns (bool)
     {
         return
-            interfaceId == type(IArbiterOperator).interfaceId ||
+            interfaceId == type(IArbiterOperator).interfaceId || // 0xd9f812f9
             super.supportsInterface(interfaceId);
     }
 
@@ -148,10 +168,10 @@ contract ArbiterOperator is OperatorMod, ERC165, IArbiterOperator {
         require(_approved(requester), "Operator: requester not approved");
     }
 
-    /*──────── fulfillOracleRequest3 ───────*/
+    /*──────── fulfillOracleRequestV ───────*/
 
     /// @inheritdoc IArbiterOperator
-    function fulfillOracleRequest3(
+    function fulfillOracleRequestV(
         bytes32 requestId,
         uint256 payment,
         address callbackAddress,
