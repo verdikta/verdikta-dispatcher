@@ -6,7 +6,7 @@ module.exports = async (hre) => {
   /* ------------------------------------------------------------------ */
   /* CONFIG                                                             */
   // Set this to the address of your deployed operator contract:
-  const oracleAddress = "0xb8b2302759e1FB7144d35f6F41057f11dbFAdDbD";
+  const oracleAddress = "0x00A08b75178de0e0d7FF13Fdd4ef925AC3572503";
 
   // ---- raw 16-byte job-ID (32 hex chars, no hyphens) -----------------
   // Set this to the job ID you recieved when configuring the Chainlink job:
