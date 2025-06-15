@@ -23,11 +23,11 @@
 
 // Add and Remove Examples:
 /* 
-HARDHAT_NETWORK=base_sepolia RK_ACTION=add RK_OPERATOR=0xb8b2302759e1FB7144d35f6F41057f11dbFAdDbD \
-RK_KEEPER=0x3ee944351bc1c6074f1b66349d05ceBCcbb200fB node scripts/manageReputationKeepers.js
+HARDHAT_NETWORK=base_sepolia RK_ACTION=add RK_OPERATOR=0x00A08b75178de0e0d7FF13Fdd4ef925AC3572503 \
+RK_KEEPER=0xda32c23FA1955cCF6Eb849206747f089e0074838 node scripts/manageReputationKeepers.js
 
-HARDHAT_NETWORK=base_sepolia RK_ACTION=remove RK_OPERATOR=0xb8b2302759e1FB7144d35f6F41057f11dbFAdDbD \
-RK_KEEPER=0x3ee944351bc1c6074f1b66349d05ceBCcbb200fB node scripts/manageReputationKeepers.js
+HARDHAT_NETWORK=base_sepolia RK_ACTION=remove RK_OPERATOR=0x00A08b75178de0e0d7FF13Fdd4ef925AC3572503 \
+RK_KEEPER=0xda32c23FA1955cCF6Eb849206747f089e0074838 node scripts/manageReputationKeepers.js
 */
 
 require("dotenv").config();           // optional .env support
