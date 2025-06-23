@@ -7,7 +7,7 @@ const { ethers } = require("ethers");
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
 const AGGREGATOR = "0x3637DD9C5aF249D713645209A30FFbC56D3Cd0a1";
 const LINK_TOKEN = "0xE4aB69C077896252FAFBD49EFD26B5D171A32410";
-const NUM_QUERIES          = 3;
+const NUM_QUERIES          = 6;
 const JOB_CLASS            = 128;
 const MAX_ORACLE_FEE       = ethers.parseUnits("0.06", 18);
 const ESTIMATED_BASE_FEE   = ethers.parseUnits("0.000001", 18);
@@ -75,14 +75,14 @@ async function sendQuery(idx, nonce) {
     return { receipt: rcpt, aggId: null };
   }
 }
-  /* ---- fire six queries in parallel ---- */
+  /* ---- fire queries in parallel ---- */
   const startNonce = await signer.getNonce();
   console.log(`Starting nonce: ${startNonce}`);
   const results = await Promise.all(Array.from({ length: NUM_QUERIES }, (_, i) =>
     sendQuery(i + 1, startNonce + i)
   ));
 
-  // Extract aggIds from the results  
+  // Extract aggIds from the results
   const aggIds = results
     .filter(result => result.aggId)
     .map(result => result.aggId);
@@ -94,24 +94,36 @@ async function sendQuery(idx, nonce) {
   console.log("\nChecking for results every 30 seconds...");
   const completedEvaluations = new Set();
   const failedEvaluations = new Set();
+  const errorEvaluations = new Set();
 
   for (let check = 0; check < 10; check++) { // Check for 5 minutes
     await new Promise(resolve => setTimeout(resolve, 30000));
-    
+
     console.log(`\nStatus check ${check + 1}:`);
-    
+
     for (const aggId of aggIds) {
-      if (!completedEvaluations.has(aggId) && !failedEvaluations.has(aggId)) {
+      if (!completedEvaluations.has(aggId) && !failedEvaluations.has(aggId) && !errorEvaluations.has(aggId)) {
         try {
           console.log(`  Checking ${aggId}...`);
           const [likelihoods, justifications, hasResponses] = await agg.getEvaluation(aggId);
           console.log(`    hasResponses: ${hasResponses}, likelihoods.length: ${likelihoods.length}`);
-          
+
           if (hasResponses && likelihoods.length > 0) {
-            console.log(`SUCCESS: ${aggId}`);
-            console.log(`Scores: [${likelihoods.map(x => x.toString()).join(', ')}]`);
-            console.log(`CIDs: ${justifications}`);
-            completedEvaluations.add(aggId);
+            // Check for error conditions: all zeros or empty CIDs
+            const allZeros = likelihoods.every(score => score.toString() === '0');
+            const emptyCIDs = !justifications || justifications.trim() === '';
+            
+            if (allZeros || emptyCIDs) {
+              console.log(`ERROR: ${aggId} - Invalid data (all zeros: ${allZeros}, empty CIDs: ${emptyCIDs})`);
+              console.log(`Scores: [${likelihoods.map(x => x.toString()).join(', ')}]`);
+              console.log(`CIDs: "${justifications}"`);
+              errorEvaluations.add(aggId);
+            } else {
+              console.log(`SUCCESS: ${aggId}`);
+              console.log(`Scores: [${likelihoods.map(x => x.toString()).join(', ')}]`);
+              console.log(`CIDs: ${justifications}`);
+              completedEvaluations.add(aggId);
+            }
           } else {
             // Check if failed
             const failed = await agg.isFailed(aggId);
@@ -128,11 +140,11 @@ async function sendQuery(idx, nonce) {
         }
       }
     }
-    
-    console.log(`Completed: ${completedEvaluations.size}, Failed: ${failedEvaluations.size}, Pending: ${aggIds.length - completedEvaluations.size - failedEvaluations.size}`);
-    
+
+    console.log(`Completed: ${completedEvaluations.size}, Failed: ${failedEvaluations.size}, Error: ${errorEvaluations.size}, Pending: ${aggIds.length - completedEvaluations.size - failedEvaluations.size - errorEvaluations.size}`);
+
     // Stop if all are done
-    if (completedEvaluations.size + failedEvaluations.size >= aggIds.length) {
+    if (completedEvaluations.size + failedEvaluations.size + errorEvaluations.size >= aggIds.length) {
       console.log("All evaluations processed!");
       break;
     }
@@ -141,7 +153,21 @@ async function sendQuery(idx, nonce) {
   console.log(`\nFinal Results:`);
   console.log(`Completed: ${completedEvaluations.size}`);
   console.log(`Failed: ${failedEvaluations.size}`);
-  console.log(`Timed out: ${aggIds.length - completedEvaluations.size - failedEvaluations.size}`);
+  console.log(`Error: ${errorEvaluations.size}`);
+  console.log(`Timed out: ${aggIds.length - completedEvaluations.size - failedEvaluations.size - errorEvaluations.size}`);
+
+  console.log(`\nDetailed Breakdown:`);
+  aggIds.forEach((aggId, i) => {
+    if (completedEvaluations.has(aggId)) {
+      console.log(`[${i+1}] SUCCESS: ${aggId}`);
+    } else if (failedEvaluations.has(aggId)) {
+      console.log(`[${i+1}] FAILED: ${aggId}`);
+    } else if (errorEvaluations.has(aggId)) {
+      console.log(`[${i+1}] ERROR: ${aggId}`);
+    } else {
+      console.log(`[${i+1}] TIMEOUT: ${aggId}`);
+    }
+  });
 }
 main().catch((err) => {
   console.error(err);
