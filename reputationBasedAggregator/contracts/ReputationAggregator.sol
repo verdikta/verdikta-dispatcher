@@ -55,6 +55,9 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     uint256 public constant MAX_CID_LENGTH = 100;
     uint256 public constant MAX_ADDENDUM_LENGTH = 1000;
 
+    // running call counter
+    uint256 private requestCounter;
+
     ReputationKeeper public reputationKeeper;
 
     // ----------------------------------------------------------------------
@@ -229,7 +232,8 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         cidConcat = string(abi.encodePacked("1:", cidConcat));  // Mode 1 – commit
 
         // generate aggregator request id
-        bytes32 aggId = keccak256(abi.encodePacked(block.timestamp, msg.sender, cidConcat));
+        requestCounter++;
+        bytes32 aggId = keccak256(abi.encodePacked(block.timestamp, msg.sender, cidConcat, requestCounter));
         AggregatedEvaluation storage agg = aggregatedEvaluations[aggId];
         agg.commitExpected = commitOraclesToPoll;
         agg.requiredResponses = requiredResponses;
@@ -319,89 +323,109 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
      *      COMMIT PHASE: response[0] contains the pre-computed hash of (actualLikelihoods, salt)
      *      REVEAL PHASE: response contains actual likelihood scores, cid contains "cleanCid:salt"
      */
-    function fulfill(
-        bytes32 requestId,
-        uint256[] memory response,
-        string memory cid
-    ) public recordChainlinkFulfillment(requestId) {
-        bytes32 aggId = requestIdToAggregatorId[requestId];
-        require(aggId != bytes32(0), "Unknown reqId");
-        
-        AggregatedEvaluation storage agg = aggregatedEvaluations[aggId];
-        require(!agg.isComplete, "Aggregation done");
-        require(agg.requestIds[requestId], "Invalid reqId");
+function fulfill(
+    bytes32 requestId,
+    uint256[] memory response,
+    string memory cid
+) public recordChainlinkFulfillment(requestId) nonReentrant {
 
-        uint256 slot = requestIdToPollIndex[requestId];
-        ReputationKeeper.OracleIdentity memory id = agg.polledOracles[slot];
+    bytes32 aggId = requestIdToAggregatorId[requestId];
+    require(aggId != bytes32(0), "Unknown reqId");
 
-        // ------------------------------------------------------------------
-        //                      PHASE-SPECIFIC HANDLING
-        // ------------------------------------------------------------------
-        if (!agg.commitPhaseComplete) {
-            // ----------------------- COMMIT PHASE --------------------------
-            // During commit phase, response[0] contains the hash that the oracle
-            // computed off-chain using: sha256(abi.encode(actualLikelihoods, salt))
-            // We store the first 128 bits of this hash for later verification
-            bytes16 hash128 = bytes16(bytes32(uint256(response[0]) << 128));
-            agg.commitHashPerSlot[slot] = hash128;
-            agg.commitReceived += 1;
+    AggregatedEvaluation storage agg = aggregatedEvaluations[aggId];
+    require(!agg.isComplete, "Aggregation done");
+    require(agg.requestIds[requestId], "Invalid reqId");
 
+    uint256 slot = requestIdToPollIndex[requestId];
+    ReputationKeeper.OracleIdentity memory id = agg.polledOracles[slot];
+
+    // ---------- decide phase from *payload shape* ----------
+    bool looksLikeCommit = (response.length == 1) && (bytes(cid).length == 0);
+    bool looksLikeReveal = (response.length >= 2) && (bytes(cid).length > 0);
+    require(looksLikeCommit || looksLikeReveal, "callback payload malformed");
+
+    /* ────────────────────────────────────────────────────────
+     *                     COMMIT  (Mode-1)
+     * ──────────────────────────────────────────────────────── */
+    if (looksLikeCommit) {
+
+        bytes16 hash128 = bytes16(bytes32(uint256(response[0]) << 128));
+
+        // (a) commit arrived after we already switched to reveal → just log it
+        if (agg.commitPhaseComplete) {
             emit CommitReceived(aggId, slot, msg.sender, hash128);
-
-            // once the first M have committed → dispatch reveal requests
-            if (agg.commitReceived == oraclesToPoll) {
-                agg.commitPhaseComplete = true;
-                emit CommitPhaseComplete(aggId);
-                _dispatchRevealRequests(aggId, agg);
-            }
-            return; // commit fulfilment finished
+            return;
+        }
+        // (b) duplicate commit for this slot → ignore
+        if (agg.commitHashPerSlot[slot] != bytes16(0)) {
+            return;
         }
 
-        // ------------------------- REVEAL PHASE ----------------------------
-        require(response.length > 0, "Empty likelihoods");
-        
-        // the first reveal fixes the expected length
-        if (agg.aggregatedLikelihoods.length == 0) {
-            agg.aggregatedLikelihoods = new uint256[](response.length);
-        } else {
-            require(response.length == agg.aggregatedLikelihoods.length, "Wrong number of scores");
+        // normal commit path
+        agg.commitHashPerSlot[slot] = hash128;
+        agg.commitReceived += 1;
+        emit CommitReceived(aggId, slot, msg.sender, hash128);
+
+        // when we have M commits → start reveal phase
+        if (agg.commitReceived == oraclesToPoll) {
+            agg.commitPhaseComplete = true;
+            emit CommitPhaseComplete(aggId);
+            _dispatchRevealRequests(aggId, agg);
         }
-
-        // Split "cleanCid:20hexSalt" → (cid, saltUint)
-        (string memory cleanCid, uint256 saltUint) = _splitCidAndSalt(cid);
-
-        // Re-compute the 128-bit commitment hash and verify against stored commit
-        // Oracle computed: sha256(abi.encode(actualLikelihoods, salt))
-        // We verify: first 128 bits match what was committed
-        bytes16 recomputed = bytes16(sha256(abi.encode(response, saltUint)));
-        
-        if (recomputed != agg.commitHashPerSlot[slot]) {
-            emit HashMismatch(requestId, recomputed, agg.commitHashPerSlot[slot]);
-            revert("Hash mismatch: reveal hash doesn't match commit hash");
-        }
-
-        _updateEntropy(bytes10(uint80(saltUint)));
-        bool selected = (agg.responses.length < agg.requiredResponses);
-        Response memory resp = Response({
-            likelihoods: response,
-            justificationCID: cleanCid,   // use the cleaned CID
-            requestId: requestId,
-            selected: selected,
-            timestamp: block.timestamp,
-            operator: msg.sender,
-            pollIndex: slot,
-            jobId: id.jobId
-        });
-
-        agg.responses.push(resp);
-        agg.responseCount += 1;
-
-        emit NewOracleResponseRecorded(requestId, slot, msg.sender);
-
-        if (agg.responseCount >= agg.requiredResponses) {
-            _finalizeAggregation(aggId);
-        }
+        return;                                     // commit handled
     }
+
+    /* ────────────────────────────────────────────────────────
+     *                     REVEAL  (Mode-2)
+     * ──────────────────────────────────────────────────────── */
+    require(agg.commitPhaseComplete,
+            "reveal arrived before commit phase complete");
+
+// ─── NEW DUPLICATE-REVEAL GUARD ──────────────────
+(bool seenAlready, ) = _getResponseForSlot(agg.responses, slot);
+if (seenAlready) {
+    return;                                    // ignore retry
+}
+
+    // first reveal fixes array length; every later reveal must match
+    uint256[] storage totals = _ensureAggArrayExists(agg, response.length);
+    require(response.length == totals.length, "Wrong number of scores");
+
+    // Split "cleanCid:20hexSalt" → (cid, saltUint)
+    (string memory cleanCid, uint256 saltUint) = _splitCidAndSalt(cid);
+
+    // verify commit-reveal hash
+    bytes16 recomputed = bytes16(sha256(abi.encode(response, saltUint)));
+    if (recomputed != agg.commitHashPerSlot[slot]) {
+        emit HashMismatch(requestId, recomputed, agg.commitHashPerSlot[slot]);
+        revert("Hash mismatch: reveal hash doesn't match commit hash");
+    }
+
+    // entropy, bookkeeping, and storage insert
+    _updateEntropy(bytes10(uint80(saltUint)));
+    bool selected = (agg.responses.length < agg.requiredResponses);
+
+    Response memory resp = Response({
+        likelihoods:      response,
+        justificationCID: cleanCid,
+        requestId:        requestId,
+        selected:         selected,
+        timestamp:        block.timestamp,
+        operator:         msg.sender,
+        pollIndex:        slot,
+        jobId:            id.jobId
+    });
+
+    agg.responses.push(resp);
+    agg.responseCount += 1;
+    emit NewOracleResponseRecorded(requestId, slot, msg.sender);
+
+    if (agg.responseCount >= agg.requiredResponses) {
+        _finalizeAggregation(aggId);
+    }
+}
+
+
 
     // ----------------------------------------------------------------------
     //                      INTERNAL: DISPATCH REVEAL REQUESTS
@@ -442,8 +466,9 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     // ----------------------------------------------------------------------
     //                            AGGREGATION LOGIC
     // ----------------------------------------------------------------------
-    function _finalizeAggregation(bytes32 aggId) internal nonReentrant {
+    function _finalizeAggregation(bytes32 aggId) internal {
         AggregatedEvaluation storage agg = aggregatedEvaluations[aggId];
+        require(!agg.isComplete, "already-finalised");
 
         uint256 selectedCount = 0;
         for (uint256 i = 0; i < agg.responses.length; i++) {
@@ -567,6 +592,21 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         return string(hexChars);
     }
 
+/// @dev Make sure the per-round running-total array exists and return a
+///      STORAGE pointer to it.  Subsequent writers all share the same slot.
+function _ensureAggArrayExists(
+    AggregatedEvaluation storage agg,
+    uint256 len
+) internal returns (uint256[] storage totals) {
+    if (agg.aggregatedLikelihoods.length == 0) {
+        // Allocate once. If two transactions arrive in the same block,
+        // whichever executes first creates the array; the second one just
+        // re-uses it – no data loss.
+        agg.aggregatedLikelihoods = new uint256[](len);
+    }
+    return agg.aggregatedLikelihoods;  // this is a STORAGE alias
+}
+
     function _lowerHexChar(uint8 nib) internal pure returns (bytes1) {
         return bytes1(uint8(nib < 10 ? 48 + nib : 87 + nib)); // 0-9 → '0'-'9', 10-15 → 'a'-'f'
     }
@@ -574,6 +614,11 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     // ----------------------------------------------------------------------
     //                          HELPER FUNCTIONS
     // ----------------------------------------------------------------------
+
+    function getCurrentRequestCounter() external view returns (uint256) {
+        return requestCounter;
+    }
+
     /**
      * @dev Pay bonus to an operator
      */
@@ -776,12 +821,15 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         }
     }
 
+
     // ----------------------------------------------------------------------
     //             EVALUATION GETTERS & WITHDRAW
     // ----------------------------------------------------------------------
+
     function getEvaluation(bytes32 reqId) public view returns (uint256[] memory, string memory, bool) {
         AggregatedEvaluation storage agg = aggregatedEvaluations[reqId];
-        return (agg.aggregatedLikelihoods, agg.combinedJustificationCIDs, agg.responseCount > 0);
+        bool hasValidData = agg.isComplete && agg.aggregatedLikelihoods.length > 0;
+        return (agg.aggregatedLikelihoods, agg.combinedJustificationCIDs, hasValidData);
     }
 
     function evaluations(bytes32 reqId) external view returns (uint256[] memory, string memory) {
