@@ -39,21 +39,13 @@ async function main () {
   const link = new hre.ethers.Contract(LINK_TOKEN, linkAbi,  signer);
 
   /* ---- Optional: DEBUG listeners ---- */
-
+  /*
   console.log("Setting up debug event listeners...");
   
   agg.on("DetailedResponseReceived", (aggId, pollIndex, operator, likelihoods, cid, timestamp, isReveal) => {
     console.log(`[RESPONSE] aggId: ${aggId}, slot: ${pollIndex}, scores: [${likelihoods.join(',')}], cid: "${cid}"`);
   });
-
-  agg.on("ZeroResponseDetected", (aggId, pollIndex, operator, response, cid) => {
-    console.log(`[ZERO DETECTED] aggId: ${aggId}, slot: ${pollIndex}, operator: ${operator}`);
-  });
-
-  agg.on("AggregationDebug", (aggId, selectedCount, clusterCount, finalLikelihoods, finalCIDs) => {
-    console.log(`[AGGREGATION] aggId: ${aggId}, selected: ${selectedCount}, clustered: ${clusterCount}, final: [${finalLikelihoods.join(',')}]`);
-  });
-
+  */
   /* ---- LINK approval (set allowance in .env) ---- */
   if (process.env.LINK_ALLOWANCE) {
     const allowance = ethers.parseUnits(process.env.LINK_ALLOWANCE, 18);
