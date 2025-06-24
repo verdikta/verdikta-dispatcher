@@ -71,8 +71,8 @@ async function main () {
   //   N = 3  first 3 reveals are accepted for clustering
   //   P = 2  cluster size rewarded
   //
-  console.log("Setting phase counts to (K,M,N,P) = (4,3,3,2)…");
-  await (await aggregator.setPhaseCounts(4, 3, 3, 2)).wait();
+  console.log("Setting phase counts to (K,M,N,P) = (5,4,3,2)…");
+  await (await aggregator.setPhaseCounts(5, 4, 3, 2)).wait();
 
   console.log("Setting response timeout to 300 seconds…");
   await (await aggregator.setResponseTimeout(300)).wait();
