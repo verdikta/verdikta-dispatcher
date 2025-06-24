@@ -5,9 +5,11 @@ const { ethers } = require("ethers");
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
    EDIT ONLY THESE CONSTANTS
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
-const AGGREGATOR = "0x3637DD9C5aF249D713645209A30FFbC56D3Cd0a1";
+const AGGREGATOR = "0x3835647fAe92bdFAEF448FebB111eFbF411b40Ae";
 const LINK_TOKEN = "0xE4aB69C077896252FAFBD49EFD26B5D171A32410";
-const NUM_QUERIES          = 6;
+const NUM_QUERIES          = 10;
+const NUM_INCREMENTS       = 12;
+const INCREMENT_DURATION   = 30000; // Polling increment in ms.
 const JOB_CLASS            = 128;
 const MAX_ORACLE_FEE       = ethers.parseUnits("0.06", 18);
 const ESTIMATED_BASE_FEE   = ethers.parseUnits("0.000001", 18);
@@ -35,7 +37,24 @@ async function main () {
   const linkAbi = (await hre.artifacts.readArtifact("LinkTokenInterface")).abi;
   const agg  = new hre.ethers.Contract(AGGREGATOR, aggAbi, signer);
   const link = new hre.ethers.Contract(LINK_TOKEN, linkAbi,  signer);
-  /* ---- optional LINK approval (set allowance in .env) ---- */
+
+  /* ---- Optional: DEBUG listeners ---- */
+
+  console.log("Setting up debug event listeners...");
+  
+  agg.on("DetailedResponseReceived", (aggId, pollIndex, operator, likelihoods, cid, timestamp, isReveal) => {
+    console.log(`[RESPONSE] aggId: ${aggId}, slot: ${pollIndex}, scores: [${likelihoods.join(',')}], cid: "${cid}"`);
+  });
+
+  agg.on("ZeroResponseDetected", (aggId, pollIndex, operator, response, cid) => {
+    console.log(`[ZERO DETECTED] aggId: ${aggId}, slot: ${pollIndex}, operator: ${operator}`);
+  });
+
+  agg.on("AggregationDebug", (aggId, selectedCount, clusterCount, finalLikelihoods, finalCIDs) => {
+    console.log(`[AGGREGATION] aggId: ${aggId}, selected: ${selectedCount}, clustered: ${clusterCount}, final: [${finalLikelihoods.join(',')}]`);
+  });
+
+  /* ---- LINK approval (set allowance in .env) ---- */
   if (process.env.LINK_ALLOWANCE) {
     const allowance = ethers.parseUnits(process.env.LINK_ALLOWANCE, 18);
     const tx = await link.approve(AGGREGATOR, allowance);
@@ -58,7 +77,8 @@ async function sendQuery(idx, nonce) {
   );
   console.log(`[${idx}] tx sent →`, tx.hash);
   const rcpt = await tx.wait(1);
-  // Parse logs to find the event (ethers v6 way)
+  
+  // Log all events for debugging
   const parsedLogs = rcpt.logs.map(log => {
     try {
       return agg.interface.parseLog(log);
@@ -66,6 +86,9 @@ async function sendQuery(idx, nonce) {
       return null;
     }
   }).filter(Boolean);
+  
+  console.log(`[${idx}] Events: ${parsedLogs.map(log => log.name).join(', ')}`);
+  
   const ev = parsedLogs.find(log => log.name === "RequestAIEvaluation");
   if (ev) {
     console.log(`[${idx}] aggId = ${ev.args.aggRequestId}`);
@@ -91,13 +114,14 @@ async function sendQuery(idx, nonce) {
   aggIds.forEach((id, i) => console.log(`[${i+1}] ${id}`));
 
   // Simple polling to check results
-  console.log("\nChecking for results every 30 seconds...");
+  const intervalSeconds = INCREMENT_DURATION/1000;
+  console.log(`\nChecking for results (nominally) every ${intervalSeconds} seconds...`);
   const completedEvaluations = new Set();
   const failedEvaluations = new Set();
   const errorEvaluations = new Set();
 
-  for (let check = 0; check < 10; check++) { // Check for 5 minutes
-    await new Promise(resolve => setTimeout(resolve, 30000));
+  for (let check = 0; check < NUM_INCREMENTS; check++) { 
+    await new Promise(resolve => setTimeout(resolve, INCREMENT_DURATION));
 
     console.log(`\nStatus check ${check + 1}:`);
 
@@ -107,6 +131,8 @@ async function sendQuery(idx, nonce) {
           console.log(`  Checking ${aggId}...`);
           const [likelihoods, justifications, hasResponses] = await agg.getEvaluation(aggId);
           console.log(`    hasResponses: ${hasResponses}, likelihoods.length: ${likelihoods.length}`);
+          console.log(`    likelihoods: [${likelihoods.map(x => x.toString()).join(', ')}]`);
+          console.log(`    justifications: "${justifications}"`);
 
           if (hasResponses && likelihoods.length > 0) {
             // Check for error conditions: all zeros or empty CIDs
@@ -168,6 +194,7 @@ async function sendQuery(idx, nonce) {
       console.log(`[${i+1}] TIMEOUT: ${aggId}`);
     }
   });
+  agg.removeAllListeners();
 }
 main().catch((err) => {
   console.error(err);
