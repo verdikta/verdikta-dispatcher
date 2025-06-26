@@ -25,7 +25,7 @@ contract ReputationKeeper is Ownable {
     }
 
     bytes4 private constant ARBITERIFACE = type(IArbiterOperator).interfaceId;
-
+    uint256 public selectionCounter;
     bytes16[2] public entropyBuf;    // updated by aggregators - 0=latest, 1=prev-block
     uint256 public entropyBlock;     // block.number when last updated
 
@@ -388,11 +388,11 @@ contract ReputationKeeper is Ownable {
         uint256 estimatedBaseCost,
         uint256 maxFeeBasedScalingFactor,
         uint64 requestedClass
-    ) external view returns (OracleIdentity[] memory) {
+    ) external returns (OracleIdentity[] memory) {
         require(approvedContracts[msg.sender].isApproved, "Not approved to select oracles");
         require(estimatedBaseCost < maxFee, "Base cost must be less than max fee");
         require(maxFeeBasedScalingFactor >= 1, "Max scaling factor must be at least 1");
-        
+        selectionCounter++; // bump once per call 
         uint256 eligibleCount = 0;
         for (uint256 i = 0; i < registeredOracles.length; i++) {
             OracleIdentity storage id = registeredOracles[i];
@@ -486,7 +486,7 @@ function _weightedSelect(
     uint256 uniqueDraws = count > n ? n : count;
     for (uint256 k; k < uniqueDraws; ++k) {
         bytes32 seed = keccak256(
-            abi.encodePacked(chosenEntropy, block.prevrandao, block.timestamp, k)
+            abi.encodePacked(chosenEntropy, block.prevrandao, block.timestamp, selectionCounter, k)
         );
         uint256 pivot = uint256(seed) % totalWeight;
 
