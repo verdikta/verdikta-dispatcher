@@ -1,0 +1,51 @@
+site_name: Verdikta Dispatcher Smart Contracts
+site_description: Smart contract documentation for the Verdikta Dispatcher ecosystem
+
+theme:
+  name: material
+
+nav:
+  - Home: index.md
+  - Contracts:
+    - contracts/reputation-aggregator.md
+    - contracts/reputation-singleton.md
+    - contracts/reputation-keeper.md
+    - contracts/arbiter-operator.md
+    - contracts/simple-contract.md
+  - Examples:
+    - examples/index.md
+    - examples/integration.md
+    - examples/frontend.md
+  - Deployment:
+    - deployment/index.md
+    - deployment/scripts.md
+    - deployment/networks.md
+  - API Reference:
+    - api/index.md
+    - api/events.md
+    - api/errors.md
+  - Advanced Topics:
+    - advanced/reputation.md
+    - advanced/fees.md
+    - advanced/security.md
+    - advanced/oracle-selection.md
+  - Troubleshooting:
+    - troubleshooting/index.md
+  - FAQ: faq.md
+
+markdown_extensions:
+  - admonition
+  - codehilite
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed
+  - pymdownx.details
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - toc:
+      permalink: true 
