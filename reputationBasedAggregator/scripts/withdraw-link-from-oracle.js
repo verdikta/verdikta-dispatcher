@@ -2,7 +2,7 @@
 /*
   scripts/withdraw-link-from-oracle.js  – Hardhat + Ethers
 
-  • Reads the “secondary” signer when the env-var USE_SECONDARY=1 is set  
+  • Optionally reads the “secondary” signer when the env-var USE_SECONDARY=1 is set  
     (first account otherwise).  
   • Turns *off* yargs’ automatic number-parsing so 0x-addresses stay
     strings.  
@@ -12,7 +12,7 @@
   Example (run with the secondary key):
 
   USE_SECONDARY=1 HARDHAT_NETWORK=base_sepolia node scripts/withdraw-link-from-oracle.js \
-    --operator 0xD67D6508D4E5611cd6a463Dd0969Fa153Be91101 \
+    --operator 0x00A08b75178de0e0d7FF13Fdd4ef925AC3572503 \
     --deposit  0xFBDE840eb654E0f8B9F3e6c69C354B309A9ffE6b \
     --link     0xE4aB69C077896252FAFBD49EFD26B5D171A32410
 */
