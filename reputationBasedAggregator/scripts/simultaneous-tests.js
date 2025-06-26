@@ -5,7 +5,7 @@ const { ethers } = require("ethers");
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
    EDIT ONLY THESE CONSTANTS
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
-const AGGREGATOR = "0x3835647fAe92bdFAEF448FebB111eFbF411b40Ae";
+const AGGREGATOR = "0xE816CdD0eDD920B283AB2cc6d08EAFA2B4de1072";
 const LINK_TOKEN = "0xE4aB69C077896252FAFBD49EFD26B5D171A32410";
 const NUM_QUERIES          = 10;
 const NUM_INCREMENTS       = 12;
