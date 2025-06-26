@@ -74,7 +74,13 @@ const bytes32ToAscii = (b32) =>
         const { oracle, jobId } = await keeper.registeredOracles(i);
         if (oracle !== ethers.ZeroAddress) {
           const info = await keeper.getOracleInfo(oracle, jobId);
-          found.push({ oracle, jobId, info });
+          let recentScores = [];
+          try {
+            recentScores = await keeper.getRecentScores(oracle, jobId);
+          } catch (err) {
+            console.log(`Warning: Could not fetch score history for oracle ${oracle}: ${err.message}`);
+          }
+          found.push({ oracle, jobId, info, recentScores });
         }
       } catch { break; } // reached past-end
     }
@@ -86,7 +92,7 @@ const bytes32ToAscii = (b32) =>
 
     console.log(`\nFound ${found.length} oracle(s):`);
     let n = 1;
-    for (const { oracle, jobId, info } of found) {
+    for (const { oracle, jobId, info, recentScores } of found) {
       console.log(`\nOracle ${n++}`);
       console.log(`Address:            ${oracle}`);
       console.log(`Active:             ${info.isActive}`);
@@ -114,6 +120,21 @@ const bytes32ToAscii = (b32) =>
         owner = await new ethers.Contract(oracle, minimalOwnerABI, provider).owner();
       } catch { owner = "(couldn’t fetch)"; }
       console.log(`Owner Address:      ${owner}`);
+
+      /* Score History -------------------------------------------------- */
+      if (recentScores && recentScores.length > 0) {
+        console.log(`\nScore History (${recentScores.length} records):`);
+        console.log(`${'Index'.padEnd(8)} ${'Quality'.padEnd(12)} ${'Timeliness'.padEnd(12)}`);
+        console.log(`${'-----'.padEnd(8)} ${'-------'.padEnd(12)} ${'----------'.padEnd(12)}`);
+        
+        recentScores.forEach((scoreRecord, index) => {
+          const quality = scoreRecord.qualityScore.toString();
+          const timeliness = scoreRecord.timelinessScore.toString();
+          console.log(`${(index + 1).toString().padEnd(8)} ${quality.padEnd(12)} ${timeliness.padEnd(12)}`);
+        });
+      } else {
+        console.log(`\nScore History:      No historical scores available`);
+      }
     }
   } catch (err) {
     console.error("Error:", err);
