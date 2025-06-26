@@ -23,8 +23,13 @@ const JOB_IDS = [
   "c6a5a82aa4814f8296c30fa44aff715e",
   "cdee0a127bc74a5188cbabf7aadcc84f",
   "39515f75ac2947beb7f2eeae4d8eaf3e",
-  "38f19572c51041baa5f2dea284614590"
+  "38f19572c51041baa5f2dea284614590",
+  "6f0ab41b6ffd4245bb1be16064043bfc",
+  "6230e342f7ff47aca7e62f9b0bc097df",
+  "184c2fd08a634719adc9183846e91380",
+  "858acbb95d90492bbff6a0eb568112b0"
 ];
+
 /* ------------------------------------------------------------------- */
 
 (async () => {
