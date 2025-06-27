@@ -7,31 +7,16 @@ theme:
 nav:
   - Home: index.md
   - Contracts:
-    - contracts/reputation-aggregator.md
-    - contracts/reputation-singleton.md
-    - contracts/reputation-keeper.md
-    - contracts/arbiter-operator.md
-    - contracts/simple-contract.md
+    - ReputationAggregator: contracts/reputation-aggregator.md
+    - ReputationSingleton: contracts/reputation-singleton.md
+    - ReputationKeeper: contracts/reputation-keeper.md
+    - ArbiterOperator: contracts/arbiter-operator.md
+    - SimpleContract: contracts/simple-contract.md
   - Examples:
-    - examples/index.md
-    - examples/integration.md
-    - examples/frontend.md
-  - Deployment:
-    - deployment/index.md
-    - deployment/scripts.md
-    - deployment/networks.md
+    - Overview: examples/index.md
   - API Reference:
-    - api/index.md
-    - api/events.md
-    - api/errors.md
-  - Advanced Topics:
-    - advanced/reputation.md
-    - advanced/fees.md
-    - advanced/security.md
-    - advanced/oracle-selection.md
-  - Troubleshooting:
-    - troubleshooting/index.md
-  - FAQ: faq.md
+    - Overview: api/index.md
+    - Auto-Generated Contract APIs: api/generated/index.md
 
 markdown_extensions:
   - admonition
