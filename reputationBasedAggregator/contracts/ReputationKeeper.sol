@@ -14,14 +14,21 @@ interface IOracleOwner {
 
 /**
  * @title ReputationKeeper
- * @notice Tracks oracle reputations using composite keys (oracle address and jobID).
+ * @author Verdikta Team
+ * @notice Manages oracle registration, reputation tracking, and selection for the Verdikta network
+ * @dev Central registry for oracle reputation management using composite keys (oracle address + jobID).
+ *      Implements staking, slashing, reputation scoring, and weighted oracle selection algorithms.
  */
 contract ReputationKeeper is Ownable {
-    // A composite identity for an oracle.
+    
+    /**
+     * @notice Composite identifier for an oracle instance
+     * @dev Uniquely identifies an oracle by address, job ID, and supported evaluation classes
+     */
     struct OracleIdentity {
-        address oracle;
-        bytes32 jobId;
-        uint64[] classes; // list of classes (up to 5) supported by this oracle
+        address oracle;     /// @dev Address of the oracle contract
+        bytes32 jobId;      /// @dev Chainlink job ID for this oracle
+        uint64[] classes;   /// @dev List of evaluation classes (up to 5) supported by this oracle
     }
 
     bytes4 private constant ARBITERIFACE = type(IArbiterOperator).interfaceId;
@@ -29,40 +36,51 @@ contract ReputationKeeper is Ownable {
     bytes16[2] public entropyBuf;    // updated by aggregators - 0=latest, 1=prev-block
     uint256 public entropyBlock;     // block.number when last updated
 
-    // A single record of (qualityScore, timelinessScore).
+    /**
+     * @notice Historical score record for tracking oracle performance trends
+     * @dev Used to detect consistent performance degradation over time
+     */
     struct ScoreRecord {
-        int256 qualityScore;
-        int256 timelinessScore;
+        int256 qualityScore;        /// @dev Quality score at this point in time
+        int256 timelinessScore;     /// @dev Timeliness score at this point in time
     }
 
-    // Information about each oracle identity.
+    /**
+     * @notice Complete information about a registered oracle
+     * @dev Stores all oracle metadata, scores, staking, and status information
+     */
     struct OracleInfo {
-        int256 qualityScore;    // Score based on clustering accuracy
-        int256 timelinessScore; // Score based on response timeliness
-        uint256 stakeAmount;    // Amount of VDKA tokens staked
-        bool isActive;          // Indicates if the oracle is available (true) or temporarily paused (false)
-        bytes32 jobId;          // The job ID (redundant but stored for convenience)
-        uint256 fee;            // LINK fee required for this job
-        uint256 callCount;      // Number of times this oracle has been called
-        ScoreRecord[] recentScores; // Rolling history of scores
-        uint256 lockedUntil;    // Timestamp until which the oracle is locked (cannot be unregistered)
-        bool blocked;           // If true, oracle is blocked from selection
-        uint64[] classes;       // Classes for this oracle
+        int256 qualityScore;        /// @dev Score based on clustering accuracy and response quality
+        int256 timelinessScore;     /// @dev Score based on response timeliness and availability
+        uint256 stakeAmount;        /// @dev Amount of VDKA tokens currently staked by this oracle
+        bool isActive;              /// @dev Whether the oracle is available (true) or paused (false)
+        bytes32 jobId;              /// @dev The job ID (redundant but stored for convenience)
+        uint256 fee;                /// @dev LINK fee required for this job
+        uint256 callCount;          /// @dev Number of times this oracle has been called
+        ScoreRecord[] recentScores; /// @dev Rolling history of recent score snapshots
+        uint256 lockedUntil;        /// @dev Timestamp until which the oracle is locked (cannot be unregistered)
+        bool blocked;               /// @dev If true, oracle is blocked from selection due to poor performance
+        uint64[] classes;           /// @dev Evaluation classes supported by this oracle
     }
     
-    // Per–contract usage data.
+    /**
+     * @notice Contract approval and usage tracking data
+     * @dev Tracks which contracts are approved to use oracles and which oracles they've used
+     */
     struct ContractInfo {
-        bool isApproved;      // Whether this contract is approved to use oracles
-        // Mapping from composite oracle key to whether the contract used that oracle.
-        mapping(bytes32 => bool) usedOracles;
+        bool isApproved;            /// @dev Whether this contract is approved to use oracles
+        mapping(bytes32 => bool) usedOracles; /// @dev Mapping from oracle key to usage status
     }
     
-    // Group selection parameters into one struct to reduce stack usage.
+    /**
+     * @notice Parameters for oracle selection algorithm
+     * @dev Groups selection parameters to reduce stack usage in complex functions
+     */
     struct SelectionParams {
-        uint256 alpha;
-        uint256 maxFee;
-        uint256 estimatedBaseCost;
-        uint256 maxFeeBasedScalingFactor;
+        uint256 alpha;                      /// @dev Reputation weight factor (0-1000)
+        uint256 maxFee;                     /// @dev Maximum fee willing to pay per oracle
+        uint256 estimatedBaseCost;          /// @dev Estimated base cost for the evaluation
+        uint256 maxFeeBasedScalingFactor;   /// @dev Maximum scaling factor for fee-based weighting
     }
 
     IERC20 public verdiktaToken;
@@ -114,7 +132,12 @@ contract ReputationKeeper is Ownable {
     }
     
     /**
-     * @notice Register an oracle under a specific job ID.
+     * @notice Register an oracle with the reputation system
+     * @dev Requires VDKA token staking and oracle contract compliance. Only oracle owner or contract owner can register.
+     * @param _oracle Address of the oracle contract (must implement IArbiterOperator)
+     * @param _jobId Chainlink job ID for this oracle instance
+     * @param fee LINK fee required for using this oracle
+     * @param _classes Array of evaluation classes this oracle supports (1-5 classes allowed)
      */
     function registerOracle(
         address _oracle,
@@ -176,8 +199,10 @@ contract ReputationKeeper is Ownable {
     }
     
     /**
-     * @notice Deregister an oracle identity.
-     * Completely removes the oracle record from storage.
+     * @notice Deregister an oracle and remove it from the reputation system
+     * @dev Completely removes oracle record and returns staked tokens. Only callable by oracle owner or contract owner.
+     * @param _oracle Address of the oracle contract to deregister
+     * @param _jobId Job ID of the oracle instance to deregister
      */
     function deregisterOracle(address _oracle, bytes32 _jobId) external {
         bytes32 key = _oracleKey(_oracle, _jobId);
@@ -209,9 +234,11 @@ contract ReputationKeeper is Ownable {
     }
     
     /**
-     * @notice Set an oracle's active status (pause/unpause).
-     * Only the contract owner can perform this action.
-     * When paused, isActive is set to false; when unpaused, it is set to true.
+     * @notice Set an oracle's active status (pause/unpause)
+     * @dev Only the contract owner can perform this action. Paused oracles are excluded from selection.
+     * @param _oracle Address of the oracle contract
+     * @param _jobId Job ID of the oracle instance
+     * @param _active True to activate/unpause, false to deactivate/pause
      */
     function setOracleActive(address _oracle, bytes32 _jobId, bool _active) external onlyOwner {
         bytes32 key = _oracleKey(_oracle, _jobId);
@@ -222,7 +249,19 @@ contract ReputationKeeper is Ownable {
     }
     
     /**
-     * @notice Retrieve an oracle identity's info.
+     * @notice Get comprehensive information about a registered oracle
+     * @dev Returns all oracle metadata, scores, staking, and status information
+     * @param _oracle Address of the oracle contract
+     * @param _jobId Job ID of the oracle instance
+     * @return isActive Whether the oracle is currently active and available for selection
+     * @return qualityScore Current quality score based on response accuracy
+     * @return timelinessScore Current timeliness score based on response speed
+     * @return callCount Total number of times this oracle has been called
+     * @return jobId The job ID (returned for convenience)
+     * @return fee LINK fee required for using this oracle
+     * @return stakeAmount Amount of VDKA tokens currently staked
+     * @return lockedUntil Timestamp until which oracle is locked (0 if not locked)
+     * @return blocked Whether oracle is blocked from selection due to poor performance
      */
     function getOracleInfo(address _oracle, bytes32 _jobId)
         external
@@ -255,7 +294,13 @@ contract ReputationKeeper is Ownable {
     }
     
     /**
-     * @notice Update reputation scores for an oracle identity.
+     * @notice Update reputation scores for an oracle after evaluation completion
+     * @dev Called by approved aggregator contracts to reward/penalize oracle performance.
+     *      Automatically applies slashing and blocking for poor performance.
+     * @param _oracle Address of the oracle contract
+     * @param _jobId Job ID of the oracle instance
+     * @param qualityChange Change to apply to quality score (positive = reward, negative = penalty)
+     * @param timelinessChange Change to apply to timeliness score (positive = reward, negative = penalty)
      */
     function updateScores(
         address _oracle, 
@@ -331,9 +376,13 @@ contract ReputationKeeper is Ownable {
     }
     
     /**
-     * @notice Calculate the weighted selection score for an oracle identity.
-     * Oracles that are blocked (and still within the lock period) are treated as having a score of 0.
-     * Now accepts a single SelectionParams struct.
+     * @notice Calculate the weighted selection score for an oracle
+     * @dev Combines reputation scores with fee weighting to determine selection probability.
+     *      Blocked or inactive oracles return score of 0.
+     * @param _oracle Address of the oracle contract
+     * @param _jobId Job ID of the oracle instance
+     * @param params Selection parameters including alpha, fees, and scaling factors
+     * @return Weighted selection score (higher = more likely to be selected)
      */
     function getSelectionScore(
         address _oracle,
@@ -375,11 +424,16 @@ contract ReputationKeeper is Ownable {
     }
     
     /**
-     * @notice Select a list of oracle identities based on their weighted scores.
-     * Uses a two-stage approach:
-     *  1. Filter eligible oracles (active, fee <= maxFee, not blocked, supporting the requested class).
-     *  2. If eligible count > shortlistSize, randomly select a subset of size shortlistSize.
-     *  3. Perform weighted selection on that shortlist.
+     * @notice Select oracles for evaluation using reputation-weighted algorithm
+     * @dev Uses two-stage selection: eligibility filtering, optional shortlisting, then weighted selection.
+     *      Selection is based on reputation scores, fees, and availability.
+     * @param count Number of oracles to select
+     * @param alpha Reputation weight factor (0-1000, where 1000 = 100% reputation-based)
+     * @param maxFee Maximum fee willing to pay per oracle (in LINK wei)
+     * @param estimatedBaseCost Estimated base cost for the evaluation
+     * @param maxFeeBasedScalingFactor Maximum scaling factor for fee-based selection weighting
+     * @param requestedClass Evaluation class required (oracles must support this class)
+     * @return Array of selected oracle identities
      */
     function selectOracles(
         uint256 count,
@@ -526,7 +580,10 @@ function _weightedSelect(
 }
     
     /**
-     * @notice Records that a set of oracle identities were used by an approved contract.
+     * @notice Record that specific oracles were used by an approved contract
+     * @dev Enables these oracles to have their scores updated by the calling contract later.
+     *      Must be called before updateScores can be used.
+     * @param _oracleIdentities Array of oracle identities that were used for evaluation
      */
     function recordUsedOracles(OracleIdentity[] calldata _oracleIdentities) external {
         require(approvedContracts[msg.sender].isApproved, "Not approved to record oracles");
@@ -536,11 +593,23 @@ function _weightedSelect(
         }
     }
     
+    /**
+     * @notice Set the maximum number of historical score records to maintain per oracle
+     * @dev Controls memory usage and affects trend analysis for performance degradation detection
+     * @param _maxScoreHistory Maximum number of score records to keep (must be > 0)
+     */
     function setMaxScoreHistory(uint256 _maxScoreHistory) external onlyOwner {
         require(_maxScoreHistory > 0, "maxScoreHistory must be > 0");
         maxScoreHistory = _maxScoreHistory;
     }
     
+    /**
+     * @notice Get the recent score history for an oracle
+     * @dev Returns historical performance data used for trend analysis
+     * @param _oracle Address of the oracle contract
+     * @param _jobId Job ID of the oracle instance
+     * @return Array of recent score records showing performance over time
+     */
     function getRecentScores(address _oracle, bytes32 _jobId)
         external
         view
@@ -556,38 +625,66 @@ function _weightedSelect(
         return scores;
     }
     
-    // Owner setters for slashing configuration.
+    /**
+     * @notice Set the amount of VDKA tokens to slash for poor performance
+     * @dev Amount slashed when oracles fall below performance thresholds
+     * @param _slashAmount Amount of VDKA tokens to slash (in wei)
+     */
     function setSlashAmount(uint256 _slashAmount) external onlyOwner {
         slashAmountConfig = _slashAmount;
     }
     
+    /**
+     * @notice Set the duration for which poorly performing oracles are locked
+     * @dev Locked oracles cannot be unregistered and may be blocked from selection
+     * @param _lockDuration Lock duration in seconds
+     */
     function setLockDuration(uint256 _lockDuration) external onlyOwner {
         lockDurationConfig = _lockDuration;
     }
     
+    /**
+     * @notice Set the severe performance threshold for slashing and blocking
+     * @dev Oracles below this threshold are slashed and blocked from selection
+     * @param _threshold Severe threshold value (negative number)
+     */
     function setSevereThreshold(int256 _threshold) external onlyOwner {
         severeThreshold = _threshold;
     }
     
+    /**
+     * @notice Set the mild performance threshold for temporary locking
+     * @dev Oracles below this threshold are temporarily locked but not slashed
+     * @param _threshold Mild threshold value (negative number)  
+     */
     function setMildThreshold(int256 _threshold) external onlyOwner {
         mildThreshold = _threshold;
     }
 
     /**
-     * @notice Updates the reference to the VerdiktaToken contract.
+     * @notice Update the VDKA token contract address used for staking
+     * @dev Changes the token contract used for oracle staking and slashing
+     * @param _newVerdiktaToken Address of the new VDKA token contract
      */
     function setVerdiktaToken(address _newVerdiktaToken) external onlyOwner {
         require(_newVerdiktaToken != address(0), "Invalid token address");
         verdiktaToken = IERC20(_newVerdiktaToken);
     }
 
-    // Return the count of registered oracles.
+    /**
+     * @notice Get the total number of registered oracles
+     * @dev Returns the count of all oracle identities in the system
+     * @return Total number of registered oracle identities
+     */
     function getRegisteredOraclesCount() external view returns (uint256) {
         return registeredOracles.length;
     }
 
     /**
-     * @dev Internal helper: Check if the given classes array contains the requested class.
+     * @dev Check if an oracle supports a specific evaluation class
+     * @param classes Array of classes supported by the oracle
+     * @param requestedClass The class being requested
+     * @return bool True if the oracle supports the requested class
      */
     function _hasClass(uint64[] memory classes, uint64 requestedClass) internal pure returns (bool) {
         for (uint256 i = 0; i < classes.length; i++) {
@@ -598,11 +695,24 @@ function _weightedSelect(
         return false;
     }
 
+    /**
+     * @notice Get the evaluation classes supported by an oracle at a specific index
+     * @dev Returns classes for oracle at given index in registeredOracles array
+     * @param index Index in the registeredOracles array
+     * @return Array of evaluation classes supported by the oracle
+     */
     function getOracleClasses(uint256 index) public view returns (uint64[] memory) {
         require(index < registeredOracles.length, "Index out of bounds");
         return registeredOracles[index].classes;
     }
 
+    /**
+     * @notice Get the evaluation classes supported by a specific oracle identity
+     * @dev Returns classes for oracle identified by address and job ID
+     * @param _oracle Address of the oracle contract
+     * @param _jobId Job ID of the oracle instance
+     * @return Array of evaluation classes supported by the oracle
+     */
     function getOracleClassesByKey(address _oracle, bytes32 _jobId) public view returns (uint64[] memory) {
         for (uint256 i = 0; i < registeredOracles.length; i++) {
             if (registeredOracles[i].oracle == _oracle && registeredOracles[i].jobId == _jobId) {
@@ -613,8 +723,9 @@ function _weightedSelect(
     }
 
     /**
-     * @notice Set a new shortlist size for oracle selection.
-     * Only the owner can update this value.
+     * @notice Set the maximum number of oracles to consider in second-stage selection
+     * @dev Controls the shortlist size for weighted selection when many oracles are available
+     * @param newSize Maximum shortlist size (must be > 0)
      */
     function setShortlistSize(uint256 newSize) external onlyOwner {
         require(newSize > 0, "Shortlist size must be > 0");
@@ -622,28 +733,41 @@ function _weightedSelect(
     }
     
     /**
-     * @notice Approve a contract to use oracles.
+     * @notice Approve a contract to select and use oracles from the reputation system
+     * @dev Only approved contracts can call selectOracles, recordUsedOracles, and updateScores
+     * @param contractAddress Address of the contract to approve (typically an aggregator contract)
      */
     function approveContract(address contractAddress) external onlyOwner {
         approvedContracts[contractAddress].isApproved = true;
         emit ContractApproved(contractAddress);
     }
 
-/**
- * @notice Lightweight getter. Returns true if contract address has been approved.
- */
-function isContractApproved(address contractAddress) external view returns (bool) {
-    return approvedContracts[contractAddress].isApproved;
-}
+    /**
+     * @notice Check if a contract is approved to use the reputation system
+     * @dev Lightweight getter for contract approval status
+     * @param contractAddress Address of the contract to check
+     * @return bool True if the contract is approved, false otherwise
+     */
+    function isContractApproved(address contractAddress) external view returns (bool) {
+        return approvedContracts[contractAddress].isApproved;
+    }
     
     /**
-     * @notice Remove a contract's approval.
+     * @notice Revoke a contract's approval to use oracles
+     * @dev Removes the contract's ability to select oracles and update scores
+     * @param contractAddress Address of the contract to remove approval from
      */
     function removeContract(address contractAddress) external onlyOwner {
         approvedContracts[contractAddress].isApproved = false;
         emit ContractRemoved(contractAddress);
     }
 
+    /**
+     * @notice Update entropy buffer with new randomness from aggregator contracts
+     * @dev Called by approved aggregators to provide entropy for oracle selection randomization.
+     *      Maintains a 2-slot buffer to prevent manipulation from same-block calls.
+     * @param e New entropy value to add to the buffer
+     */
     function pushEntropy(bytes16 e) external {
         require(approvedContracts[msg.sender].isApproved, "not aggregator");
 
