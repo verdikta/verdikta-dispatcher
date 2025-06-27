@@ -20,18 +20,30 @@ interface IReputationKeeper {
 
 /**
  * @title IArbiterOperator
- * @notice Marker + allow-list interface implemented **only** by ArbiterOperator.
- *
- *         interfaceId = 0xd9f812f9
- *           = bytes4(
- *               keccak256("fulfillOracleRequestV(bytes32,uint256,address,bytes4,uint256,bytes)")
- *             )
- *             ^ 0x1132d7b2  // isReputationKeeper(address)
- *             ^ 0xb7834e7d  // isReputationKeeperListEmpty()
- *         A vanilla Chainlink Operator returns `false` for this ID.
+ * @author Verdikta Team
+ * @notice Marker interface for Verdikta ArbiterOperator with access control capabilities
+ * @dev Specialized interface implemented ONLY by ArbiterOperator contracts.
+ *      Provides multi-word response capability and ReputationKeeper integration.
+ *      
+ *      Interface ID = 0xd9f812f9, calculated as:
+ *      bytes4(keccak256("fulfillOracleRequestV(bytes32,uint256,address,bytes4,uint256,bytes)"))
+ *      ^ 0x1132d7b2  // isReputationKeeper(address)  
+ *      ^ 0xb7834e7d  // isReputationKeeperListEmpty()
+ *      
+ *      Standard Chainlink Operators return `false` for this interface ID.
  */
 interface IArbiterOperator is IERC165 {
-    /*────────  Chainlink multi-word fulfilment  ────────*/
+    /**
+     * @notice Fulfill oracle request with multi-word response capability
+     * @dev Extended fulfillment function that supports complex data responses
+     * @param requestId The Chainlink request ID to fulfill
+     * @param payment Payment amount in LINK tokens
+     * @param callbackAddress Address of the contract to call back
+     * @param callbackFunctionId Function selector to call on callback
+     * @param expiration Request expiration timestamp
+     * @param data Multi-word response data to send to callback
+     * @return success Whether the callback was successful
+     */
     function fulfillOracleRequestV(
         bytes32 requestId,
         uint256 payment,
@@ -41,8 +53,19 @@ interface IArbiterOperator is IERC165 {
         bytes   calldata data
     ) external returns (bool success);
 
-    /*────────  Allow-list probes  ──────────────────────*/
+    /**
+     * @notice Check if an address is a registered ReputationKeeper
+     * @dev Used by ReputationKeeper contracts to verify operator compliance
+     * @param rkAddr Address to check
+     * @return bool True if address is a registered ReputationKeeper
+     */
     function isReputationKeeper(address rkAddr) external view returns (bool);
+    
+    /**
+     * @notice Check if the ReputationKeeper allow-list is empty
+     * @dev When empty, all requests are allowed (access control disabled)
+     * @return bool True if no ReputationKeepers are registered
+     */
     function isReputationKeeperListEmpty() external view returns (bool);
 }
 
@@ -50,11 +73,18 @@ interface IArbiterOperator is IERC165 {
 /*  ArbiterOperator                                              */
 /* ────────────────────────────────────────────────────────────── */
 
-/// @notice Chainlink Operator variant that
-///         1) exposes `fulfillOracleRequestV` (multi-word response)
-///         2) enforces an allow-list of consumers approved by one or more
-///            ReputationKeeper contracts *before* the OracleRequest event
-///            is emitted (so nodes never start un-approved jobs).
+/**
+ * @title ArbiterOperator
+ * @author Verdikta Team
+ * @notice Specialized Chainlink Operator with access control and multi-word response support
+ * @dev Extended Chainlink Operator that:
+ *      1) Provides `fulfillOracleRequestV` for multi-word responses (complex data structures)
+ *      2) Enforces access control via ReputationKeeper allow-list before oracle requests
+ *      3) Implements IArbiterOperator interface for Verdikta ecosystem integration
+ *      
+ *      Access control is enforced BEFORE OracleRequest events are emitted,
+ *      ensuring Chainlink nodes never start processing unauthorized jobs.
+ */
 contract ArbiterOperator is OperatorMod, ERC165, IArbiterOperator {
     /*──────────────  CONFIG  ──────────────*/
 
@@ -92,6 +122,12 @@ contract ArbiterOperator is OperatorMod, ERC165, IArbiterOperator {
 
     /*────────────  RK management  ─────────*/
 
+    /**
+     * @notice Add a ReputationKeeper contract to the access control allow-list
+     * @dev Only approved ReputationKeeper contracts can authorize consumer requests.
+     *      Validates interface compliance before adding.
+     * @param rkAddr Address of the ReputationKeeper contract to add
+     */
     function addReputationKeeper(address rkAddr) external onlyOwner {
         require(rkAddr.code.length > 0, "RK: not contract");
         require(!rk[rkAddr],            "RK: exists");
@@ -107,6 +143,11 @@ contract ArbiterOperator is OperatorMod, ERC165, IArbiterOperator {
         emit ReputationKeeperAdded(rkAddr);
     }
 
+    /**
+     * @notice Remove a ReputationKeeper contract from the access control allow-list  
+     * @dev Removes authorization capability for the specified ReputationKeeper
+     * @param rkAddr Address of the ReputationKeeper contract to remove
+     */
     function removeReputationKeeper(address rkAddr) external onlyOwner {
         require(rk[rkAddr], "RK: unknown");
         delete rk[rkAddr];
@@ -123,16 +164,32 @@ contract ArbiterOperator is OperatorMod, ERC165, IArbiterOperator {
 
     /*────────────  public probes  ─────────*/
 
+    /**
+     * @notice Check if an address is a registered ReputationKeeper
+     * @dev Part of IArbiterOperator interface for ReputationKeeper verification
+     * @param rkAddr Address to check
+     * @return bool True if address is in the ReputationKeeper allow-list
+     */
     function isReputationKeeper(address rkAddr) external view override returns (bool) {
         return rk[rkAddr];
     }
 
+    /**
+     * @notice Check if the ReputationKeeper allow-list is empty
+     * @dev When empty, access control is disabled and all requests are allowed
+     * @return bool True if no ReputationKeepers are registered
+     */
     function isReputationKeeperListEmpty() external view override returns (bool) {
         return rkList.length == 0;
     }
 
     /*────────── internal helper ───────────*/
 
+    /**
+     * @dev Check if a requester is approved by any registered ReputationKeeper
+     * @param requester Address of the contract requesting oracle services
+     * @return bool True if approved by at least one ReputationKeeper, or if allow-list is empty
+     */
     function _approved(address requester) internal view returns (bool) {
         if (rkList.length == 0) return true;               // gate disabled
         for (uint256 i; i < rkList.length; ++i) {

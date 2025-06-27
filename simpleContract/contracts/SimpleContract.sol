@@ -3,6 +3,14 @@ pragma solidity ^0.8.21;
 
 import "@chainlink/contracts/src/v0.8/ChainlinkClient.sol";
 
+/**
+ * @title SimpleContract
+ * @author Verdikta Team
+ * @notice Basic single-oracle contract for development and testing purposes
+ * @dev Simplified oracle contract that works with a single pre-configured oracle.
+ *      Provides the same interface as more complex aggregators for testing compatibility.
+ *      Includes automatic bonus payment (1x fee) to oracle upon successful completion.
+ */
 contract SimpleContract is ChainlinkClient {
     using Chainlink for Chainlink.Request;
 
@@ -15,19 +23,29 @@ contract SimpleContract is ChainlinkClient {
     uint256 public responseTimeoutSeconds = 300;   // 5-minute window
 
     /* ──────────────────────────── REQUEST META ──────────────────────── */
+    
+    /**
+     * @notice Metadata for tracking individual evaluation requests
+     * @dev Stores request state and payment information for bonus distribution
+     */
     struct ReqMeta {
-        uint256 started;
-        bool    done;
-        bool    failed;
-        address requester;   // who pays the bonus
+        uint256 started;     /// @dev Timestamp when request was initiated
+        bool    done;        /// @dev Whether the request has been completed
+        bool    failed;      /// @dev Whether the request failed or timed out
+        address requester;   /// @dev Address that requested the evaluation (pays bonus)
     }
     mapping(bytes32 => ReqMeta) private _reqMeta;
 
     /* ──────────────────────────── EVALUATIONS ───────────────────────── */
+    
+    /**
+     * @notice Complete evaluation result from oracle
+     * @dev Stores the final evaluation data returned by the oracle
+     */
     struct Evaluation {
-        uint256[] likelihoods;
-        string    justificationCID;
-        bool      exists;
+        uint256[] likelihoods;      /// @dev Array of likelihood scores (0-100)
+        string    justificationCID; /// @dev IPFS CID containing detailed justification
+        bool      exists;           /// @dev Whether valid evaluation data exists
     }
     mapping(bytes32 => Evaluation) public evaluations;
 
@@ -37,10 +55,33 @@ contract SimpleContract is ChainlinkClient {
     uint256 public constant MAX_ADDENDUM_LENGTH = 1000;
 
     /* ────────────────────────────── EVENTS ──────────────────────────── */
+    
+    /// @notice Emitted when a new AI evaluation request is created
+    /// @param requestId Unique request identifier
+    /// @param cids Array of IPFS CIDs containing evidence to evaluate
     event RequestAIEvaluation (bytes32 indexed requestId, string[] cids);
+    
+    /// @notice Emitted when an AI evaluation is completed successfully
+    /// @param requestId The request identifier
+    /// @param likelihoods Final likelihood scores from the oracle
+    /// @param justificationCID IPFS CID containing the oracle's justification
     event FulfillAIEvaluation (bytes32 indexed requestId, uint256[] likelihoods, string justificationCID);
+    
+    /// @notice Emitted when fulfillment data is received (debugging event)
+    /// @param requestId The request identifier
+    /// @param caller Address of the fulfilling oracle
+    /// @param len Number of likelihood scores received
+    /// @param justificationCID IPFS CID of the justification
     event FulfillmentReceived (bytes32 indexed requestId, address caller, uint256 len, string justificationCID);
+    
+    /// @notice Emitted when an evaluation fails or times out
+    /// @param requestId The request identifier that failed
     event EvaluationFailed    (bytes32 indexed requestId);
+    
+    /// @notice Emitted when bonus payment is made to the oracle
+    /// @param requestId The request identifier
+    /// @param oracle Address of the oracle receiving the bonus
+    /// @param amount Amount of LINK tokens paid as bonus
     event BonusPaid           (bytes32 indexed requestId, address oracle, uint256 amount);
 
     /* ──────────────────────────── CONSTRUCTOR ───────────────────────── */
@@ -67,6 +108,16 @@ contract SimpleContract is ChainlinkClient {
     }
 
     /* ───────────────────────────── REQUEST ──────────────────────────── */
+    
+    /**
+     * @notice Request AI evaluation with pre-configured oracle
+     * @dev Main entry point for requesting AI evaluation. User must approve 2x LINK (base + bonus).
+     *      Many parameters are ignored for simplicity compared to aggregator contracts.
+     * @param cids Array of IPFS CIDs containing evidence/data to evaluate
+     * @param addendumText Additional text to append to the evaluation request
+     * @param _requestedClass Oracle class required (must match contract's requiredClass)
+     * @return requestId Unique request ID for tracking the evaluation
+     */
     function requestAIEvaluationWithApproval(
         string[] memory cids,
         string   memory addendumText,
@@ -111,6 +162,14 @@ contract SimpleContract is ChainlinkClient {
     }
 
     /* ─────────────────────────── FULFILLMENT ────────────────────────── */
+    
+    /**
+     * @notice Callback function called by the oracle with evaluation results
+     * @dev Stores results and automatically pays bonus to oracle upon completion
+     * @param _requestId The Chainlink request ID
+     * @param likelihoods Array of likelihood scores from the oracle
+     * @param justificationCID IPFS CID containing the oracle's justification
+     */
     function fulfill(
         bytes32   _requestId,
         uint256[] calldata likelihoods,
@@ -145,6 +204,12 @@ contract SimpleContract is ChainlinkClient {
     }
 
     /* ───────────────────────────── TIMEOUT ──────────────────────────── */
+    
+    /**
+     * @notice Finalize an evaluation that has timed out
+     * @dev Can be called by anyone to finalize evaluations that have exceeded responseTimeoutSeconds
+     * @param requestId The request ID to finalize
+     */
     function finalizeEvaluationTimeout(bytes32 requestId) external {
         ReqMeta storage m = _reqMeta[requestId];
 
@@ -158,16 +223,36 @@ contract SimpleContract is ChainlinkClient {
         emit EvaluationFailed(requestId);
     }
 
+    /**
+     * @notice Check if an evaluation has failed
+     * @dev Returns true if the evaluation timed out or failed for other reasons
+     * @param requestId The request ID to check
+     * @return bool True if the evaluation failed, false otherwise
+     */
     function isFailed(bytes32 requestId) external view returns (bool) {
         return _reqMeta[requestId].failed;
     }
 
     /* ───────────────────────── VIEW & ADMIN HELPERS ─────────────────── */
+    
+    /**
+     * @notice Calculate the maximum total LINK required including bonus payment
+     * @dev Returns 2x the base fee (base fee + bonus payment)
+     * @return Maximum total LINK required for evaluation with bonus
+     */
     function maxTotalFee(uint256) external view returns (uint256) {
         /* user must approve base fee + potential bonus = 2 * fee */
         return fee * 2;
     }
 
+    /**
+     * @notice Get contract configuration information
+     * @dev Returns oracle address, LINK token, job ID, and current fee
+     * @return oracleAddr Address of the configured oracle
+     * @return linkAddr Address of the LINK token contract
+     * @return jId Job ID for the oracle
+     * @return currentFee Current fee amount in LINK wei
+     */
     function getContractConfig()
         external
         view
@@ -176,6 +261,14 @@ contract SimpleContract is ChainlinkClient {
         return (oracle, _chainlinkTokenAddress(), jobId, fee);
     }
 
+    /**
+     * @notice Get the evaluation results for a completed request
+     * @dev Returns the likelihood scores and justification from the oracle
+     * @param id The request ID
+     * @return likelihoods Array of likelihood scores (0-100)
+     * @return cid IPFS CID containing the justification
+     * @return exists Whether valid evaluation data exists for this request
+     */
     function getEvaluation(bytes32 id)
         external
         view
@@ -185,6 +278,12 @@ contract SimpleContract is ChainlinkClient {
         return (ev.likelihoods, ev.justificationCID, ev.exists);
     }
 
+    /**
+     * @notice Withdraw LINK tokens from the contract
+     * @dev Emergency function for recovering LINK tokens (no access control in test contract)
+     * @param to Address to receive the LINK tokens
+     * @param amount Amount of LINK tokens to withdraw (in wei)
+     */
     function withdrawLink(address payable to, uint256 amount) external /* onlyOwner stub */ {
         LinkTokenInterface(_chainlinkTokenAddress()).transfer(to, amount);
     }
