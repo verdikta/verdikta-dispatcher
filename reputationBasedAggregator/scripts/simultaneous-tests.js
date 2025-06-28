@@ -5,9 +5,10 @@ const { ethers } = require("ethers");
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
    EDIT ONLY THESE CONSTANTS
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
-const AGGREGATOR = "0xE816CdD0eDD920B283AB2cc6d08EAFA2B4de1072";
+const AGGREGATOR = "0xdC361699d1fB1B72C0Ee887dCB315296b6a743bc";
 const LINK_TOKEN = "0xE4aB69C077896252FAFBD49EFD26B5D171A32410";
-const NUM_QUERIES          = 10;
+const NUM_QUERIES          = 6;
+const BETWEEN_QUERY_DELAY  = 5000;
 const NUM_INCREMENTS       = 12;
 const INCREMENT_DURATION   = 30000; // Polling increment in ms.
 const JOB_CLASS            = 128;
@@ -93,9 +94,14 @@ async function sendQuery(idx, nonce) {
   /* ---- fire queries in parallel ---- */
   const startNonce = await signer.getNonce();
   console.log(`Starting nonce: ${startNonce}`);
-  const results = await Promise.all(Array.from({ length: NUM_QUERIES }, (_, i) =>
-    sendQuery(i + 1, startNonce + i)
-  ));
+//  const results = await Promise.all(Array.from({ length: NUM_QUERIES }, (_, i) =>
+//    sendQuery(i + 1, startNonce + i)
+//  ));
+
+   const results = [];
+   for (let i = 0; i < NUM_QUERIES; i++) { 
+      if (i > 0) await new Promise(resolve => setTimeout(resolve, BETWEEN_QUERY_DELAY)); results.push(await sendQuery(i + 1, startNonce + i)); 
+   }
 
   // Extract aggIds from the results
   const aggIds = results

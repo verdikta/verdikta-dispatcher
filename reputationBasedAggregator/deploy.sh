@@ -20,7 +20,7 @@ echo "Deploying keeper + aggregator + config to ${NET}..."
 
 # Use --reset to force redeployment even when compiled bytecode is the same
 # npx hardhat deploy --network "${NET}" --tags aggregator,keeper,config --reset
-npx hardhat deploy --network "${NET}" --tags aggregator,keeper,config
+npx hardhat deploy --network "${NET}" --tags aggregator,keeper,config --reset
 
 echo "✅  All deployments finished."
 

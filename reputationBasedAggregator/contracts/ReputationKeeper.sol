@@ -672,6 +672,37 @@ function _weightedSelect(
     }
 
     /**
+     * @notice Hard-reset all reputation data.
+     *         Callable only by the contract owner.
+     *
+     *         This walks the whole `registeredOracles` array and can run
+     *         out of gas if there are “many” oracles.  
+     */
+    function resetAllReputations() external onlyOwner {
+        // 1. Reset the global counter that shows up in oracle selection.
+        selectionCounter = 0;
+
+        // 2. Loop through every registered identity and zero out its data.
+        uint256 len = registeredOracles.length;
+        for (uint256 i; i < len; ++i) {
+            OracleIdentity storage id = registeredOracles[i];
+            bytes32 key = _oracleKey(id.oracle, id.jobId);
+            OracleInfo storage info = oracles[key];
+
+            info.qualityScore     = 0;
+            info.timelinessScore  = 0;
+            info.callCount        = 0;
+
+            // clear the sliding window completely
+            delete info.recentScores;
+
+            // unblock & unlock so the oracle can be picked again immediately
+            info.blocked     = false;
+            info.lockedUntil = 0;
+        }
+    }
+
+    /**
      * @notice Get the total number of registered oracles
      * @dev Returns the count of all oracle identities in the system
      * @return Total number of registered oracle identities
