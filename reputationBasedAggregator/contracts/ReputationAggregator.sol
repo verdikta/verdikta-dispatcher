@@ -41,7 +41,6 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     uint256 public clusterSize;             // P
     uint256 public bonusMultiplier = 3;     // B
     uint256 public responseTimeoutSeconds = 300; // default 5 min
-    uint256 public alpha = 500;             // reputation weight
 
     // rolling entropy
     bytes16 public rollingEntropy;          // init to 0x0 and build over time
@@ -49,8 +48,6 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
 
     // owner-settable LINK fee limits
     uint256 public maxOracleFee;
-    uint256 public baseFeePct = 1;          // 1% of maxOracleFee
-    uint256 public maxFeeBasedScalingFactor = 10;
 
     // limits for user input
     uint256 public constant MAX_CID_COUNT = 10;
@@ -254,16 +251,6 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
      */
     function setResponseTimeout(uint256 _seconds) external onlyOwner {
         responseTimeoutSeconds = _seconds;
-    }
-
-    /**
-     * @notice Set the reputation weight factor for oracle selection
-     * @dev Alpha determines how much reputation influences oracle selection (0-1000)
-     * @param _alpha Reputation weight factor (0-1000, where 1000 = 100%)
-     */
-    function setAlpha(uint256 _alpha) external onlyOwner {
-        require(_alpha <= 1000, "Alpha 0-1000");
-        alpha = _alpha;
     }
 
     /**
