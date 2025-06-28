@@ -93,21 +93,20 @@ contract ReputationKeeper is Ownable {
     OracleIdentity[] public registeredOracles;
     
     // The maximum number of historical score records to keep for each oracle.
-    uint256 public maxScoreHistory = 10;
+    uint256 public maxScoreHistory = 27;
 
     uint256 public constant STAKE_REQUIREMENT = 100 * 10**18;  // 100 VDKA tokens
     uint256 public constant MAX_SCORE_FOR_SELECTION = 400;
     uint256 public constant MIN_SCORE_FOR_SELECTION = 1;
     
     // Configuration for slashing and locking.
-    uint256 public slashAmountConfig = 10 * 10**18;  // 10 VDKA tokens (configurable)
+    uint256 public slashAmountConfig = 0 * 10**18;     // 0 VDKA tokens (configurable)
     uint256 public lockDurationConfig = 2 hours;       // Lock period (configurable)
-    int256 public severeThreshold = -40;               // Severe threshold (configurable)
-    int256 public mildThreshold = -20;                 // Mild threshold (configurable)
+    int256 public severeThreshold = -60;               // Severe threshold (configurable)
+    int256 public mildThreshold = -30;                 // Mild threshold (configurable)
     
     // The maximum number of oracles to weight in the second-stage selection.
-    // Default is 20 but can be updated by the owner.
-    uint256 public shortlistSize = 20;
+    uint256 public shortlistSize = 25;
     
     event OracleRegistered(address indexed oracle, bytes32 jobId, uint256 fee);
     event OracleDeregistered(address indexed oracle, bytes32 jobId);
@@ -339,6 +338,12 @@ contract ReputationKeeper is Ownable {
                 }
                 info.lockedUntil = block.timestamp + lockDurationConfig;
                 info.blocked = true;
+                if(info.qualityScore < severeThreshold) {
+                    info.qualityScore = mildThreshold;
+                }
+                if(info.timelinessScore < severeThreshold) {
+                    info.timelinessScore = mildThreshold;
+                }
                 emit OracleSlashed(_oracle, _jobId, slashAmountConfig, info.lockedUntil, true);
             }
             else if (info.qualityScore < mildThreshold || info.timelinessScore < mildThreshold) {
@@ -349,17 +354,14 @@ contract ReputationKeeper is Ownable {
         }
         
         if (info.recentScores.length == maxScoreHistory) {
-            bool qualityWorsening = true;
-            bool timelinessWorsening = true;
+            bool worsening = true;
             for (uint256 i = 1; i < maxScoreHistory; i++) {
-                if (info.recentScores[i].qualityScore >= info.recentScores[i - 1].qualityScore) {
-                    qualityWorsening = false;
-                }
-                if (info.recentScores[i].timelinessScore >= info.recentScores[i - 1].timelinessScore) {
-                    timelinessWorsening = false;
+                if (info.recentScores[i].qualityScore >= info.recentScores[i - 1].qualityScore &&
+                    info.recentScores[i].timelinessScore >= info.recentScores[i - 1].timelinessScore) {
+                    worsening = false;
                 }
             }
-            if (qualityWorsening || timelinessWorsening) {
+            if (worsening) {
                 if (info.stakeAmount >= slashAmountConfig) {
                     info.stakeAmount -= slashAmountConfig;
                 } else {
@@ -669,6 +671,34 @@ function _weightedSelect(
     function setVerdiktaToken(address _newVerdiktaToken) external onlyOwner {
         require(_newVerdiktaToken != address(0), "Invalid token address");
         verdiktaToken = IERC20(_newVerdiktaToken);
+    }
+
+    /**
+     * @notice Manually block a specific oracle for a given duration
+     * @dev    Only callable by the contract owner.
+     *         While blocked, the oracle is excluded from selection
+     *         (`selectOracles`, `getSelectionScore`) exactly the same way
+     *         as when it is auto-blocked for poor performance.
+     *
+     * @param _oracle   The oracle contract address
+     * @param _jobId    The job-ID of that oracle instance
+     * @param _duration How long to block it, **in seconds**.
+     *                  Pass 0 to use the current `lockDurationConfig`.
+     */
+    function manualBlockOracle(
+        address _oracle,
+        bytes32 _jobId,
+        uint256 _duration
+    ) external onlyOwner {
+        bytes32 key = _oracleKey(_oracle, _jobId);
+        OracleInfo storage info = oracles[key];
+        require(info.stakeAmount > 0, "Oracle not registered");
+
+        uint256 duration = _duration == 0 ? lockDurationConfig : _duration;
+        require(duration > 0, "Duration must be > 0");
+
+        info.blocked     = true;
+        info.lockedUntil = block.timestamp + duration;
     }
 
     /**
