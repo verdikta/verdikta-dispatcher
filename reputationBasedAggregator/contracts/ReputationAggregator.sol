@@ -8,24 +8,26 @@ import "./ReputationKeeper.sol";
 
 /**
  * @title ReputationAggregator commit-reveal edition (ASCII only)
- * @notice Two phase polling system for secure oracle aggregation:
- *         K = commitOraclesToPoll  - oracles polled in commit phase (Mode 1)
- *         M = oraclesToPoll        - first M commits promoted to reveal (Mode 2)
- *         N = requiredResponses    - first N reveals aggregated
- *         P = clusterSize          - size of best match cluster for bonus
+ * @author Verdikta Team
+ * @notice Two phase polling system for secure oracle aggregation with commit-reveal mechanism
+ * @dev Implements a sophisticated oracle aggregation system with the following phases:
+ *      - K = commitOraclesToPoll  - oracles polled in commit phase (Mode 1)
+ *      - M = oraclesToPoll        - first M commits promoted to reveal (Mode 2)
+ *      - N = requiredResponses    - first N reveals aggregated
+ *      - P = clusterSize          - size of best match cluster for bonus
  *
- *         By default, K,M,N,P = 5,4,3,2
+ *      By default, K,M,N,P = 5,4,3,2
  *
- *         Flow:
- *         1. requestAIEvaluationWithApproval sends Mode 1 requests to K oracles.
- *         2. When first M commitments arrive, the contract sends Mode 2
- *            requests (reveal) back to those M oracles.
- *         3. After N valid reveals, responses are clustered and scored.
+ *      Flow:
+ *      1. requestAIEvaluationWithApproval sends Mode 1 requests to K oracles.
+ *      2. When first M commitments arrive, the contract sends Mode 2
+ *         requests (reveal) back to those M oracles.
+ *      3. After N valid reveals, responses are clustered and scored.
  *        
- *         Payment:
- *         1. All oracles get 1x fee up front.
- *         2. There is a bonus multiplier B, nominally 3.
- *         3. Clustered oracles get an additional Bx fee at finish.
+ *      Payment:
+ *      1. All oracles get 1x fee up front.
+ *      2. There is a bonus multiplier B, nominally 3.
+ *      3. Clustered oracles get an additional Bx fee at finish.
  */
 contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     using Chainlink for Chainlink.Request;
@@ -63,63 +65,125 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     // ----------------------------------------------------------------------
     //                               EVENTS
     // ----------------------------------------------------------------------
+    
+    /// @notice Emitted when a new AI evaluation request is created
+    /// @param aggRequestId Unique aggregator request identifier
+    /// @param cids Array of IPFS CIDs containing evidence to evaluate
     event RequestAIEvaluation(bytes32 indexed aggRequestId, string[] cids);
+    
+    /// @notice Emitted when an AI evaluation is completed successfully
+    /// @param aggRequestId The aggregator request identifier
+    /// @param aggregated Final aggregated likelihood scores
+    /// @param justifications Combined IPFS CIDs of justifications from clustered oracles
     event FulfillAIEvaluation(bytes32 indexed aggRequestId, uint256[] aggregated, string justifications);
+    
+    /// @notice Emitted when an oracle submits a commit hash
+    /// @param aggRequestId The aggregator request identifier
+    /// @param pollIndex The oracle's slot index in the polling array
+    /// @param operator Address of the oracle operator
+    /// @param commitHash Hash of the oracle's commitment
     event CommitReceived(bytes32 indexed aggRequestId, uint256 pollIndex, address operator, bytes16 commitHash);
+    
+    /// @notice Emitted when enough commits are received to start reveal phase
+    /// @param aggRequestId The aggregator request identifier
     event CommitPhaseComplete(bytes32 indexed aggRequestId);
+    
+    /// @notice Emitted when a reveal request is sent to an oracle
+    /// @param aggRequestId The aggregator request identifier
+    /// @param pollIndex The oracle's slot index
+    /// @param commitHash The commit hash being revealed
     event RevealRequestDispatched(bytes32 indexed aggRequestId, uint256 pollIndex, bytes16 commitHash);
+    
+    /// @notice Emitted when an oracle provides a valid reveal response
+    /// @param requestId The Chainlink request identifier
+    /// @param pollIndex The oracle's slot index
+    /// @param operator Address of the oracle operator
     event NewOracleResponseRecorded(bytes32 requestId, uint256 pollIndex, address operator);
+    
+    /// @notice Emitted when bonus payment is made to a clustered oracle
+    /// @param operator Address of the oracle operator receiving bonus
+    /// @param bonusFee Amount of bonus LINK tokens paid
     event BonusPayment(address indexed operator, uint256 bonusFee);
+    
+    /// @notice Emitted when an evaluation times out
+    /// @param aggRequestId The aggregator request identifier
     event EvaluationTimedOut(bytes32 indexed aggRequestId);
+    
+    /// @notice Emitted when an evaluation fails in a specific phase
+    /// @param aggRequestId The aggregator request identifier
+    /// @param phase The phase where failure occurred ("commit" or "reveal")
     event EvaluationFailed(bytes32 indexed aggRequestId, string phase);
+    
+    /// @notice Emitted when oracle score update is skipped due to error
+    /// @param oracle Address of the oracle
+    /// @param jobId Job identifier
+    /// @param reason Reason for skipping the update
     event OracleScoreUpdateSkipped(address oracle, bytes32 jobId, string reason);
+    
+    /// @notice Emitted when commit-reveal hash validation fails
+    /// @param requestId The Chainlink request identifier
+    /// @param computedHash Hash computed from reveal data
+    /// @param storedHash Hash stored from commit phase
     event HashMismatch(bytes32 requestId, bytes16 computedHash, bytes16 storedHash);
+    
+    /// @notice Emitted when ReputationKeeper contract is changed
+    /// @param oldKeeper Address of the previous ReputationKeeper
+    /// @param newKeeper Address of the new ReputationKeeper
     event ReputationKeeperChanged(address indexed oldKeeper, address indexed newKeeper);
 
     // ----------------------------------------------------------------------
     //                               STRUCTS
     // ----------------------------------------------------------------------
+    
+    /**
+     * @notice Individual oracle response data structure
+     * @dev Stores a single oracle's response during the reveal phase
+     */
     struct Response {
-        uint256[] likelihoods;
-        string justificationCID;
-        bytes32 requestId;
-        bool selected;
-        uint256 timestamp;
-        address operator;
-        uint256 pollIndex;
-        bytes32 jobId;
+        uint256[] likelihoods;      /// @dev Array of likelihood scores provided by the oracle
+        string justificationCID;    /// @dev IPFS CID containing the oracle's justification
+        bytes32 requestId;          /// @dev Chainlink request ID for this response
+        bool selected;              /// @dev Whether this response was selected for aggregation
+        uint256 timestamp;          /// @dev Block timestamp when response was received
+        address operator;           /// @dev Address of the oracle operator
+        uint256 pollIndex;          /// @dev Oracle's slot index in the polling array
+        bytes32 jobId;              /// @dev Oracle's job ID
     }
 
+    /**
+     * @notice Complete evaluation state for a single aggregation request
+     * @dev Tracks the entire lifecycle of a commit-reveal evaluation
+     */
     struct AggregatedEvaluation {
         // phase bookkeeping
-        bool commitPhaseComplete;           // true → we are in reveal phase
-        uint256 commitExpected;             // K
-        uint256 commitReceived;             // # of commits so far
+        bool commitPhaseComplete;           /// @dev true → we are in reveal phase
+        uint256 commitExpected;             /// @dev K - number of oracles polled in commit phase
+        uint256 commitReceived;             /// @dev number of commits received so far
 
         // commit hashes per poll slot
-        mapping(uint256 => bytes16) commitHashPerSlot;  // 0‑based poll index ⇒ 128‑bit hash
+        mapping(uint256 => bytes16) commitHashPerSlot;  /// @dev 0‑based poll index ⇒ 128‑bit hash
 
         // reveal bookkeeping
-        Response[] responses;               // only *reveal* responses are stored here
-        uint256 responseCount;              // reveal response counter
-        uint256 requiredResponses;          // N (reveals to aggregate)
-        uint256 clusterSize;                // P
-        uint256[] aggregatedLikelihoods;
+        Response[] responses;               /// @dev only *reveal* responses are stored here
+        uint256 responseCount;              /// @dev reveal response counter
+        uint256 requiredResponses;          /// @dev N (reveals to aggregate)
+        uint256 clusterSize;                /// @dev P (cluster size for bonus)
+        uint256[] aggregatedLikelihoods;    /// @dev final aggregated likelihood scores
 
         // oracle selection
-        ReputationKeeper.OracleIdentity[] polledOracles;  // length == K
-        uint256[] pollFees;                               // same length
+        ReputationKeeper.OracleIdentity[] polledOracles;  /// @dev selected oracles (length == K)
+        uint256[] pollFees;                               /// @dev fees paid to each oracle
 
         // accounting
-        mapping(bytes32 => bool) requestIds;    // valid requestIds (commit & reveal)
-        bool userFunded;
-        address requester;
-        uint256 startTimestamp;
+        mapping(bytes32 => bool) requestIds;    /// @dev valid requestIds (commit & reveal)
+        bool userFunded;                        /// @dev whether user provided funding
+        address requester;                      /// @dev address that requested the evaluation
+        uint256 startTimestamp;                 /// @dev when the evaluation was started
 
         // output
-        string combinedJustificationCIDs;
-        bool isComplete;
-        bool failed;
+        string combinedJustificationCIDs;       /// @dev comma-separated CIDs from clustered oracles
+        bool isComplete;                        /// @dev whether evaluation is finished
+        bool failed;                            /// @dev whether evaluation failed
     }
 
     // ----------------------------------------------------------------------
@@ -153,13 +217,13 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     // ----------------------------------------------------------------------
     //                            CONFIGURATION API
     // ----------------------------------------------------------------------
-    // setPhaseCounts is DEPRECATED - Use setConfig instead
     /**
-     * @dev Set all phase counts at once (K, M, N, P)
-     * @param _k Number of oracles to poll in commit phase
-     * @param _m Number of reveals requested (first M commits)
-     * @param _n Number of reveals required for aggregation
-     * @param _p Cluster size for bonus payments
+     * @notice Set all phase counts at once (K, M, N, P) - DEPRECATED
+     * @dev This function is deprecated. Use setConfig instead for better validation
+     * @param _k Number of oracles to poll in commit phase (commitOraclesToPoll)
+     * @param _m Number of reveals requested from first M commits (oraclesToPoll)
+     * @param _n Number of reveals required for final aggregation (requiredResponses)
+     * @param _p Cluster size for bonus payments (clusterSize)
      */
     function setPhaseCounts(uint256 _k, uint256 _m, uint256 _n, uint256 _p) external onlyOwner {
         require(_k >= _m, "K must be >= M");
@@ -173,27 +237,49 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         clusterSize = _p;
     }
 
+    /**
+     * @notice Set the number of oracles to poll in commit phase
+     * @dev Must be greater than or equal to oraclesToPoll (M)
+     * @param _k Number of oracles to poll in commit phase
+     */
     function setCommitOraclesToPoll(uint256 _k) external onlyOwner {
         require(_k >= oraclesToPoll, "K must be >= M");
         commitOraclesToPoll = _k;
     }
 
+    /**
+     * @notice Set the response timeout in seconds
+     * @dev Timeout applies to both commit and reveal phases
+     * @param _seconds Timeout duration in seconds
+     */
     function setResponseTimeout(uint256 _seconds) external onlyOwner {
         responseTimeoutSeconds = _seconds;
     }
 
+    /**
+     * @notice Set the reputation weight factor for oracle selection
+     * @dev Alpha determines how much reputation influences oracle selection (0-1000)
+     * @param _alpha Reputation weight factor (0-1000, where 1000 = 100%)
+     */
     function setAlpha(uint256 _alpha) external onlyOwner {
         require(_alpha <= 1000, "Alpha 0-1000");
         alpha = _alpha;
     }
 
+    /**
+     * @notice Set the maximum oracle fee in LINK tokens
+     * @dev This limits the maximum fee that can be paid to any oracle
+     * @param _newMax Maximum oracle fee in LINK wei
+     */
     function setMaxOracleFee(uint256 _newMax) external onlyOwner {
         maxOracleFee = _newMax;
     }
 
     /**
-     * @dev Estimate the maximum LINK needed for both commit + reveal + bonus.
-     *      total = fee × (K + M + P)
+     * @notice Estimate the maximum LINK needed for complete evaluation with bonuses
+     * @dev Calculates: fee × (K + bonus_multiplier × P) for worst-case scenario
+     * @param requestedMaxOracleFee Requested maximum fee per oracle
+     * @return Maximum total LINK required for the evaluation
      */
     function maxTotalFee(uint256 requestedMaxOracleFee) public view returns (uint256) {
         uint256 eff = requestedMaxOracleFee < maxOracleFee ? requestedMaxOracleFee : maxOracleFee;
@@ -203,6 +289,20 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     // ----------------------------------------------------------------------
     //                      USER FUNDED REQUEST ENTRYPOINT
     // ----------------------------------------------------------------------
+    
+    /**
+     * @notice Request AI evaluation with user-funded LINK payment
+     * @dev Main entry point for requesting AI evaluation using commit-reveal aggregation.
+     *      User must approve LINK tokens before calling this function.
+     * @param cids Array of IPFS CIDs containing evidence/data to evaluate
+     * @param addendumText Additional text to append to the evaluation request
+     * @param _alpha Reputation weight factor for oracle selection (0-1000)
+     * @param _maxOracleFee Maximum fee per oracle in LINK wei
+     * @param _estimatedBaseCost Estimated base cost for evaluation
+     * @param _maxFeeBasedScalingFactor Maximum scaling factor for fee-based selection
+     * @param _requestedClass Oracle class/category requested for evaluation
+     * @return bytes32 Unique aggregator request ID for tracking the evaluation
+     */
     function requestAIEvaluationWithApproval(
         string[] memory cids,
         string memory addendumText,
@@ -277,6 +377,13 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     // ----------------------------------------------------------------------
     //                         TIMEOUT HANDLING
     // ----------------------------------------------------------------------
+    
+    /**
+     * @notice Finalize an evaluation that has timed out
+     * @dev Can be called by anyone to finalize evaluations that have exceeded responseTimeoutSeconds.
+     *      Applies penalties to non-responsive oracles and handles partial results if available.
+     * @param aggId The aggregator request ID to finalize
+     */
     function finalizeEvaluationTimeout(bytes32 aggId) external nonReentrant {
         AggregatedEvaluation storage agg = aggregatedEvaluations[aggId];
         require(!agg.isComplete, "Aggregation already completed");
@@ -318,10 +425,15 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     // ----------------------------------------------------------------------
     //                                FULFILL (NODE CALLBACK)
     // ----------------------------------------------------------------------
+    
     /**
-     * @dev Called by Chainlink nodes in both commit and reveal phases.
-     *      COMMIT PHASE: response[0] contains the pre-computed hash of (actualLikelihoods, salt)
+     * @notice Callback function called by Chainlink oracles with their responses
+     * @dev Handles both commit and reveal phases based on payload structure.
+     *      COMMIT PHASE: response[0] contains hash of (actualLikelihoods, salt), cid is empty
      *      REVEAL PHASE: response contains actual likelihood scores, cid contains "cleanCid:salt"
+     * @param requestId The Chainlink request ID
+     * @param response Array of likelihood scores (reveal) or single hash value (commit)
+     * @param cid IPFS CID with salt (reveal phase) or empty string (commit phase)
      */
 function fulfill(
     bytes32 requestId,
@@ -615,6 +727,11 @@ function _ensureAggArrayExists(
     //                          HELPER FUNCTIONS
     // ----------------------------------------------------------------------
 
+    /**
+     * @notice Get the current request counter value
+     * @dev Used for generating unique aggregator request IDs
+     * @return Current request counter value
+     */
     function getCurrentRequestCounter() external view returns (uint256) {
         return requestCounter;
     }
@@ -826,17 +943,40 @@ function _ensureAggArrayExists(
     //             EVALUATION GETTERS & WITHDRAW
     // ----------------------------------------------------------------------
 
+    /**
+     * @notice Get the evaluation results for a completed aggregation
+     * @dev Returns the aggregated likelihood scores and combined justification CIDs
+     * @param reqId The aggregator request ID
+     * @return likelihoods Array of aggregated likelihood scores (0-100)
+     * @return justifications Combined IPFS CIDs of justifications from clustered oracles
+     * @return hasValidData Whether the evaluation completed successfully with valid data
+     */
     function getEvaluation(bytes32 reqId) public view returns (uint256[] memory, string memory, bool) {
         AggregatedEvaluation storage agg = aggregatedEvaluations[reqId];
         bool hasValidData = agg.isComplete && agg.aggregatedLikelihoods.length > 0;
         return (agg.aggregatedLikelihoods, agg.combinedJustificationCIDs, hasValidData);
     }
 
+    /**
+     * @notice Get evaluation results (legacy interface for backwards compatibility)
+     * @dev Simplified interface that returns only scores and justifications
+     * @param reqId The aggregator request ID
+     * @return likelihoods Array of aggregated likelihood scores
+     * @return justifications Combined IPFS CIDs of justifications
+     */
     function evaluations(bytes32 reqId) external view returns (uint256[] memory, string memory) {
         (uint256[] memory l, string memory j, ) = getEvaluation(reqId);
         return (l, j);
     }
 
+    /**
+     * @notice Get contract configuration (legacy interface)
+     * @dev Returns basic contract configuration for backwards compatibility
+     * @return oracleAddr Placeholder oracle address (always returns zero)
+     * @return linkAddr Address of the LINK token contract
+     * @return jobId Placeholder job ID (always returns zero)
+     * @return fee Placeholder fee (always returns zero)
+     */
     function getContractConfig()
         public view returns (
             address oracleAddr,
@@ -854,11 +994,22 @@ function _ensureAggArrayExists(
         );
     }
 
+    /**
+     * @notice Withdraw LINK tokens from the contract
+     * @dev Only callable by contract owner for emergency recovery
+     * @param _to Address to receive the LINK tokens
+     * @param _amount Amount of LINK tokens to withdraw (in wei)
+     */
     function withdrawLink(address payable _to, uint256 _amount) external onlyOwner {
         LinkTokenInterface link = LinkTokenInterface(_chainlinkTokenAddress());
         require(link.transfer(_to, _amount), "LINK transfer failed");
     }
 
+    /**
+     * @notice Set a new ReputationKeeper contract address
+     * @dev Updates the reputation management contract used for oracle selection and scoring
+     * @param newKeeper Address of the new ReputationKeeper contract
+     */
     function setReputationKeeper(address newKeeper) external onlyOwner {
         require(newKeeper != address(0), "ReputationKeeper: zero address");
         address old = address(reputationKeeper);
@@ -866,6 +1017,15 @@ function _ensureAggArrayExists(
         emit ReputationKeeperChanged(old, newKeeper);
     }
 
+    /**
+     * @notice Set all configuration parameters at once
+     * @dev Preferred method for updating configuration with validation
+     * @param _k Number of oracles to poll in commit phase (commitOraclesToPoll)
+     * @param _m Number of reveals requested from first M commits (oraclesToPoll)
+     * @param _n Number of reveals required for final aggregation (requiredResponses)
+     * @param _p Cluster size for bonus payments (clusterSize)
+     * @param _timeoutSecs Response timeout in seconds
+     */
     function setConfig(
         uint256 _k,
         uint256 _m,
@@ -886,11 +1046,22 @@ function _ensureAggArrayExists(
         responseTimeoutSeconds = _timeoutSecs;
     }
 
+    /**
+     * @notice Set the bonus multiplier for clustered oracles
+     * @dev Clustered oracles receive base_fee * bonus_multiplier as additional payment
+     * @param _m Bonus multiplier (0-20x), typically 3x
+     */
     function setBonusMultiplier(uint256 _m) external onlyOwner {
         require(_m <= 20, "bonus 0-20x");
         bonusMultiplier = _m;
     }
 
+    /**
+     * @notice Check if an evaluation has failed
+     * @dev Returns true if the evaluation timed out or failed for other reasons
+     * @param aggId The aggregator request ID to check
+     * @return bool True if the evaluation failed, false otherwise
+     */
     function isFailed(bytes32 aggId) external view returns (bool) {
         return aggregatedEvaluations[aggId].failed;
     }
