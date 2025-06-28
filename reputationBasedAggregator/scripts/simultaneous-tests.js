@@ -1,4 +1,4 @@
-// scripts/runSixQueries.js
+// scripts/simultaneous-tests.js
 require("dotenv").config();
 const hre   = require("hardhat");
 const { ethers } = require("ethers");
