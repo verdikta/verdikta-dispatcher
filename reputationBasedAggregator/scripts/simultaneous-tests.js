@@ -5,9 +5,9 @@ const { ethers } = require("ethers");
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
    EDIT ONLY THESE CONSTANTS
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
-const AGGREGATOR = "0xdC361699d1fB1B72C0Ee887dCB315296b6a743bc";
+const AGGREGATOR = "0x53BE18aD6fFe7A04f4eb6d2717Fc09df3F11a972";
 const LINK_TOKEN = "0xE4aB69C077896252FAFBD49EFD26B5D171A32410";
-const NUM_QUERIES          = 6;
+const NUM_QUERIES          = 10;
 const BETWEEN_QUERY_DELAY  = 5000;
 const NUM_INCREMENTS       = 12;
 const INCREMENT_DURATION   = 30000; // Polling increment in ms.
