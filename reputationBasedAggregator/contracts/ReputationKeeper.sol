@@ -93,7 +93,7 @@ contract ReputationKeeper is Ownable {
     OracleIdentity[] public registeredOracles;
     
     // The maximum number of historical score records to keep for each oracle.
-    uint256 public maxScoreHistory = 16;
+    uint256 public maxScoreHistory = 20;
 
     uint256 public constant STAKE_REQUIREMENT = 100 * 10**18;  // 100 VDKA tokens
     uint256 public constant MAX_SCORE_FOR_SELECTION = 400;
@@ -103,7 +103,7 @@ contract ReputationKeeper is Ownable {
     uint256 public slashAmountConfig = 0 * 10**18;     // 0 VDKA tokens (configurable)
     uint256 public lockDurationConfig = 2 hours;       // Lock period (configurable)
     int256 public severeThreshold = -60;               // Severe threshold (configurable)
-    int256 public mildThreshold = -30;                 // Mild threshold (configurable)
+    int256 public mildThreshold = -20;                 // Mild threshold (configurable)
     
     // The maximum number of oracles to weight in the second-stage selection.
     uint256 public shortlistSize = 20;
