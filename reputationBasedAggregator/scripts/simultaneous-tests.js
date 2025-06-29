@@ -5,14 +5,14 @@ const { ethers } = require("ethers");
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
    EDIT ONLY THESE CONSTANTS
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
-const AGGREGATOR = "0x347353614c3F60fC8f2E8BA708Ed167Af6B6B45c";
+const AGGREGATOR = "0xE9dF4E8CCcFD076f29B974a039046516aCA35944";
 const LINK_TOKEN = "0xE4aB69C077896252FAFBD49EFD26B5D171A32410";
 const NUM_QUERIES          = 10;
-const BETWEEN_QUERY_DELAY  = 5000;
+const BETWEEN_QUERY_DELAY  = 2000;
 const NUM_INCREMENTS       = 12;
 const INCREMENT_DURATION   = 30000; // Polling increment in ms.
 const JOB_CLASS            = 128;
-const MAX_ORACLE_FEE       = ethers.parseUnits("0.06", 18);
+const MAX_ORACLE_FEE       = ethers.parseUnits("0.01", 18);
 const ESTIMATED_BASE_FEE   = ethers.parseUnits("0.000001", 18);
 const MAX_FEE_SCALING      = 5;
 const ALPHA                = 500;
