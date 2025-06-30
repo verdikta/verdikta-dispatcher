@@ -93,7 +93,7 @@ contract ReputationKeeper is Ownable {
     OracleIdentity[] public registeredOracles;
     
     // The maximum number of historical score records to keep for each oracle.
-    uint256 public maxScoreHistory = 20;
+    uint256 public maxScoreHistory = 25;
 
     uint256 public constant STAKE_REQUIREMENT = 100 * 10**18;  // 100 VDKA tokens
     uint256 public constant MAX_SCORE_FOR_SELECTION = 400;
