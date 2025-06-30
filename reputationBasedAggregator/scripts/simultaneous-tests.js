@@ -2,14 +2,15 @@
 require("dotenv").config();
 const hre   = require("hardhat");
 const { ethers } = require("ethers");
+const pause = ms => new Promise(r => setTimeout(r, ms));
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
    EDIT ONLY THESE CONSTANTS
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
-const AGGREGATOR = "0xE9dF4E8CCcFD076f29B974a039046516aCA35944";
+const AGGREGATOR = "0x43fC1c39525Ec87218AFaC6dD361eBA29Ec125EF";
 const LINK_TOKEN = "0xE4aB69C077896252FAFBD49EFD26B5D171A32410";
 const NUM_QUERIES          = 10;
 const BETWEEN_QUERY_DELAY  = 2000;
-const NUM_INCREMENTS       = 12;
+const NUM_INCREMENTS       = 14;
 const INCREMENT_DURATION   = 30000; // Polling increment in ms.
 const JOB_CLASS            = 128;
 const MAX_ORACLE_FEE       = ethers.parseUnits("0.01", 18);
@@ -54,8 +55,36 @@ async function main () {
     console.log("approve() →", tx.hash);
     await tx.wait(1);
   }
+
+
+
   /* ---- helper to send one query ---- */
-async function sendQuery(idx, nonce) {
+/* ---- helper to send one query ---- */
+async function sendQuery(idx, nonce, delayMs) {
+  if (delayMs) await pause(delayMs);
+
+  /*──────────────── 0-gas pre-flight ────────────────*/
+  try {
+    // V6: get the function object, then use .staticCall(...)
+    await agg
+      .getFunction("requestAIEvaluationWithApproval")
+      .staticCall(
+        CIDS,
+        ADDENDUM,
+        ALPHA,
+        MAX_ORACLE_FEE,
+        ESTIMATED_BASE_FEE,
+        MAX_FEE_SCALING,
+        JOB_CLASS
+      );
+  } catch (e) {
+    console.error(
+      `[${idx}] dry-run revert → ${e.shortMessage || e}`
+    );
+    return null;                // ← skip this iteration but keep the loop alive
+  }
+
+  /*──────── real on-chain tx (only if pre-flight passed) ────────*/
   const tx = await agg.requestAIEvaluationWithApproval(
     CIDS,
     ADDENDUM,
@@ -64,25 +93,19 @@ async function sendQuery(idx, nonce) {
     ESTIMATED_BASE_FEE,
     MAX_FEE_SCALING,
     JOB_CLASS,
-    {
-      nonce: nonce,
-    }
+    { nonce }
   );
   console.log(`[${idx}] tx sent →`, tx.hash);
   const rcpt = await tx.wait(1);
-  
-  // Log all events for debugging
-  const parsedLogs = rcpt.logs.map(log => {
-    try {
-      return agg.interface.parseLog(log);
-    } catch {
-      return null;
-    }
-  }).filter(Boolean);
-  
-  console.log(`[${idx}] Events: ${parsedLogs.map(log => log.name).join(', ')}`);
-  
-  const ev = parsedLogs.find(log => log.name === "RequestAIEvaluation");
+
+  // --- parse logs exactly as you already do --------------------
+  const parsedLogs = rcpt.logs
+    .map(log => { try { return agg.interface.parseLog(log); } catch { return null; } })
+    .filter(Boolean);
+
+  console.log(`[${idx}] Events: ${parsedLogs.map(l => l.name).join(", ")}`);
+
+  const ev = parsedLogs.find(l => l.name === "RequestAIEvaluation");
   if (ev) {
     console.log(`[${idx}] aggId = ${ev.args.aggRequestId}`);
     return { receipt: rcpt, aggId: ev.args.aggRequestId };
@@ -91,17 +114,24 @@ async function sendQuery(idx, nonce) {
     return { receipt: rcpt, aggId: null };
   }
 }
+
+
   /* ---- fire queries in parallel ---- */
   const startNonce = await signer.getNonce();
   console.log(`Starting nonce: ${startNonce}`);
-//  const results = await Promise.all(Array.from({ length: NUM_QUERIES }, (_, i) =>
-//    sendQuery(i + 1, startNonce + i)
-//  ));
 
-   const results = [];
-   for (let i = 0; i < NUM_QUERIES; i++) { 
-      if (i > 0) await new Promise(resolve => setTimeout(resolve, BETWEEN_QUERY_DELAY)); results.push(await sendQuery(i + 1, startNonce + i)); 
-   }
+const results = [];
+let skipped = 0;
+for (let i = 0; i < NUM_QUERIES; i++) {
+  /* call sendQuery, check for null, push only when it succeeded */
+  const res = await sendQuery(i + 1, startNonce + i, i === 0 ? 0 : BETWEEN_QUERY_DELAY);
+  if (res) {
+    results.push(res);          // dry-run passed → keep it
+  } else {
+    skipped++;                  // dry-run failed → just count it
+  }
+}
+console.log(`Skipped (dry-run failed): ${skipped}`);
 
   // Extract aggIds from the results
   const aggIds = results
