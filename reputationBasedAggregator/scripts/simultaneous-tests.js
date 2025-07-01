@@ -8,9 +8,9 @@ const pause = ms => new Promise(r => setTimeout(r, ms));
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
 const AGGREGATOR = "0x43fC1c39525Ec87218AFaC6dD361eBA29Ec125EF";
 const LINK_TOKEN = "0xE4aB69C077896252FAFBD49EFD26B5D171A32410";
-const NUM_QUERIES          = 10;
-const BETWEEN_QUERY_DELAY  = 2000;
-const NUM_INCREMENTS       = 14;
+const NUM_QUERIES          = 9;
+const BETWEEN_QUERY_DELAY  = 500;
+const NUM_INCREMENTS       = 12;
 const INCREMENT_DURATION   = 30000; // Polling increment in ms.
 const JOB_CLASS            = 128;
 const MAX_ORACLE_FEE       = ethers.parseUnits("0.01", 18);
