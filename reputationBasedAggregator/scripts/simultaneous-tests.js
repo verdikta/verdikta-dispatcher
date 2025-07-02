@@ -21,6 +21,7 @@ const CIDS      = [
   "QmSnynnZVufbeb9GVNLBjxBJ45FyHgjPYUHTvMK5VmQZcS"
 ];
 const ADDENDUM  = "";                     // optional
+const GAS_LIMIT = 3_000_000;
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
 async function getSigner() {
   // 1) try the accounts from hardhat.config.js
@@ -93,7 +94,7 @@ async function sendQuery(idx, nonce, delayMs) {
     ESTIMATED_BASE_FEE,
     MAX_FEE_SCALING,
     JOB_CLASS,
-    { nonce }
+    { nonce, gasLimit: GAS_LIMIT } 
   );
   console.log(`[${idx}] tx sent →`, tx.hash);
   const rcpt = await tx.wait(1);
