@@ -494,7 +494,7 @@ if (seenAlready) {
     (string memory cleanCid, uint256 saltUint) = _splitCidAndSalt(cid);
 
     // verify commit-reveal hash
-    bytes16 recomputed = bytes16(sha256(abi.encode(response, saltUint)));
+    bytes16 recomputed = bytes16(sha256(abi.encode(msg.sender, response, saltUint)));
     if (recomputed != agg.commitHashPerSlot[slot]) {
         emit HashMismatch(requestId, recomputed, agg.commitHashPerSlot[slot]);
         revert("Hash mismatch: reveal hash doesn't match commit hash");
