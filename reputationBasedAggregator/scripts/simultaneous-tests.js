@@ -6,7 +6,7 @@ const pause = ms => new Promise(r => setTimeout(r, ms));
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
    EDIT ONLY THESE CONSTANTS
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
-const AGGREGATOR = "0x43fC1c39525Ec87218AFaC6dD361eBA29Ec125EF";
+const AGGREGATOR = "0x65863e5e0B2c2968dBbD1c95BDC2e0EA598E5e02";
 const LINK_TOKEN = "0xE4aB69C077896252FAFBD49EFD26B5D171A32410";
 const NUM_QUERIES          = 9;
 const BETWEEN_QUERY_DELAY  = 500;
