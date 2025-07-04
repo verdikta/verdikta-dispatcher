@@ -1,1 +1,1 @@
-node scripts/approve-link.js 4
+node scripts/approve-link.js 0.5
