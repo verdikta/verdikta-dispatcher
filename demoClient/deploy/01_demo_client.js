@@ -8,8 +8,11 @@ module.exports = async ({ deployments, getNamedAccounts }) => {
 
   await deploy("DemoClient", {
     from: deployer,
-    args: [AGGREGATOR, LINK_TOKEN],      // ← two constructor params
+    args: [AGGREGATOR, LINK_TOKEN],      // two constructor params
     log: true,
+    deterministicDeployment: false,   
+    proxy: false,
+    skipIfAlreadyDeployed: false      // force fresh deploy
   });
 };
 
