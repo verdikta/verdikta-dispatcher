@@ -15,7 +15,6 @@ if (!TARGET) {
   const demoAbi = (await hre.artifacts.readArtifact("DemoClient")).abi;
   const demo = new ethers.Contract(TARGET, demoAbi, signer);
   
-  // Check current state first
   const currentAggId = await demo.currentAggId();
   console.log("Current aggId before request:", currentAggId);
   
@@ -36,7 +35,6 @@ if (!TARGET) {
       process.exit(1);
     }
     
-    // Debug: show all logs
     console.log("Total logs:", rcpt.logs.length);
     
     let requestedEvent = null;
@@ -54,21 +52,53 @@ if (!TARGET) {
     
     if (!requestedEvent) {
       console.error("Requested event not found!");
-      console.error("This suggests the transaction succeeded but the event wasn't emitted");
-      console.error("Check if the require() statement failed or if there's an issue with the contract");
       process.exit(1);
     }
     
     const aggId = requestedEvent.args.id;
     console.log("aggId:", aggId);
     
-    // Rest of your code...
+    // Use the full ReputationAggregator ABI instead of minimal interface
+    console.log("Setting up aggregator polling...");
+    const aggAbi = (await hre.artifacts.readArtifact('ReputationAggregator')).abi;
+    const aggAddress = await demo.agg();
+    const agg = new ethers.Contract(aggAddress, aggAbi, ethers.provider);
+    
+    console.log("waiting for scores …");
+    while (true) {
+      try {
+        const [scores, justif, has] = await agg.getEvaluation(aggId);
+        console.log(`Checking results... has: ${has}, scores length: ${scores.length}`);
+        
+        if (has && scores.length) {
+          console.log("✅ SCORES RECEIVED:");
+          console.log("scores:", scores.map(x => x.toString()).join(", "));
+          console.log("justifications:", justif);
+          break;
+        }
+        
+        if (await agg.isFailed(aggId)) {
+          console.error("❌ evaluation marked as failed by aggregator");
+          process.exit(1);
+        }
+        
+        console.log("Still waiting... checking again in 20 seconds");
+        await new Promise(r => setTimeout(r, 20_000));
+        
+      } catch (error) {
+        console.error("Error during polling:", error.message);
+        console.log("Retrying in 20 seconds...");
+        await new Promise(r => setTimeout(r, 20_000));
+      }
+    }
+    
+    console.log("Publishing results...");
+    const txPub = await demo.publish({ gasLimit: 500_000n });
+    console.log("publish tx:", txPub.hash);
+    console.log("✅ COMPLETE!");
     
   } catch (error) {
-    console.error("Error calling request():", error.message);
-    if (error.reason) {
-      console.error("Revert reason:", error.reason);
-    }
+    console.error("Error:", error.message);
     process.exit(1);
   }
 })();
