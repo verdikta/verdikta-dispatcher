@@ -1,2 +1,2 @@
-node scripts/transfer-link.js 0x15B3324A52853B56682a4E1470f7Ec3d86578a0F 0.10
+HARDHAT_NETWORK=base_sepolia node scripts/transfer-link.js 0xf84C988d7e05f2c8056A455992686BBa4D512adb 0.10
 
