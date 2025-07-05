@@ -1,0 +1,18 @@
+{
+  "name": "simple-contract",
+  "version": "1.0.0",
+  "private": true,
+  "devDependencies": {
+    "@chainlink/contracts": "1.2.0",
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "@openzeppelin/contracts": "^5.3.0",
+    "hardhat": "^2.23.0",
+    "hardhat-deploy": "^1.0.2"
+  },
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "deploy:base": "hardhat deploy --network base_sepolia",
+    "deploy:sep": "hardhat deploy --network sepolia"
+  }
+}

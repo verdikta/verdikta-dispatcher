@@ -1,0 +1,2 @@
+node scripts/transfer-link.js 0x8a56E7D23414dD793D322d4783336A9bd29E773B 0.15
+
