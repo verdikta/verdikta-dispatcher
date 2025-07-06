@@ -27,7 +27,7 @@ import "./ReputationKeeper.sol";
  *      Payment:
  *      1. All oracles get 1x fee up front.
  *      2. There is a bonus multiplier B, nominally 3.
- *      3. Clustered oracles get an additional Bx fee at finish.
+ *      3. Clustered oracles get this additional Bx fee at finish.
  */
 contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     using Chainlink for Chainlink.Request;
@@ -422,109 +422,107 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
      * @param response Array of likelihood scores (reveal) or single hash value (commit)
      * @param cid IPFS CID with salt (reveal phase) or empty string (commit phase)
      */
-function fulfill(
-    bytes32 requestId,
-    uint256[] memory response,
-    string memory cid
-) public recordChainlinkFulfillment(requestId) nonReentrant {
+    function fulfill(
+        bytes32 requestId,
+        uint256[] memory response,
+        string memory cid
+    ) public recordChainlinkFulfillment(requestId) nonReentrant {
 
-    bytes32 aggId = requestIdToAggregatorId[requestId];
-    require(aggId != bytes32(0), "Unknown reqId");
+        bytes32 aggId = requestIdToAggregatorId[requestId];
+        require(aggId != bytes32(0), "Unknown reqId");
 
-    AggregatedEvaluation storage agg = aggregatedEvaluations[aggId];
-    require(!agg.isComplete, "Aggregation done");
-    require(agg.requestIds[requestId], "Invalid reqId");
+        AggregatedEvaluation storage agg = aggregatedEvaluations[aggId];
+        require(!agg.isComplete, "Aggregation done");
+        require(agg.requestIds[requestId], "Invalid reqId");
 
-    uint256 slot = requestIdToPollIndex[requestId];
-    ReputationKeeper.OracleIdentity memory id = agg.polledOracles[slot];
+        uint256 slot = requestIdToPollIndex[requestId];
+        ReputationKeeper.OracleIdentity memory id = agg.polledOracles[slot];
 
-    // ---------- decide phase from *payload shape* ----------
-    bool looksLikeCommit = (response.length == 1) && (bytes(cid).length == 0);
-    bool looksLikeReveal = (response.length >= 2) && (bytes(cid).length > 0);
-    require(looksLikeCommit || looksLikeReveal, "callback payload malformed");
+        // ---------- decide phase from *payload shape* ----------
+        bool looksLikeCommit = (response.length == 1) && (bytes(cid).length == 0);
+        bool looksLikeReveal = (response.length >= 2) && (bytes(cid).length > 0);
+        require(looksLikeCommit || looksLikeReveal, "callback payload malformed");
 
-    /* ────────────────────────────────────────────────────────
-     *                     COMMIT  (Mode-1)
-     * ──────────────────────────────────────────────────────── */
-    if (looksLikeCommit) {
+        /* ────────────────────────────────────────────────────────
+         *                     COMMIT  (Mode-1)
+         * ──────────────────────────────────────────────────────── */
+        if (looksLikeCommit) {
 
-        bytes16 hash128 = bytes16(bytes32(uint256(response[0]) << 128));
+            bytes16 hash128 = bytes16(bytes32(uint256(response[0]) << 128));
 
-        // (a) commit arrived after we already switched to reveal → just log it
-        if (agg.commitPhaseComplete) {
+            // (a) commit arrived after we already switched to reveal → just log it
+            if (agg.commitPhaseComplete) {
+                emit CommitReceived(aggId, slot, msg.sender, hash128);
+                return;
+            }
+            // (b) duplicate commit for this slot → ignore
+            if (agg.commitHashPerSlot[slot] != bytes16(0)) {
+                return;
+            }
+
+            // normal commit path
+            agg.commitHashPerSlot[slot] = hash128;
+            agg.commitReceived += 1;
             emit CommitReceived(aggId, slot, msg.sender, hash128);
-            return;
+
+            // when we have M commits → start reveal phase
+            if (agg.commitReceived == oraclesToPoll) {
+                agg.commitPhaseComplete = true;
+                emit CommitPhaseComplete(aggId);
+                _dispatchRevealRequests(aggId, agg);
+            }
+            return;                                     // commit handled
         }
-        // (b) duplicate commit for this slot → ignore
-        if (agg.commitHashPerSlot[slot] != bytes16(0)) {
-            return;
+
+        /* ────────────────────────────────────────────────────────
+         *                     REVEAL  (Mode-2)
+         * ──────────────────────────────────────────────────────── */
+        require(agg.commitPhaseComplete,
+                "reveal arrived before commit phase complete");
+
+        // ─── DUPLICATE-REVEAL GUARD ──────────────────
+        (bool seenAlready, ) = _getResponseForSlot(agg.responses, slot);
+        if (seenAlready) {
+            return;                                    // ignore retry
         }
 
-        // normal commit path
-        agg.commitHashPerSlot[slot] = hash128;
-        agg.commitReceived += 1;
-        emit CommitReceived(aggId, slot, msg.sender, hash128);
+        // first reveal fixes array length; every later reveal must match
+        uint256[] storage totals = _ensureAggArrayExists(agg, response.length);
+        require(response.length == totals.length, "Wrong number of scores");
 
-        // when we have M commits → start reveal phase
-        if (agg.commitReceived == oraclesToPoll) {
-            agg.commitPhaseComplete = true;
-            emit CommitPhaseComplete(aggId);
-            _dispatchRevealRequests(aggId, agg);
+        // Split "cleanCid:20hexSalt" → (cid, saltUint)
+        (string memory cleanCid, uint256 saltUint) = _splitCidAndSalt(cid);
+
+        // verify commit-reveal hash
+        bytes16 recomputed = bytes16(sha256(abi.encode(msg.sender, response, saltUint)));
+        if (recomputed != agg.commitHashPerSlot[slot]) {
+            emit HashMismatch(requestId, recomputed, agg.commitHashPerSlot[slot]);
+            revert("Hash mismatch: reveal hash doesn't match commit hash");
         }
-        return;                                     // commit handled
+
+        // entropy, bookkeeping, and storage insert
+        _updateEntropy(bytes10(uint80(saltUint)));
+        bool selected = (agg.responses.length < agg.requiredResponses);
+
+        Response memory resp = Response({
+            likelihoods:      response,
+            justificationCID: cleanCid,
+            requestId:        requestId,
+            selected:         selected,
+            timestamp:        block.timestamp,
+            operator:         msg.sender,
+            pollIndex:        slot,
+            jobId:            id.jobId
+        });
+
+        agg.responses.push(resp);
+        agg.responseCount += 1;
+        emit NewOracleResponseRecorded(requestId, slot, msg.sender);
+
+        if (agg.responseCount >= agg.requiredResponses) {
+            _finalizeAggregation(aggId);
+        }
     }
-
-    /* ────────────────────────────────────────────────────────
-     *                     REVEAL  (Mode-2)
-     * ──────────────────────────────────────────────────────── */
-    require(agg.commitPhaseComplete,
-            "reveal arrived before commit phase complete");
-
-// ─── NEW DUPLICATE-REVEAL GUARD ──────────────────
-(bool seenAlready, ) = _getResponseForSlot(agg.responses, slot);
-if (seenAlready) {
-    return;                                    // ignore retry
-}
-
-    // first reveal fixes array length; every later reveal must match
-    uint256[] storage totals = _ensureAggArrayExists(agg, response.length);
-    require(response.length == totals.length, "Wrong number of scores");
-
-    // Split "cleanCid:20hexSalt" → (cid, saltUint)
-    (string memory cleanCid, uint256 saltUint) = _splitCidAndSalt(cid);
-
-    // verify commit-reveal hash
-    bytes16 recomputed = bytes16(sha256(abi.encode(msg.sender, response, saltUint)));
-    if (recomputed != agg.commitHashPerSlot[slot]) {
-        emit HashMismatch(requestId, recomputed, agg.commitHashPerSlot[slot]);
-        revert("Hash mismatch: reveal hash doesn't match commit hash");
-    }
-
-    // entropy, bookkeeping, and storage insert
-    _updateEntropy(bytes10(uint80(saltUint)));
-    bool selected = (agg.responses.length < agg.requiredResponses);
-
-    Response memory resp = Response({
-        likelihoods:      response,
-        justificationCID: cleanCid,
-        requestId:        requestId,
-        selected:         selected,
-        timestamp:        block.timestamp,
-        operator:         msg.sender,
-        pollIndex:        slot,
-        jobId:            id.jobId
-    });
-
-    agg.responses.push(resp);
-    agg.responseCount += 1;
-    emit NewOracleResponseRecorded(requestId, slot, msg.sender);
-
-    if (agg.responseCount >= agg.requiredResponses) {
-        _finalizeAggregation(aggId);
-    }
-}
-
-
 
     // ----------------------------------------------------------------------
     //                      INTERNAL: DISPATCH REVEAL REQUESTS
@@ -691,6 +689,10 @@ if (seenAlready) {
         return string(hexChars);
     }
 
+    // ----------------------------------------------------------------------
+    //                          HELPER FUNCTIONS
+    // ----------------------------------------------------------------------
+
 /// @dev Make sure the per-round running-total array exists and return a
 ///      STORAGE pointer to it.  Subsequent writers all share the same slot.
 function _ensureAggArrayExists(
@@ -709,10 +711,6 @@ function _ensureAggArrayExists(
     function _lowerHexChar(uint8 nib) internal pure returns (bytes1) {
         return bytes1(uint8(nib < 10 ? 48 + nib : 87 + nib)); // 0-9 → '0'-'9', 10-15 → 'a'-'f'
     }
-
-    // ----------------------------------------------------------------------
-    //                          HELPER FUNCTIONS
-    // ----------------------------------------------------------------------
 
     /**
      * @notice Get the current request counter value
@@ -900,6 +898,7 @@ function _ensureAggArrayExists(
     // ----------------------------------------------------------------------
     //             TIMEOUT PENALTY HELPERS
     // ----------------------------------------------------------------------
+
     function _applyTimeoutPenalties(
         AggregatedEvaluation storage agg,
         bool commitPhase            // true  = commit timeout
@@ -924,7 +923,6 @@ function _ensureAggArrayExists(
             }
         }
     }
-
 
     // ----------------------------------------------------------------------
     //             EVALUATION GETTERS & WITHDRAW
