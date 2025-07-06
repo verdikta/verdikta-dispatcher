@@ -2,9 +2,12 @@
 pragma solidity ^0.8.21;
 
 interface IERC20 {
-    function approve(address spender, uint256 amount) external returns (bool);
-    function transferFrom(address from, address to, uint256 amount) external returns (bool);
-    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) 
+        external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) 
+        external returns (bool);
+    function balanceOf(address account) 
+        external view returns (uint256);
 }
 
 interface IReputationAggregator {
@@ -17,7 +20,8 @@ interface IReputationAggregator {
         uint256 maxFeeScaling,
         uint64 jobClass
     ) external returns (bytes32);
-    function getEvaluation(bytes32) external view returns (uint64[] memory, string memory, bool);
+    function getEvaluation(bytes32) 
+       external view returns (uint64[] memory, string memory, bool);
     function isFailed(bytes32) external view returns (bool);
 }
 
@@ -37,7 +41,7 @@ contract DemoClient {
         cids.push("QmSnynnZVufbeb9GVNLBjxBJ45FyHgjPYUHTvMK5VmQZcS");
     }
 
-    // Separate function to approve aggregator (call this once before using request)
+    // Function to approve aggregator (call this once before using request)
     function approveAggregator() external {
         link.approve(address(agg), type(uint256).max);
         linkApproved = true;
