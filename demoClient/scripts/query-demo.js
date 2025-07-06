@@ -125,7 +125,7 @@ if (!TARGET) {
     
     // Use the full ReputationAggregator ABI instead of minimal interface
     console.log("Setting up aggregator polling...");
-    const aggAbi = (await hre.artifacts.readArtifact('ReputationAggregator')).abi;
+    const aggAbi = (await hre.artifacts.readArtifact('IReputationAggregator')).abi;
     const aggAddress = await demo.agg();
     const agg = new ethers.Contract(aggAddress, aggAbi, ethers.provider);
     
