@@ -1,1 +1,1 @@
-HARDHAT_NETWORK=base_sepolia node scripts/query-demo.js 0xf84C988d7e05f2c8056A455992686BBa4D512adb
+HARDHAT_NETWORK=base_sepolia node scripts/query-demo.js 0x5D84637a2c19D7b16837D2bc63A2d7e48a229950
