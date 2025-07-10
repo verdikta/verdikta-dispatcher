@@ -101,7 +101,7 @@ contract ReputationKeeper is Ownable {
     
     // Configuration for slashing and locking.
     uint256 public slashAmountConfig = 0 * 10**18;     // 0 VDKA tokens (configurable)
-    uint256 public lockDurationConfig = 2 hours;       // Lock period (configurable)
+    uint256 public lockDurationConfig = 24 hours;      // Lock period (configurable)
     int256 public severeThreshold = -60;               // Severe threshold (configurable)
     int256 public mildThreshold = -20;                 // Mild threshold (configurable)
     
