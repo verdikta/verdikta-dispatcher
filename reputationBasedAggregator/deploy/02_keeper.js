@@ -53,7 +53,7 @@ module.exports = async ({ deployments, getNamedAccounts, ethers, network }) => {
   /* ----------------------------------------------------------------------- */
   /* Wire keeper ↔ aggregator                                                */
   /* ----------------------------------------------------------------------- */
-  // fetch addresses that hardhat‑deploy wrote
+  // fetch addresses that hardhat-deploy wrote
   let aggInfo  = await deployments.getOrNull("ReputationAggregator");
   if (!aggInfo || !ethers.isAddress(aggInfo.address)) {
     throw new Error("Aggregator address not recorded yet; re-run the deploy.");
@@ -76,18 +76,10 @@ module.exports = async ({ deployments, getNamedAccounts, ethers, network }) => {
     signer
   );
 
- // const currentNonce1 = await ethers.provider.getTransactionCount(deployer, "latest");
- // const pendingNonce1 = await ethers.provider.getTransactionCount(deployer, "pending");
- // const baseNonce = Math.max(currentNonce1, pendingNonce1, safeNonce+1);
- // console.log(`Contract interaction nonce: ${baseNonce} (current: ${currentNonce1}, pending: ${pendingNonce1})`);
-
   console.log("Approving aggregator in keeper…");
   if (!aggInfo?.address || aggInfo.address === ethers.ZeroAddress) {
     throw new Error("Aggregator address undefined – previous deploy not finished?");
   }
-  console.log("DEBUG aggInfo.address =", aggInfo.address);
-  // await (await keeper.approveContract(aggInfo.address, { nonce: baseNonce })).wait();
-  // await (await keeper["approveContract(address)"]( aggInfo.address, { nonce: baseNonce } )).wait();
 
   // Check if aggregator is already approved in keeper
   const isApproved = await keeper.isContractApproved(aggInfo.address);
@@ -145,7 +137,7 @@ if (currentKeeper.toLowerCase() !== keepInfo.address.toLowerCase()) {
 } else {
   console.log("Keeper already set correctly, skipping...");
 }
-  console.log("Keeper wired to aggregator ✓");
+  console.log("Keeper wired to aggregator.");
 };
 
 module.exports.tags = ["keeper"];
