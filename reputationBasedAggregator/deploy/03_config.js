@@ -71,7 +71,7 @@ if (keeper.target === aggregator.target) {
   const maxFee = ethers.parseEther("0.05"); // In LINK as maximum fee increment.
   await (await aggregator.setMaxOracleFee(maxFee)).wait();
 
-  console.log("Aggregator configured ✓");
+  console.log("Aggregator configured.");
 };
 
 module.exports.tags = ["config"];
