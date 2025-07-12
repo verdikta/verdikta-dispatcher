@@ -22,5 +22,5 @@ echo "Deploying keeper + aggregator + config to ${NET}..."
 # npx hardhat deploy --network "${NET}" --tags aggregator,keeper,config --reset
 npx hardhat deploy --network "${NET}" --tags aggregator,keeper,config
 
-echo "✅  All deployments finished."
+echo "All deployments finished."
 
