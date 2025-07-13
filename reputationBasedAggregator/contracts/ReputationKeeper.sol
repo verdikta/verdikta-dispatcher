@@ -95,8 +95,10 @@ contract ReputationKeeper is Ownable {
     // The maximum number of historical score records to keep for each oracle.
     uint256 public maxScoreHistory = 25;
 
+    // The cap on the reputation score as used for selection
+    uint256 public maxScoreForSelection = 400;
+
     uint256 public constant STAKE_REQUIREMENT = 100 * 10**18;  // 100 VDKA tokens
-    uint256 public constant MAX_SCORE_FOR_SELECTION = 400;
     uint256 public constant MIN_SCORE_FOR_SELECTION = 1;
     
     // Configuration for slashing and locking.
@@ -403,8 +405,8 @@ contract ReputationKeeper is Ownable {
         if (weightedScore < int256(MIN_SCORE_FOR_SELECTION)) {
             weightedScore = int256(MIN_SCORE_FOR_SELECTION);
         }
-        if (weightedScore > int256(MAX_SCORE_FOR_SELECTION)) {
-            weightedScore = int256(MAX_SCORE_FOR_SELECTION);
+        if (weightedScore > int256(maxScoreForSelection)) {
+            weightedScore = int256(maxScoreForSelection);
         }
         
         uint256 oracleFee = info.fee;
@@ -508,78 +510,78 @@ contract ReputationKeeper is Ownable {
     /**
      * @dev Internal helper to perform weighted selection on a given shortlist (while avoiding duplicates if possible).
      */
-function _weightedSelect(
-    OracleIdentity[] memory shortlist,
-    SelectionParams memory params,
-    uint256 count
-) internal view returns (OracleIdentity[] memory) {
+    function _weightedSelect(
+        OracleIdentity[] memory shortlist,
+        SelectionParams memory params,
+        uint256 count
+    ) internal view returns (OracleIdentity[] memory) {
 
-    // Pick arbiter-provided entropy from earlier block to prevent manipulation
-    bytes16 chosenEntropy =
-        (block.number == entropyBlock) ? entropyBuf[1] : entropyBuf[0];
+        // Pick arbiter-provided entropy from earlier block to prevent manipulation
+        bytes16 chosenEntropy =
+            (block.number == entropyBlock) ? entropyBuf[1] : entropyBuf[0];
 
-    uint256 n = shortlist.length;
+        uint256 n = shortlist.length;
 
-    // Pre-compute weights once
-    uint256[] memory weights = new uint256[](n);
-    uint256 totalWeight = 0;
-    for (uint256 i; i < n; ++i) {
-        weights[i] = getSelectionScore(
-            shortlist[i].oracle,
-            shortlist[i].jobId,
-            params
-        );
-        totalWeight += weights[i];
-    }
-
-    // Keep a copy of the *full* total for later reuse
-    uint256 fullWeight = totalWeight;
-
-    OracleIdentity[] memory selected = new OracleIdentity[](count);
-    bool[] memory taken = new bool[](n);
-
-    /* ---------- 1st pass: unique selections ---------- */
-    uint256 uniqueDraws = count > n ? n : count;
-    for (uint256 k; k < uniqueDraws; ++k) {
-        bytes32 seed = keccak256(
-            abi.encodePacked(chosenEntropy, block.prevrandao, block.timestamp, selectionCounter, k)
-        );
-        uint256 pivot = uint256(seed) % totalWeight;
-
-        uint256 acc = 0;
-        uint256 j;
-        for (j = 0; j < n; ++j) {
-            if (taken[j]) continue;
-            acc += weights[j];
-            if (acc > pivot) break;
-        }
-        selected[k] = shortlist[j];
-        taken[j] = true;
-
-        // Burn this weight so it can’t be drawn again in the unique phase
-        totalWeight -= weights[j];
-    }
-
-    /* ---------- 2nd pass: duplicates allowed (only if needed) ---------- */
-    if (count > n) {
-        for (uint256 k = uniqueDraws; k < count; ++k) {
-            bytes32 seed = keccak256(
-                abi.encodePacked(chosenEntropy, block.prevrandao, block.timestamp, k)
+        // Pre-compute weights once
+        uint256[] memory weights = new uint256[](n);
+        uint256 totalWeight = 0;
+        for (uint256 i; i < n; ++i) {
+            weights[i] = getSelectionScore(
+                shortlist[i].oracle,
+                shortlist[i].jobId,
+                params
             );
-            uint256 pivot = uint256(seed) % fullWeight;   // use *full* weight
+            totalWeight += weights[i];
+        }
+
+        // Keep a copy of the *full* total for later reuse
+        uint256 fullWeight = totalWeight;
+
+        OracleIdentity[] memory selected = new OracleIdentity[](count);
+        bool[] memory taken = new bool[](n);
+
+        /* ---------- 1st pass: unique selections ---------- */
+        uint256 uniqueDraws = count > n ? n : count;
+        for (uint256 k; k < uniqueDraws; ++k) {
+            bytes32 seed = keccak256(
+                abi.encodePacked(chosenEntropy, block.prevrandao, block.timestamp, selectionCounter, k)
+            );
+            uint256 pivot = uint256(seed) % totalWeight;
 
             uint256 acc = 0;
-            for (uint256 j; j < n; ++j) {
+            uint256 j;
+            for (j = 0; j < n; ++j) {
+                if (taken[j]) continue;
                 acc += weights[j];
-                if (acc > pivot) {
-                    selected[k] = shortlist[j];
-                    break;              // duplicates now permitted
+                if (acc > pivot) break;
+            }
+            selected[k] = shortlist[j];
+            taken[j] = true;
+
+            // Burn this weight so it can’t be drawn again in the unique phase
+            totalWeight -= weights[j];
+        }
+
+        /* ---------- 2nd pass: duplicates allowed (only if needed) ---------- */
+        if (count > n) {
+            for (uint256 k = uniqueDraws; k < count; ++k) {
+                bytes32 seed = keccak256(
+                    abi.encodePacked(chosenEntropy, block.prevrandao, block.timestamp, k)
+                );
+                uint256 pivot = uint256(seed) % fullWeight;   // use *full* weight
+
+                uint256 acc = 0;
+                for (uint256 j; j < n; ++j) {
+                    acc += weights[j];
+                    if (acc > pivot) {
+                        selected[k] = shortlist[j];
+                        break;              // duplicates now permitted
+                    }
                 }
             }
         }
+        return selected;
     }
-    return selected;
-}
     
     /**
      * @notice Record that specific oracles were used by an approved contract
@@ -604,7 +606,17 @@ function _weightedSelect(
         require(_maxScoreHistory > 0, "maxScoreHistory must be > 0");
         maxScoreHistory = _maxScoreHistory;
     }
-    
+
+    /**
+     * @notice Set the maximum score used for arbiter random selection probabilities
+     * @dev Affects selection likelihood
+     * @param _maxScoreForSelection Maximum score used for selection (must be > 0)
+     */
+    function setMaxScoreForSelection(uint256 _maxScoreForSelection) external onlyOwner {
+        require(_maxScoreForSelection > 0, "maxScoreForSelection must be > 0");
+        maxScoreForSelection = _maxScoreForSelection;
+    }
+
     /**
      * @notice Get the recent score history for an oracle
      * @dev Returns historical performance data used for trend analysis
