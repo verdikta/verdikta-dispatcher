@@ -119,6 +119,7 @@ const toBytes32 = (id) =>
           console.log(`\nOracle: ${oracle}`);
           console.log(`JobID:  ${jobId}`);
           console.log(`Scores: ${info.qualityScore}/${info.timelinessScore}`);
+          console.log(`Fee:     ${ethers.formatEther(info.fee)} LINK`);
           try {
             const classes = await keeper.getOracleClassesByKey(oracle, jobId);
             console.log(`Classes: ${classes}`);
