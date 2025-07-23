@@ -1,6 +1,9 @@
 site_name: Verdikta Dispatcher Smart Contracts
 site_description: Smart contract documentation for the Verdikta Dispatcher ecosystem
 
+# Docs directory (set to docs subdirectory)
+docs_dir: docs
+
 theme:
   name: material
 
