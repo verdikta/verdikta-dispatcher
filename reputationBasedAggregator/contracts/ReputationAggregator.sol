@@ -54,6 +54,9 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     uint256 public constant MAX_CID_LENGTH = 100;
     uint256 public constant MAX_ADDENDUM_LENGTH = 1000;
 
+    // limits for arbiter behavior
+    uint256 private constant MAX_ARBITER_RETURN_SCORE = 1e34;
+
     // running call counter
     uint256 private requestCounter;
 
@@ -498,6 +501,13 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         if (recomputed != agg.commitHashPerSlot[slot]) {
             emit HashMismatch(requestId, recomputed, agg.commitHashPerSlot[slot]);
             revert("Hash mismatch: reveal hash doesn't match commit hash");
+        }
+
+        // fix excessive score values through clamping to prevent later overflow
+        for (uint256 i = 0; i < response.length; ++i) {
+            if (response[i] > MAX_ARBITER_RETURN_SCORE) {
+                response[i] = MAX_ARBITER_RETURN_SCORE;
+            }
         }
 
         // entropy, bookkeeping, and storage insert
