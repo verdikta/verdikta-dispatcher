@@ -165,7 +165,10 @@ contract ReputationKeeper is Ownable {
         );
         
         // Transfer the stake from the registering party.
-        verdiktaToken.transferFrom(msg.sender, address(this), STAKE_REQUIREMENT);
+        require(
+            verdiktaToken.transferFrom(msg.sender, address(this), STAKE_REQUIREMENT),
+            "Stake transfer failed"
+        );
         
         // Initialize the oracle info.
         OracleInfo storage info = oracles[key];
