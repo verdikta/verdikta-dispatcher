@@ -589,7 +589,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         }
         
         uint256[] memory cluster = (selectedCount >= 2)
-            ? _findBestClusterFromResponses(agg.responses, selIdx)
+            ? _findBestClusterFromResponses(agg.responses, selIdx, agg.clusterSize)
             : new uint256[](selectedCount);
 
         if (agg.responses.length > 0) {
@@ -801,36 +801,73 @@ function _ensureAggArrayExists(
     /**
      * @dev Find the best cluster from responses
      */
-    function _findBestClusterFromResponses(Response[] memory responses, uint256[] memory selectedResponseIndices)
-        internal pure returns (uint256[] memory)
+    function _findBestClusterFromResponses(
+        Response[] memory responses,
+        uint256[] memory selectedResponseIndices,
+        uint256 P                              // desired cluster size
+    ) internal pure returns (uint256[] memory)
     {
         uint256 count = selectedResponseIndices.length;
         require(count >= 2, "Need at least 2 responses");
-        uint256[] memory bestCluster = new uint256[](count);
-        uint256 bestDistance = type(uint256).max;
-        
-        for (uint256 i = 0; i < count - 1; i++) {
-            for (uint256 j = i + 1; j < count; j++) {
-                uint256 respIndexA = selectedResponseIndices[i];
-                uint256 respIndexB = selectedResponseIndices[j];
-                if (respIndexA >= responses.length || respIndexB >= responses.length) continue;
-                
-                uint256 dist = _calculateDistance(
-                    responses[respIndexA].likelihoods,
-                    responses[respIndexB].likelihoods
+
+        // Cap P to available responses
+        if (P > count) P = count;
+
+        // ---- step 1: find the closest pair ----
+        uint256 bestA;
+        uint256 bestB;
+        uint256 bestDist = type(uint256).max;
+        for (uint256 i = 0; i < count - 1; ++i) {
+            for (uint256 j = i + 1; j < count; ++j) {
+                uint256 d = _calculateDistance(
+                    responses[selectedResponseIndices[i]].likelihoods,
+                    responses[selectedResponseIndices[j]].likelihoods
                 );
-                
-                if (dist < bestDistance) {
-                    bestDistance = dist;
-                    for (uint256 x = 0; x < count; x++) {
-                        bestCluster[x] = (x == i || x == j) ? 1 : 0;
-                    }
+                if (d < bestDist) {
+                    bestDist = d;
+                    bestA = i;
+                    bestB = j;
                 }
             }
         }
-        
-        return bestCluster;
+
+        // flags: 1 = in cluster, 0 = out
+        uint256[] memory flags = new uint256[](count);
+        flags[bestA] = 1;
+        flags[bestB] = 1;
+        uint256 clusterSizeNow = 2;
+
+        // ---- step 2: greedy add until clusterSizeNow == P ----
+        while (clusterSizeNow < P) {
+            uint256 bestCand;
+            uint256 bestScore = type(uint256).max;
+
+            for (uint256 i = 0; i < count; ++i) {
+                if (flags[i] == 1) continue; // already in cluster
+
+                // score = sum distance to current cluster members
+                uint256 score = 0;
+                for (uint256 k = 0; k < count; ++k) {
+                    if (flags[k] == 1) {
+                        score += _calculateDistance(
+                            responses[selectedResponseIndices[i]].likelihoods,
+                            responses[selectedResponseIndices[k]].likelihoods
+                        );
+                    }
+                }
+                if (score < bestScore) {
+                    bestScore = score;
+                    bestCand  = i;
+                }
+            }
+
+            flags[bestCand] = 1;
+            ++clusterSizeNow;
+        }
+
+        return flags; // length == count, with exactly P ones
     }
+
 
     /**
      * @dev Calculate the Euclidean distance between two arrays
