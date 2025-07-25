@@ -211,16 +211,19 @@ contract ReputationKeeper is Ownable {
     function deregisterOracle(address _oracle, bytes32 _jobId) external {
         bytes32 key = _oracleKey(_oracle, _jobId);
         OracleInfo storage info = oracles[key];
+
         // Check that the oracle is registered by ensuring stakeAmount is nonzero.
-        require(info.stakeAmount > 0, "Oracle not registered");
+        uint256 refundAmount = info.stakeAmount;
+        require(refundAmount > 0 || info.isActive || info.blocked,  "Oracle not registered");
         require(
             msg.sender == owner() || msg.sender == IOracleOwner(_oracle).owner(),
             "Not authorized to deregister oracle"
         );
         require(block.timestamp >= info.lockedUntil, "Oracle is locked and cannot be unregistered");
-        
-        // Return the staked tokens.
-        verdiktaToken.transfer(msg.sender, info.stakeAmount);
+
+        // Funds go to the owner of the arbiter
+        address oracleOwner = IOracleOwner(_oracle).owner();
+        require(oracleOwner != address(0), "Oracle owner is zero");
         
         // Remove the oracle record completely.
         delete oracles[key];
@@ -233,7 +236,15 @@ contract ReputationKeeper is Ownable {
                 break;
             }
         }
-        
+
+        // refund the stake
+        if (refundAmount > 0) {
+            require(
+                verdiktaToken.transfer(oracleOwner, refundAmount),
+                "Stake refund failed"
+            ); 
+        }
+
         emit OracleDeregistered(_oracle, _jobId);
     }
     
