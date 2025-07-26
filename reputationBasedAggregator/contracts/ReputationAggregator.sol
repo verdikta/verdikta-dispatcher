@@ -16,7 +16,7 @@ import "./ReputationKeeper.sol";
  *      - N = requiredResponses    - first N reveals aggregated
  *      - P = clusterSize          - size of best match cluster for bonus
  *
- *      By default, K,M,N,P = 5,4,3,2
+ *      By default, K,M,N,P = 6,4,3,2
  *
  *      Flow:
  *      1. requestAIEvaluationWithApproval sends Mode 1 requests to K oracles.
@@ -33,9 +33,9 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     using Chainlink for Chainlink.Request;
 
     // ----------------------------------------------------------------------
-    //                          CONFIGURATION STORAGE
+    //                          CONFIGURATION
     // ----------------------------------------------------------------------
-    uint256 public commitOraclesToPoll;     // K – commiti-phase polls
+    uint256 public commitOraclesToPoll;     // K – commit-phase polls
     uint256 public oraclesToPoll;           // M – reveals requested
     uint256 public requiredResponses;       // N
     uint256 public clusterSize;             // P
@@ -45,6 +45,16 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     // rolling entropy
     bytes16 public rollingEntropy;          // init to 0x0 and build over time
     uint256 public lastEntropyBlock;        // block.number the keeper saw last
+
+    // scoring
+    int8 public clusteredTimelinessScore;   // timeliness score change when clustered
+    int8 public clusteredQualityScore;      // quality score change when clustered
+    int8 public selectedTimelinessScore;    // timeliness score change when selected but not clustered
+    int8 public selectedQualityScore;       // quality score change when selected but not clustered
+    int8 public revealedTimelinessScore;    // timeliness score change when revealed but not selected
+    int8 public revealedQualityScore;       // quality score change when revealed but not selected
+    int8 public committedTimelinessScore;   // timeliness score change when committed but not revealed
+    int8 public committedQualityScore;      // quality score change when committed but not revealed
 
     // owner-settable LINK fee limits
     uint256 public maxOracleFee;
@@ -131,6 +141,19 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     /// @param newKeeper Address of the new ReputationKeeper
     event ReputationKeeperChanged(address indexed oldKeeper, address indexed newKeeper);
 
+    /// @notice Emitted when the owner updates the score delta parameters.
+    /// @param clusteredTimeliness   New timeliness delta when clustered.
+    /// @param clusteredQuality      New quality delta when clustered.
+    /// @param selectedTimeliness    New timeliness delta when selected but not clustered.
+    /// @param selectedQuality       New quality delta when selected but not clustered.
+    /// @param revealedTimeliness    New timeliness delta when revealed but not selected.
+    /// @param revealedQuality       New quality delta when revealed but not selected.
+    /// @param committedTimeliness   New timeliness delta when committed but not revealed.
+    /// @param committedQuality      New quality delta when committed but not revealed.
+    event ScoreDeltasUpdated( int8 clusteredTimeliness, int8 clusteredQuality, int8 selectedTimeliness,
+                              int8 selectedQuality, int8 revealedTimeliness, int8 revealedQuality, 
+                              int8 committedTimeliness, int8 committedQuality);
+
     // ----------------------------------------------------------------------
     //                               STRUCTS
     // ----------------------------------------------------------------------
@@ -204,11 +227,20 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         rollingEntropy = 0x0;
         lastEntropyBlock = block.number;
 
-        // default parameters keep the old behaviour: K=M=4, N=3, P=2
-        commitOraclesToPoll = 5;        // K (default – one extra oracle)
+        // default parameters: K=6, M=4, N=3, P=2
+        commitOraclesToPoll = 6;        // K 
         oraclesToPoll = 4;              // M
         requiredResponses = 3;          // N
         clusterSize = 2;                // P
+
+        clusteredTimelinessScore = 4;   // timeliness score change when clustered
+        clusteredQualityScore = 4;      // quality score change when clustered
+        selectedTimelinessScore = 0;    // timeliness score change when selected but not clustered
+        selectedQualityScore = -4;      // quality score change when selected but not clustered
+        revealedTimelinessScore = -2;   // timeliness score change when revealed but not selected
+        revealedQualityScore = 0;       // quality score change when revealed but not selected
+        committedTimelinessScore = -1;  // timeliness score change when committed but not revealed
+        committedQualityScore = 0;      // quality score change when committed but not revealed
 
         responseTimeoutSeconds = 5 minutes;
         maxOracleFee = 0.1 * 10 ** 18;  // 0.1 LINK
@@ -658,27 +690,27 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
                 (bool found, uint256 sIdx) = _findIndexInArray(selIdx, respIndex);
                 if (found) {
                     if (cluster[sIdx] == 1) {
-                        try reputationKeeper.updateScores(id.oracle, resp.jobId, int8(4), int8(4)) {} catch {
+                        try reputationKeeper.updateScores(id.oracle, resp.jobId, clusteredQualityScore, clusteredTimelinessScore) {} catch {
                             emit OracleScoreUpdateSkipped(resp.operator, resp.jobId, "updateScores failed for clustered selected response");
                         }
                         uint256 bonus = agg.pollFees[slot] * bonusMultiplier;
                         _payBonus(agg.requester, agg.userFunded, bonus, resp.operator);
                         return (true, 1);
                     } else {
-                        try reputationKeeper.updateScores(id.oracle, resp.jobId, int8(-4), int8(0)) {} catch {
+                        try reputationKeeper.updateScores(id.oracle, resp.jobId, selectedQualityScore, selectedTimelinessScore) {} catch {
                             emit OracleScoreUpdateSkipped(resp.operator, resp.jobId, "updateScores failed for non-clustered selected response");
                         }
                         return (true, 0);
                     }
                 }
             } else {
-                try reputationKeeper.updateScores(id.oracle, resp.jobId, int8(0), int8(-2)) {} catch {
+                try reputationKeeper.updateScores(id.oracle, resp.jobId, revealedQualityScore, revealedTimelinessScore) {} catch {
                     emit OracleScoreUpdateSkipped(resp.operator, resp.jobId, "updateScores failed for responded but not selected");
                 }
                 return (true, 0);
             }
         } else {
-            try reputationKeeper.updateScores(id.oracle, id.jobId, int8(0), int8(-2)) {} catch {
+            try reputationKeeper.updateScores(id.oracle, id.jobId, committedQualityScore, committedTimelinessScore) {} catch {
                 emit OracleScoreUpdateSkipped(id.oracle, id.jobId, "updateScores failed for no response");
             }
             return (true, 0);
@@ -1086,6 +1118,50 @@ function _ensureAggArrayExists(
     function setBonusMultiplier(uint256 _m) external onlyOwner {
         require(_m <= 20, "bonus 0-20x");
         bonusMultiplier = _m;
+    }
+
+    /**
+     * @notice Updates all score‑delta parameters in one transaction.
+     * @dev Only callable by the contract owner. Emits a ScoreDeltasUpdated event.
+     * @param _clusteredTimeliness  Delta applied to timeliness when clustered.
+     * @param _clusteredQuality     Delta applied to quality when clustered.
+     * @param _selectedTimeliness   Delta applied to timeliness when selected but not clustered.
+     * @param _selectedQuality      Delta applied to quality when selected but not clustered.
+     * @param _revealedTimeliness   Delta applied to timeliness when revealed but not selected.
+     * @param _revealedQuality      Delta applied to quality when revealed but not selected.
+     * @param _committedTimeliness  Delta applied to timeliness when committed but not revealed.
+     * @param _committedQuality     Delta applied to quality when committed but not revealed.
+     */
+    function setScoreDeltas(
+        int8 _clusteredTimeliness,
+        int8 _clusteredQuality,
+        int8 _selectedTimeliness,
+        int8 _selectedQuality,
+        int8 _revealedTimeliness,
+        int8 _revealedQuality,
+        int8 _committedTimeliness,
+        int8 _committedQuality
+    ) external onlyOwner {
+
+       clusteredTimelinessScore  = _clusteredTimeliness;
+       clusteredQualityScore     = _clusteredQuality;
+       selectedTimelinessScore   = _selectedTimeliness;
+       selectedQualityScore      = _selectedQuality;
+       revealedTimelinessScore   = _revealedTimeliness;
+       revealedQualityScore      = _revealedQuality;
+       committedTimelinessScore  = _committedTimeliness;
+       committedQualityScore     = _committedQuality;
+
+       emit ScoreDeltasUpdated(
+           _clusteredTimeliness,
+           _clusteredQuality,
+           _selectedTimeliness,
+           _selectedQuality,
+           _revealedTimeliness,
+           _revealedQuality,
+           _committedTimeliness,
+           _committedQuality
+       );
     }
 
     /**
