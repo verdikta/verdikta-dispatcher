@@ -6,19 +6,19 @@ const pause = ms => new Promise(r => setTimeout(r, ms));
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
    EDIT ONLY THESE CONSTANTS
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
-const AGGREGATOR = "0x09dC170cEF18eB0Ab128950CA3d478317103d5F1";
+const AGGREGATOR = "0x65863e5e0B2c2968dBbD1c95BDC2e0EA598E5e02";
 const LINK_TOKEN = "0xE4aB69C077896252FAFBD49EFD26B5D171A32410";
-const NUM_QUERIES          = 9;
+const NUM_QUERIES          = 1;
 const BETWEEN_QUERY_DELAY  = 500;
 const NUM_INCREMENTS       = 12;
 const INCREMENT_DURATION   = 30000; // Polling increment in ms.
-const JOB_CLASS            = 128;
+const JOB_CLASS            = 777;
 const MAX_ORACLE_FEE       = ethers.parseUnits("0.01", 18);
 const ESTIMATED_BASE_FEE   = ethers.parseUnits("0.000001", 18);
 const MAX_FEE_SCALING      = 5;
 const ALPHA                = 500;
 const CIDS      = [
-  "QmSnynnZVufbeb9GVNLBjxBJ45FyHgjPYUHTvMK5VmQZcS"
+  "QmSHXfBcrfFf4pnuRYCbHA8rjKkDh1wjqas3Rpk3a2uAWH"
 ];
 const ADDENDUM  = "";                     // optional
 const GAS_LIMIT = 3_000_000;
