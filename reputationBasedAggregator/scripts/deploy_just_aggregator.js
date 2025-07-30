@@ -30,7 +30,7 @@ async function main () {
   const keeperInfo = await deployments.get("ReputationKeeper")
         .catch(() => { throw new Error("❌  ReputationKeeper not found in deployments"); });
   const keeperAddr = keeperInfo.address;
-  console.log("✓ Existing ReputationKeeper:", keeperAddr);
+  console.log("Existing ReputationKeeper:", keeperAddr);
 
   /* ------------------------------------------------------------------ */
   /* 2. Deploy a new ReputationAggregator                               */
@@ -46,7 +46,7 @@ async function main () {
     deterministicDeployment: false
   });
   const aggAddr = aggRes.address;
-  console.log("✓ New ReputationAggregator deployed:", aggAddr);
+  console.log("New ReputationAggregator deployed:", aggAddr);
 
   /* ------------------------------------------------------------------ */
   /* 3. Approve the aggregator inside the keeper (if not yet approved)  */
@@ -65,14 +65,14 @@ async function main () {
   /* ------------------------------------------------------------------ */
   const aggregator = await ethers.getContractAt("ReputationAggregator", aggAddr, signer);
 
-  // 4-3-2 commit-reveal layout:
-  //   K = 4  total oracles polled in commit phase
-  //   M = 3  first 3 commits advance to reveal
+  //   6-4-3-2 commit-reveal layout:
+  //   K = 6  total oracles polled in commit phase
+  //   M = 4  first 4 commits advance to reveal
   //   N = 3  first 3 reveals are accepted for clustering
   //   P = 2  cluster size rewarded
   //
-  console.log("Setting phase counts to (K,M,N,P) = (5,4,3,2)…");
-  await (await aggregator.setPhaseCounts(5, 4, 3, 2)).wait();
+  console.log("Setting phase counts to (K,M,N,P) = (6,4,3,2)…");
+  await (await aggregator.setPhaseCounts(6, 4, 3, 2)).wait();
 
   console.log("Setting response timeout to 300 seconds…");
   await (await aggregator.setResponseTimeout(300)).wait();
@@ -80,7 +80,7 @@ async function main () {
   console.log("Setting max oracle fee to 0.08 LINK…");
   await (await aggregator.setMaxOracleFee(ethers.parseEther("0.08"))).wait();
 
-  console.log("🎉 Deployment and configuration complete!");
+  console.log("Deployment and configuration complete!");
 }
 
 main()
