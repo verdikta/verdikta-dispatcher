@@ -131,11 +131,19 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     /// @param reason Reason for skipping the update
     event OracleScoreUpdateSkipped(address oracle, bytes32 jobId, string reason);
     
-    /// @notice Emitted when commit-reveal hash validation fails
-    /// @param requestId The Chainlink request identifier
-    /// @param computedHash Hash computed from reveal data
-    /// @param storedHash Hash stored from commit phase
-    event HashMismatch(bytes32 requestId, bytes16 computedHash, bytes16 storedHash);
+    /// @notice Reveal payload failed the commit-hash check (i.e., there was a mismatch)
+    /// @param aggRequestId  Aggregator request id
+    /// @param pollIndex     Oracle’s slot index
+    /// @param operator      Oracle operator address (msg.sender)
+    /// @param expectedHash  The hash stored from the commit
+    /// @param gotHash       Hash recomputed from the reveal payload
+    event RevealHashMismatch(
+       bytes32 indexed aggRequestId,
+       uint256 indexed pollIndex,
+       address operator,
+       bytes16 expectedHash,
+       bytes16 gotHash
+    );
     
     /// @notice Emitted when ReputationKeeper contract is changed
     /// @param oldKeeper Address of the previous ReputationKeeper
@@ -544,8 +552,11 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         // verify commit-reveal hash
         bytes16 recomputed = bytes16(sha256(abi.encode(msg.sender, response, saltUint)));
         if (recomputed != agg.commitHashPerSlot[slot]) {
-            emit HashMismatch(requestId, recomputed, agg.commitHashPerSlot[slot]);
-            revert("Hash mismatch: reveal hash doesn't match commit hash");
+            // log the problem
+            emit RevealHashMismatch(aggId, slot, msg.sender, agg.commitHashPerSlot[slot], recomputed);
+
+            // treat this oracle as “not revealed” – no response stored
+            return;
         }
 
         // fix excessive score values through clamping to prevent later overflow
