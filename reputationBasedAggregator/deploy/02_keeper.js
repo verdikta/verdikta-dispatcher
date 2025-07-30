@@ -1,11 +1,11 @@
 // deploy/02_keeper.js
 // -----------------------------------------------------------------------------
 // Deploys ReputationKeeper, then connects it to the ReputationAggregator that
-// was deployed in 001_aggregator.js (which currently holds a dummy keeper
-// address). This mirrors your old Truffle migration #5.
+// was deployed in 01_aggregator.js (which currently holds a dummy keeper
+// address). 
 // -----------------------------------------------------------------------------
-//   • Requires WRAPPED_VERDIKTA_TOKEN in .env (token is no longer deployed).
-//   • Skips entirely when SKIP_MIGRATIONS env‑var is set.
+//   • Requires WRAPPED_VERDIKTA_TOKEN in .env.
+//   • Skips entirely when SKIP_MIGRATIONS env var is set.
 // -----------------------------------------------------------------------------
 
 require("dotenv").config();
@@ -43,8 +43,6 @@ module.exports = async ({ deployments, getNamedAccounts, ethers, network }) => {
     args: [TOKEN_ADDR],
     log: true,
     waitConfirmations: CONFIRMATIONS
-    // gasLimit: 5_000_000,
-    // nonce: safeNonce
   });
 
   const keeperAddr = keeperRes.address;
@@ -92,8 +90,6 @@ if (!isApproved) {
       { 
         from: deployer, 
         log: true,
-        // gasLimit: 800000,           // Keep your working gas settings
-        // gasPrice: ethers.parseUnits("10", "gwei"),
 	waitConfirmations: CONFIRMATIONS
       },
       "approveContract",            // Function name  
@@ -122,8 +118,6 @@ if (currentKeeper.toLowerCase() !== keepInfo.address.toLowerCase()) {
       { 
         from: deployer, 
         log: true,
-        // gasLimit: 300000,           // Adjust gas as needed
-        // gasPrice: ethers.parseUnits("10", "gwei"),
 	waitConfirmations: CONFIRMATIONS
       },
       "setReputationKeeper",        // Function name
