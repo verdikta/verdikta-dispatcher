@@ -3,7 +3,7 @@
 // Deploys ReputationAggregator with a **dummy keeper address**. The real keeper
 // is wired up later in deploy/003_config.js.
 // -----------------------------------------------------------------------------
-//   • Skips deployment entirely when the SKIP_MIGRATIONS env‑var is set
+//   • Skips deployment entirely when the SKIP_MIGRATIONS env var is set
 //   • Maps LINK token addresses by network name (same as the old Truffle script)
 //   • Tagged "aggregator" so you can run: npx hardhat deploy --tags aggregator
 // -----------------------------------------------------------------------------
@@ -18,7 +18,7 @@ module.exports = async ({ deployments, getNamedAccounts, network }) => {
   const { deployer } = await getNamedAccounts();
   const CONFIRMATIONS = network.name === "base_sepolia" ? 2 : 1;
 
-  // LINK token address lookup (per‑network)
+  // LINK token address lookup (per network)
   const LINK_TOKEN_ADDRESS = {
     base:          "0xd886e2286fd1073df82462ea1822119600af80b6",
     base_goerli:   "0xd886e2286fd1073df82462ea1822119600af80b6",
