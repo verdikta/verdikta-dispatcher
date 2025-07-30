@@ -96,7 +96,7 @@ contract ReputationKeeper is Ownable {
     uint256 public maxScoreHistory = 25;
 
     // The cap on the reputation score as used for selection
-    uint256 public maxScoreForSelection = 400;
+    uint256 public maxScoreForSelection = 6000;
 
     uint256 public constant STAKE_REQUIREMENT = 100 * 10**18;  // 100 VDKA tokens
     uint256 public constant MIN_SCORE_FOR_SELECTION = 1;
@@ -104,8 +104,8 @@ contract ReputationKeeper is Ownable {
     // Configuration for slashing and locking.
     uint256 public slashAmountConfig = 0 * 10**18;     // 0 VDKA tokens (configurable)
     uint256 public lockDurationConfig = 24 hours;      // Lock period (configurable)
-    int256 public severeThreshold = -60;               // Severe threshold (configurable)
-    int256 public mildThreshold = -20;                 // Mild threshold (configurable)
+    int256 public severeThreshold = -900;              // Severe threshold (configurable)
+    int256 public mildThreshold = -300;                // Mild threshold (configurable)
     
     // The maximum number of oracles to weight in the second-stage selection.
     uint256 public shortlistSize = 20;

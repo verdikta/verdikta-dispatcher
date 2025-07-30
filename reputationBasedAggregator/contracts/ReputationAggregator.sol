@@ -251,19 +251,19 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         lastEntropyBlock = block.number;
 
         // default parameters: K=6, M=4, N=3, P=2
-        commitOraclesToPoll = 6;        // K 
-        oraclesToPoll = 4;              // M
-        requiredResponses = 3;          // N
-        clusterSize = 2;                // P
+        commitOraclesToPoll = 6;         // K 
+        oraclesToPoll = 4;               // M
+        requiredResponses = 3;           // N
+        clusterSize = 2;                 // P
 
-        clusteredTimelinessScore = 4;   // timeliness score change when clustered
-        clusteredQualityScore = 4;      // quality score change when clustered
-        selectedTimelinessScore = 0;    // timeliness score change when selected but not clustered
-        selectedQualityScore = -4;      // quality score change when selected but not clustered
-        revealedTimelinessScore = -2;   // timeliness score change when revealed but not selected
-        revealedQualityScore = 0;       // quality score change when revealed but not selected
-        committedTimelinessScore = -1;  // timeliness score change when committed but not revealed
-        committedQualityScore = 0;      // quality score change when committed but not revealed
+        clusteredTimelinessScore = 60;   // timeliness score change when clustered
+        clusteredQualityScore = 60;      // quality score change when clustered
+        selectedTimelinessScore = 0;     // timeliness score change when selected but not clustered
+        selectedQualityScore = -60;      // quality score change when selected but not clustered
+        revealedTimelinessScore = -20;   // timeliness score change when revealed but not selected
+        revealedQualityScore = 0;        // quality score change when revealed but not selected
+        committedTimelinessScore = -20;  // timeliness score change when committed but not revealed
+        committedQualityScore = 0;       // quality score change when committed but not revealed
 
         responseTimeoutSeconds = 5 minutes;
         maxOracleFee = 0.1 * 10 ** 18;  // 0.1 LINK
