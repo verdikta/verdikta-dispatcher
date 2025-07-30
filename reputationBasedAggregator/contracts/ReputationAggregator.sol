@@ -35,12 +35,13 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     // ----------------------------------------------------------------------
     //                          CONFIGURATION
     // ----------------------------------------------------------------------
-    uint256 public commitOraclesToPoll;     // K – commit-phase polls
-    uint256 public oraclesToPoll;           // M – reveals requested
-    uint256 public requiredResponses;       // N
-    uint256 public clusterSize;             // P
-    uint256 public bonusMultiplier = 3;     // B
+    uint256 public commitOraclesToPoll;      // K – commit-phase polls
+    uint256 public oraclesToPoll;            // M – reveals requested
+    uint256 public requiredResponses;        // N
+    uint256 public clusterSize;              // P
+    uint256 public bonusMultiplier = 3;      // B
     uint256 public responseTimeoutSeconds = 300; // default 5 min
+    uint256 public maxLikelihoodLength = 20; // Max number of scores in the array
 
     // rolling entropy
     bytes16 public rollingEntropy;          // init to 0x0 and build over time
@@ -289,6 +290,16 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     }
 
     /**
+     * @notice Set the maximum allowed length of the likelihood vector
+     * @dev    Prevents gas‑exhaustion by very large oracle payloads.
+     * @param _len New upper bound (must be >= 2)
+     */
+    function setMaxLikelihoodLength(uint256 _len) external onlyOwner {
+        require(_len >= 2, "length must be >= 2");
+        maxLikelihoodLength = _len;
+    }
+
+    /**
      * @notice Set the maximum oracle fee in LINK tokens
      * @dev This limits the maximum fee that can be paid to any oracle
      * @param _newMax Maximum oracle fee in LINK wei
@@ -427,6 +438,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
             _applyTimeoutPenalties(agg, true);  // penalise non-committing oracles only
             agg.failed = true;
             agg.isComplete = true;
+            emit EvaluationTimedOut(aggId);
             emit EvaluationFailed(aggId, "commit");
             return;
         }
@@ -436,6 +448,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
             _applyTimeoutPenalties(agg, false); // penalise non-revealing oracles
             agg.failed = true;
             agg.isComplete = true;
+            emit EvaluationTimedOut(aggId);
             emit EvaluationFailed(aggId, "reveal");
             return;
         }
@@ -476,7 +489,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         // ---------- decide phase from *payload shape* ----------
         bool looksLikeCommit = (response.length == 1) && (bytes(cid).length == 0);
         bool looksLikeReveal = (response.length >= 2) && (bytes(cid).length > 0);
-        require(looksLikeCommit || looksLikeReveal, "callback payload malformed");
+        require(looksLikeCommit || looksLikeReveal, "Callback payload malformed");
 
         /* ────────────────────────────────────────────────────────
          *                     COMMIT  (Mode-1)
@@ -512,8 +525,8 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         /* ────────────────────────────────────────────────────────
          *                     REVEAL  (Mode-2)
          * ──────────────────────────────────────────────────────── */
-        require(agg.commitPhaseComplete,
-                "reveal arrived before commit phase complete");
+        require(agg.commitPhaseComplete, "Reveal arrived before commit phase complete");
+        require(response.length <= maxLikelihoodLength, "Too many likelihood scores");
 
         // ─── DUPLICATE-REVEAL GUARD ──────────────────
         (bool seenAlready, ) = _getResponseForSlot(agg.responses, slot);
