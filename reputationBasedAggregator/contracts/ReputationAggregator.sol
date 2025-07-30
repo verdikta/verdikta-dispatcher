@@ -163,6 +163,20 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
                               int8 selectedQuality, int8 revealedTimeliness, int8 revealedQuality, 
                               int8 committedTimeliness, int8 committedQuality);
 
+    /// @notice Emitted when an oracle’s reveal payload cannot be parsed because its
+    ///         `cid:salt` string is malformed (wrong delimiter position, length, or
+    ///         non‑hex salt).  
+    /// @dev    The event is **non-reverting**, so the transaction stays successful
+    ///         and the round can still complete with other oracles.  The offending
+    ///         oracle is treated the same as a “no‑reveal” responder and will be
+    ///         penalised during finalisation or timeout.
+    /// @param  aggRequestId  Aggregator‑level request identifier.
+    /// @param  pollIndex     Zero‑based index of the oracle in the polling array.
+    /// @param  operator      Address of the oracle operator (msg.sender).
+    /// @param  badCid        The exact malformed `cid:salt` string that was rejected.
+    event InvalidRevealFormat(bytes32 indexed aggRequestId, uint256 indexed pollIndex,
+                              address operator, string  badCid);
+
     // ----------------------------------------------------------------------
     //                               STRUCTS
     // ----------------------------------------------------------------------
@@ -546,8 +560,13 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         uint256[] storage totals = _ensureAggArrayExists(agg, response.length);
         require(response.length == totals.length, "Wrong number of scores");
 
-        // Split "cleanCid:20hexSalt" → (cid, saltUint)
-        (string memory cleanCid, uint256 saltUint) = _splitCidAndSalt(cid);
+        // Split "cleanCid:20hexSalt" -> (cid, saltUint)
+        (bool ok, uint256 colonPos) = _isValidCidSalt(cid);
+        if (!ok) {
+            emit InvalidRevealFormat(aggId, slot, msg.sender, cid); 
+            return;                         // treat as not revealed
+        }
+        (string memory cleanCid, uint256 saltUint) = _parseCidSaltUnchecked(cid, colonPos);
 
         // verify commit-reveal hash
         bytes16 recomputed = bytes16(sha256(abi.encode(msg.sender, response, saltUint)));
@@ -555,7 +574,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
             // log the problem
             emit RevealHashMismatch(aggId, slot, msg.sender, agg.commitHashPerSlot[slot], recomputed);
 
-            // treat this oracle as “not revealed” – no response stored
+            // treat this oracle as not revealed – no response stored
             return;
         }
 
@@ -940,41 +959,60 @@ function _ensureAggArrayExists(
         return sum;
     }
 
-    /**
-     * @dev Split "cleanCid:20hexSalt" into (cid, saltUint)
-     */
-    function _splitCidAndSalt(string memory packed)
-        private pure returns (string memory cidOnly, uint256 salt)
+    /// @dev Fast shape check for "cid:20hex" format.
+    ///      Returns (ok, lastColonPos) where `lastColonPos` is the index
+    ///      of ':' that separates cid and salt (undefined if !ok).
+    function _isValidCidSalt(string memory packed)
+        private pure
+        returns (bool, uint256)
     {
         bytes memory b = bytes(packed);
-        require(b.length > 21, "cid+salt too short");      // ':' + 20 hex chars
 
-        // find the last ':' (allows ':' inside CID multibase)
+        // at least 1 char + ':' + 20 chars
+        if (b.length <= 21) return (false, 0);
+
+        // find the last ':'
         uint256 i = b.length;
-        while (i > 0 && b[i-1] != ":") { 
-            unchecked { --i; } 
-        }
-        require(i > 0 && (b.length - i) == 20, "need 20 hex after ':'");
+        while (i > 0 && b[i-1] != ":") { unchecked { --i; } }
+        if (i == 0 || (b.length - i) != 20) return (false, 0);
 
-        // copy CID part
-        bytes memory cidBytes = new bytes(i - 1);
-        for (uint256 j = 0; j < cidBytes.length; ++j) {
-            cidBytes[j] = b[j];
-        }
-
-        // parse 20 hex chars → uint256 (fits in lower 80 bits)
+        // check all 20 chars are hex
         unchecked {
             for (uint256 j = i; j < b.length; ++j) {
                 uint8 c = uint8(b[j]);
-                uint8 v = (c >= 97) ? c - 87     // 'a'-'f'
-                       : (c >= 65) ? c - 55     // 'A'-'F'
-                       : (c >= 48) ? c - 48     // '0'-'9'
+                uint8 v = (c >= 97) ? c - 87
+                       : (c >= 65) ? c - 55
+                       : (c >= 48) ? c - 48
                        : 255;
-                require(v < 16, "non-hex");
-                salt = (salt << 4) | v;
+                if (v >= 16) return (false, 0);
             }
         }
-        return (string(cidBytes), salt);
+        return (true, i);
+    }
+
+    /// @dev Call **only after** `_isValidCidSalt` returned (true, pos).
+    function _parseCidSaltUnchecked(string memory packed, uint256 colonPos)
+        private pure
+        returns (string memory cidOnly, uint256 salt)
+    {
+        bytes memory b = bytes(packed);
+
+        // copy CID bytes
+        bytes memory cidBytes = new bytes(colonPos - 1);
+        for (uint256 j; j < cidBytes.length; ++j) cidBytes[j] = b[j];
+
+        // parse 20-char hex salt
+        unchecked {
+            for (uint256 j = colonPos; j < b.length; ++j) {
+                uint8 c = uint8(b[j]);
+                uint8 v = (c >= 97) ? c - 87
+                       : (c >= 65) ? c - 55
+                       : (c >= 48) ? c - 48
+                       : 0;           // cannot overflow; already validated
+                salt = (salt << 4) | v;
+            }
+         }
+        cidOnly = string(cidBytes);
     }
 
     // Mix salt into 128-bit entropy    
