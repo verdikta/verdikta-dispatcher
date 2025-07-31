@@ -95,11 +95,11 @@ contract ReputationKeeper is Ownable {
     // The maximum number of historical score records to keep for each oracle.
     uint256 public maxScoreHistory = 25;
 
-    // The cap on the reputation score as used for selection
+    // The caps on the reputation score as used for selection
     uint256 public maxScoreForSelection = 6000;
+    uint256 public minScoreForSelection = 60;
 
     uint256 public constant STAKE_REQUIREMENT = 100 * 10**18;  // 100 VDKA tokens
-    uint256 public constant MIN_SCORE_FOR_SELECTION = 1;
     
     // Configuration for slashing and locking.
     uint256 public slashAmountConfig = 0 * 10**18;     // 0 VDKA tokens (configurable)
@@ -416,8 +416,8 @@ contract ReputationKeeper is Ownable {
         
         int256 weightedScore = (int256(1000 - params.alpha) * info.qualityScore +
                                  int256(params.alpha) * info.timelinessScore) / 1000;
-        if (weightedScore < int256(MIN_SCORE_FOR_SELECTION)) {
-            weightedScore = int256(MIN_SCORE_FOR_SELECTION);
+        if (weightedScore < int256(minScoreForSelection)) {
+            weightedScore = int256(minScoreForSelection);
         }
         if (weightedScore > int256(maxScoreForSelection)) {
             weightedScore = int256(maxScoreForSelection);
@@ -629,6 +629,16 @@ contract ReputationKeeper is Ownable {
     function setMaxScoreForSelection(uint256 _maxScoreForSelection) external onlyOwner {
         require(_maxScoreForSelection > 0, "maxScoreForSelection must be > 0");
         maxScoreForSelection = _maxScoreForSelection;
+    }
+
+    /**
+     * @notice Set the minimum score used for arbiter random selection probabilities
+     * @dev Affects selection likelihood
+     * @param _minScoreForSelection Maximum score used for selection (must be > 0)
+     */
+    function setMinScoreForSelection(uint256 _minScoreForSelection) external onlyOwner {
+        require(_minScoreForSelection > 0, "minScoreForSelection must be > 0");
+        minScoreForSelection = _minScoreForSelection;
     }
 
     /**
