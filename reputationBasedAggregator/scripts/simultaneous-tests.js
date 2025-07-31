@@ -6,13 +6,13 @@ const pause = ms => new Promise(r => setTimeout(r, ms));
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
    EDIT ONLY THESE CONSTANTS
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
-const AGGREGATOR = "0x65863e5e0B2c2968dBbD1c95BDC2e0EA598E5e02";
+const AGGREGATOR = "0xC60f4532F104EDD422335a9103c8Ce7B2DF5Bc84";
 const LINK_TOKEN = "0xE4aB69C077896252FAFBD49EFD26B5D171A32410";
-const NUM_QUERIES          = 1;
-const BETWEEN_QUERY_DELAY  = 500;
+const NUM_QUERIES          = 20;
+const BETWEEN_QUERY_DELAY  = 200;
 const NUM_INCREMENTS       = 12;
 const INCREMENT_DURATION   = 30000; // Polling increment in ms.
-const JOB_CLASS            = 777;
+const JOB_CLASS            = 128;
 const MAX_ORACLE_FEE       = ethers.parseUnits("0.01", 18);
 const ESTIMATED_BASE_FEE   = ethers.parseUnits("0.000001", 18);
 const MAX_FEE_SCALING      = 5;
