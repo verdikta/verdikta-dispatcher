@@ -6,8 +6,8 @@
 
 HARDHAT_NETWORK=base_sepolia \
 node scripts/monitor-contracts-cl.js \
-  --wrappedverdikta 0x2F1d1aF9d5C25A48C29f56f57c7BAFFa7cc910a3 \
-  --aggregator      0x262f48f06DEf1FE49e0568dB4234a3478A191cFd
+  --wrappedverdikta 0x94e3c031fe9403c80E14DaFbCb73f191C683c2B1 \
+  --aggregator      0xC60f4532F104EDD422335a9103c8Ce7B2DF5Bc84
 
 */
 
@@ -35,6 +35,7 @@ const KeeperABI = [
 
 const AggregatorABI = [
   "function owner() view returns (address)",
+  "function commitOraclesToPoll() view returns (uint256)",
   "function oraclesToPoll() view returns (uint256)",
   "function requiredResponses() view returns (uint256)",
   "function clusterSize() view returns (uint256)",
@@ -135,7 +136,8 @@ const toBytes32 = (id) =>
     const [
       aggBal,
       aggOwner,
-      poll,
+      pollCommit,
+      pollReveal,
       resp,
       cluster,
       timeout,
@@ -143,6 +145,7 @@ const toBytes32 = (id) =>
     ] = await Promise.all([
       provider.getBalance(argv.aggregator),
       aggregator.owner(),
+      aggregator.commitOraclesToPoll(),
       aggregator.oraclesToPoll(),
       aggregator.requiredResponses(),
       aggregator.clusterSize(),
@@ -153,15 +156,15 @@ const toBytes32 = (id) =>
     let linkAddr = "(n/a)";
     try { linkAddr = (await aggregator.getContractConfig()).linkAddr; } catch {/* optional */ }
 
-    console.log(`Address:             ${argv.aggregator}`);
-    console.log(`Owner:               ${aggOwner}`);
-    console.log(`Oracles to Poll:     ${poll}`);
-    console.log(`Required Responses:  ${resp}`);
-    console.log(`Cluster Size:        ${cluster}`);
-    console.log(`Response Timeout:    ${timeout} seconds`);
-    console.log(`Max Oracle Fee:      ${ethers.formatEther(maxFee)} LINK`);
-    console.log(`LINK Token:          ${linkAddr}`);
-    console.log(`Aggregator Balance:  ${ethers.formatEther(aggBal)} ETH`);
+    console.log(`Address:                  ${argv.aggregator}`);
+    console.log(`Owner:                    ${aggOwner}`);
+    console.log(`Oracles to Poll (commit): ${pollCommit}`);
+    console.log(`Oracles to Poll (reveal): ${pollReveal}`);
+    console.log(`Required Responses:       ${resp}`);
+    console.log(`Cluster Size:             ${cluster}`);
+    console.log(`Response Timeout:         ${timeout} seconds`);
+    console.log(`Max Oracle Fee:           ${ethers.formatEther(maxFee)} LINK`);
+    console.log(`LINK Token:               ${linkAddr}`);
 
     /* ---- Recent events (last 1 000 blocks) -------------------------- */
     const head   = await provider.getBlockNumber();

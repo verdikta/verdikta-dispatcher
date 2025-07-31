@@ -133,7 +133,8 @@ function bytes32ToAscii(b32) {
     const [
       aggBal,
       aggOwner,
-      poll,
+      pollCommit,
+      pollReveal,
       resp,
       cluster,
       timeout,
@@ -141,6 +142,7 @@ function bytes32ToAscii(b32) {
     ] = await Promise.all([
       provider.getBalance(aggregator.target ?? aggregator.address),
       aggregator.owner(),
+      aggregator.commitOraclesToPoll(),
       aggregator.oraclesToPoll(),
       aggregator.requiredResponses(),
       aggregator.clusterSize(),
@@ -153,15 +155,15 @@ function bytes32ToAscii(b32) {
       linkAddr = (await aggregator.getContractConfig()).linkAddr;
     } catch {}
 
-    console.log(`Address:             ${aggregator.target ?? aggregator.address}`);
-    console.log(`Owner:               ${aggOwner}`);
-    console.log(`Oracles to Poll:     ${poll}`);
-    console.log(`Required Responses:  ${resp}`);
-    console.log(`Cluster Size:        ${cluster}`);
-    console.log(`Response Timeout:    ${timeout} seconds`);
-    console.log(`Max Oracle Fee:      ${ethers.formatEther(maxFee)} LINK`);
-    console.log(`LINK Token:          ${linkAddr}`);
-    console.log(`Aggregator Balance:  ${ethers.formatEther(aggBal)} ETH`);
+    console.log(`Address:                  ${aggregator.target ?? aggregator.address}`);
+    console.log(`Owner:                    ${aggOwner}`);
+    console.log(`Oracles to Poll (commit): ${pollCommit}`);
+    console.log(`Oracles to Poll (reveal): ${pollReveal}`);
+    console.log(`Required Responses:       ${resp}`);
+    console.log(`Cluster Size:             ${cluster}`);
+    console.log(`Response Timeout:         ${timeout} seconds`);
+    console.log(`Max Oracle Fee:           ${ethers.formatEther(maxFee)} LINK`);
+    console.log(`LINK Token:               ${linkAddr}`);
 
     /* Recent events (last 1000 blocks) --------------------- */
     const head = await provider.getBlockNumber();
