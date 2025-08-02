@@ -6,9 +6,7 @@
 
 HARDHAT_NETWORK=base_sepolia \
 node scripts/monitor-contracts-cl.js \
-  --wrappedverdikta 0x94e3c031fe9403c80E14DaFbCb73f191C683c2B1 \
-  --aggregator      0xC60f4532F104EDD422335a9103c8Ce7B2DF5Bc84
-
+  --aggregator 0xC60f4532F104EDD422335a9103c8Ce7B2DF5Bc84
 */
 
 require("dotenv").config();
@@ -28,7 +26,8 @@ const WrappedVerdiktaTokenABI = [
 
 const KeeperABI = [
   "function owner() view returns (address)",
-  "function getOracleInfo(address,bytes32) view returns (bool isActive,int256 qualityScore,int256 timelinessScore,uint256 callCount,bytes32 jobId,uint256 fee,uint256 stake,uint256 lockedUntil,bool blocked)",
+  "function verdiktaToken() view returns (address)",                 
+  "function getOracleInfo(address,bytes32) view returns (bool isActive,int256 qualityScore,int256 timelinessScore,uint256 callCount,bytes32 jobId,uint256 fee,uint256 stakeAmount,uint256 lockedUntil,bool blocked)",
   "function getOracleClassesByKey(address,bytes32) view returns (uint64[])",
   "event OracleRegistered(address indexed oracle,bytes32 jobId,uint256 fee)"
 ];
@@ -41,12 +40,11 @@ const AggregatorABI = [
   "function clusterSize() view returns (uint256)",
   "function responseTimeoutSeconds() view returns (uint256)",
   "function maxOracleFee() view returns (uint256)",
-  "function getContractConfig() view returns (address oracleAddr,address linkAddr,bytes32 jobId,uint256 fee)",
-  "function reputationKeeper() view returns (address)",
-  /* we don’t list events explicitly – wildcard filtering is fine in ethers v6 */
+  "function getContractConfig() view returns (address,address,bytes32,uint256)",
+  "function reputationKeeper() view returns (address)"
 ];
 
-/* Helper: encode text job-ID to bytes32 if needed ------------------- */
+/* Helper: encode job-ID to bytes32 if needed ------------------------ */
 const toBytes32 = (id) =>
   /^0x[0-9a-f]{64}$/i.test(id)
     ? id
@@ -59,19 +57,23 @@ const toBytes32 = (id) =>
   try {
     /* ---- CLI flags -------------------------------------------------- */
     const argv = yargs(hideBin(process.argv))
-      .option("wrappedverdikta", { alias: "w", type: "string", demandOption: true })
-      .option("aggregator",      { alias: "a", type: "string", demandOption: true })
+      .option("aggregator", { alias: "a", type: "string", demandOption: true })
       .strict().argv;
 
     const provider = ethers.provider;
 
-    /* ---- Instantiate contracts ------------------------------------- */
-    const token       = new ethers.Contract(argv.wrappedverdikta, WrappedVerdiktaTokenABI, provider);
-    const aggregator  = new ethers.Contract(argv.aggregator,      AggregatorABI,           provider);
-
+    /* ---- Instantiate Aggregator & Keeper --------------------------- */
+    const aggregator  = new ethers.Contract(argv.aggregator, AggregatorABI, provider);
     const keeperAddr  = await aggregator.reputationKeeper();
     console.log(`Derived ReputationKeeper: ${keeperAddr}`);
+
     const keeper      = new ethers.Contract(keeperAddr, KeeperABI, provider);
+
+    /* ---- Discover Wrapped Verdikta token --------------------------- */
+    const wrappedAddr = await keeper.verdiktaToken();
+    console.log(`Derived WrappedVerdiktaToken: ${wrappedAddr}`);
+
+    const token       = new ethers.Contract(wrappedAddr, WrappedVerdiktaTokenABI, provider);
 
     /* ---- Network info ---------------------------------------------- */
     const net = await provider.getNetwork();
@@ -85,20 +87,19 @@ const toBytes32 = (id) =>
       token.symbol(),
       token.totalSupply()
     ]);
-    console.log(`Address: ${argv.wrappedverdikta}`);
+    console.log(`Address: ${wrappedAddr}`);
     console.log(`Name:    ${tName}`);
     console.log(`Symbol:  ${tSymbol}`);
     console.log(`Supply:  ${ethers.formatEther(tSupply)} tokens`);
 
     /* ---- Keeper info ------------------------------------------------ */
-    console.log("\n=== ReputationKeeper ===");
+    console.log("\n=== Reputation Keeper ===");
     const [kBal, kOwner] = await Promise.all([
       provider.getBalance(keeperAddr),
       keeper.owner()
     ]);
     console.log(`Address: ${keeperAddr}`);
     console.log(`Owner:   ${kOwner}`);
-    console.log(`Balance: ${ethers.formatEther(kBal)} ETH`);
 
     /* ---- Registered oracles ---------------------------------------- */
     console.log("\n=== Registered Oracles ===");
@@ -154,7 +155,7 @@ const toBytes32 = (id) =>
     ]);
 
     let linkAddr = "(n/a)";
-    try { linkAddr = (await aggregator.getContractConfig()).linkAddr; } catch {/* optional */ }
+    try { linkAddr = (await aggregator.getContractConfig())[1]; } catch {/* optional */ }
 
     console.log(`Address:                  ${argv.aggregator}`);
     console.log(`Owner:                    ${aggOwner}`);
