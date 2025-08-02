@@ -115,7 +115,7 @@ const VDKA_STAKE = ethers.parseUnits("100", 18);   // 100 wVDKA
         continue;
       }
 
-      const classes = [128, 128 + idx];   // example classes
+      const classes = [128, 707, 128 + idx];   // example classes
       console.log("Calling registerOracle…", classes);
       await (
         await keeper.registerOracle(ORACLE_ADDR, jobId, LINK_FEE, classes)
