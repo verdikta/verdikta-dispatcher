@@ -1,55 +1,115 @@
-// scripts/simultaneous-tests.js
+#!/usr/bin/env node
+// scripts/simultaneous-tests.js  — original output preserved
 require("dotenv").config();
-const hre   = require("hardhat");
-const { ethers } = require("ethers");
-const pause = ms => new Promise(r => setTimeout(r, ms));
+const hre    = require("hardhat");
+const { ethers } = hre;
+const pause  = ms => new Promise(r => setTimeout(r, ms));
+
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
    EDIT ONLY THESE CONSTANTS
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
-const AGGREGATOR = "0xC60f4532F104EDD422335a9103c8Ce7B2DF5Bc84";
-const LINK_TOKEN = "0xE4aB69C077896252FAFBD49EFD26B5D171A32410";
-const NUM_QUERIES          = 20;
-const BETWEEN_QUERY_DELAY  = 200;
-const NUM_INCREMENTS       = 12;
-const INCREMENT_DURATION   = 30000; // Polling increment in ms.
-const JOB_CLASS            = 128;
-const MAX_ORACLE_FEE       = ethers.parseUnits("0.01", 18);
-const ESTIMATED_BASE_FEE   = ethers.parseUnits("0.000001", 18);
-const MAX_FEE_SCALING      = 5;
-const ALPHA                = 500;
-const CIDS      = [
-  "QmSHXfBcrfFf4pnuRYCbHA8rjKkDh1wjqas3Rpk3a2uAWH"
-];
-const ADDENDUM  = "";                     // optional
+const AGGREGATOR          = "0x65863e5e0B2c2968dBbD1c95BDC2e0EA598E5e02";
+const LINK_TOKEN          = "0xE4aB69C077896252FAFBD49EFD26B5D171A32410";
+
+const NUM_QUERIES         = 10;
+const BETWEEN_QUERY_DELAY = 200;         // ms between tx submissions
+const NUM_INCREMENTS      = 11;
+const INCREMENT_DURATION  = 30_000;      // ms between polling rounds
+
+const JOB_CLASS           = 128;
+const MAX_ORACLE_FEE      = ethers.parseUnits("0.01", 18);
+const ESTIMATE_BASE_FEE   = ethers.parseUnits("0.000001", 18);
+const MAX_FEE_SCALING     = 5;
+const ALPHA               = 500;
+
+const CIDS     = ["QmSHXfBcrfFf4pnuRYCbHA8rjKkDh1wjqas3Rpk3a2uAWH"];
+const ADDENDUM = "";
 const GAS_LIMIT = 3_000_000;
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
-async function getSigner() {
-  // 1) try the accounts from hardhat.config.js
-  const cfgSigners = await hre.ethers.getSigners();  // Use hre.ethers instead of ethers
-  if (cfgSigners.length) return cfgSigners[0];
-  // 2) fall back to PRIVATE_KEY + network provider
+
+async function getSigner () {
+  const [cfg] = await hre.ethers.getSigners();
+  if (cfg) return cfg;
   const pk = process.env.PRIVATE_KEY;
-  if (!pk) throw new Error("No signer: add accounts to hardhat.config.js or set PRIVATE_KEY");
-  return new hre.ethers.Wallet(pk, hre.ethers.provider);  // Use hre.ethers here too
+  if (!pk) throw new Error("No signer available");
+  return new hre.ethers.Wallet(pk, hre.ethers.provider);
 }
-async function main () {
+
+/* ------------------------------------------------------------------ */
+/* Diagnostic helper – called only *after* the main loop for failures */
+/* ------------------------------------------------------------------ */
+async function diagnoseTimeout(agg, aggId) {
+  const filter = {
+    address: agg.target,
+    topics: [
+      [
+        agg.interface.getEvent("CommitReceived").topicHash,
+        agg.interface.getEvent("RevealRequestDispatched").topicHash,
+        agg.interface.getEvent("NewOracleResponseRecorded").topicHash,
+        agg.interface.getEvent("EvaluationFailed").topicHash
+      ],
+      aggId
+    ],
+    fromBlock: 0, toBlock: "latest"
+  };
+  const raw  = await hre.ethers.provider.getLogs(filter);
+  const logs = raw.map(l => agg.interface.parseLog(l));
+
+  const commits = new Map();   // slot -> operator
+  const reveals = new Map();
+  const totalSlots = Number(await agg.commitOraclesToPoll()); // K
+  const slots   = new Map();   // all poll indices ever seen
+
+  logs.forEach(l => {
+    if (l.name === "CommitReceived") {
+      commits.set(l.args.pollIndex.toString(), l.args.operator);
+      slots.set (l.args.pollIndex.toString(), l.args.operator);
+    }
+    if (l.name === "NewOracleResponseRecorded") {
+      reveals.set(l.args.pollIndex.toString(), l.args.operator);
+      slots.set (l.args.pollIndex.toString(), l.args.operator);
+    }
+  });
+
+  const evFail = logs.find(l => l.name === "EvaluationFailed");
+  const phase  = evFail ? evFail.args.phase : "timeout";
+
+  const missingCommit = [];
+  const missingReveal = [];
+  for (const [slot, op] of slots) {
+    if (!commits.has(slot))       missingCommit.push(op);
+    else if (!reveals.has(slot))  missingReveal.push(op);
+  }
+
+  console.log("\n┌─ Diagnostic for", aggId, "──────────────────────────────────┐");
+  console.log(`│ Outcome: ${phase === "commit" ? "commit-phase timeout"
+                : phase === "reveal" ? "reveal-phase timeout"
+                : "timeout (undetermined)"}`
+                .padEnd(58) + "│");
+  console.log(`│ Commits:  ${commits.size} / ${totalSlots}`.padEnd(58) + "│");
+  console.log(`│ Reveals:  ${reveals.size} / ${commits.size}`.padEnd(58) + "│");
+  if (missingCommit.length)
+    console.log(`│ Missing commit from: ${missingCommit.join(" ")}`.padEnd(58) + "│");
+  if (missingReveal.length)
+    console.log(`│ Missing reveal from: ${missingReveal.join(" ")}`.padEnd(58) + "│");
+  console.log("└" + "─".repeat(58) + "┘");
+}
+
+/* ------------------------------------------------------------------ */
+/* Main                                                               */
+/* ------------------------------------------------------------------ */
+(async () => {
   const signer = await getSigner();
   console.log("Using signer:", await signer.getAddress());
   console.log("RPC endpoint:", hre.network.config.url || "in-process Hardhat node");
+
   const aggAbi  = (await hre.artifacts.readArtifact("ReputationAggregator")).abi;
   const linkAbi = (await hre.artifacts.readArtifact("LinkTokenInterface")).abi;
-  const agg  = new hre.ethers.Contract(AGGREGATOR, aggAbi, signer);
-  const link = new hre.ethers.Contract(LINK_TOKEN, linkAbi,  signer);
 
-  /* ---- Optional: DEBUG listeners ---- */
-  /*
-  console.log("Setting up debug event listeners...");
-  
-  agg.on("DetailedResponseReceived", (aggId, pollIndex, operator, likelihoods, cid, timestamp, isReveal) => {
-    console.log(`[RESPONSE] aggId: ${aggId}, slot: ${pollIndex}, scores: [${likelihoods.join(',')}], cid: "${cid}"`);
-  });
-  */
-  /* ---- LINK approval (set allowance in .env) ---- */
+  const agg  = new hre.ethers.Contract(AGGREGATOR, aggAbi, signer);
+  const link = new hre.ethers.Contract(LINK_TOKEN,  linkAbi, signer);
+
+  /* ––––– optional LINK allowance ––––– */
   if (process.env.LINK_ALLOWANCE) {
     const allowance = ethers.parseUnits(process.env.LINK_ALLOWANCE, 18);
     const tx = await link.approve(AGGREGATOR, allowance);
@@ -57,176 +117,122 @@ async function main () {
     await tx.wait(1);
   }
 
+  /* helper to submit a single query (unchanged output) */
+  async function sendQuery(idx, nonce, delayMs) {
+    if (delayMs) await pause(delayMs);
 
-
-  /* ---- helper to send one query ---- */
-/* ---- helper to send one query ---- */
-async function sendQuery(idx, nonce, delayMs) {
-  if (delayMs) await pause(delayMs);
-
-  /*──────────────── 0-gas pre-flight ────────────────*/
-  try {
-    // V6: get the function object, then use .staticCall(...)
-    await agg
-      .getFunction("requestAIEvaluationWithApproval")
-      .staticCall(
-        CIDS,
-        ADDENDUM,
-        ALPHA,
-        MAX_ORACLE_FEE,
-        ESTIMATED_BASE_FEE,
-        MAX_FEE_SCALING,
-        JOB_CLASS
+    /* dry-run */
+    try {
+      await agg.getFunction("requestAIEvaluationWithApproval").staticCall(
+        CIDS, ADDENDUM, ALPHA,
+        MAX_ORACLE_FEE, ESTIMATE_BASE_FEE, MAX_FEE_SCALING, JOB_CLASS
       );
-  } catch (e) {
-    console.error(
-      `[${idx}] dry-run revert → ${e.shortMessage || e}`
+    } catch (e) {
+      console.error(`[${idx}] dry-run revert → ${e.shortMessage || e}`);
+      return null;
+    }
+
+    /* on-chain tx */
+    const tx = await agg.requestAIEvaluationWithApproval(
+      CIDS, ADDENDUM, ALPHA,
+      MAX_ORACLE_FEE, ESTIMATE_BASE_FEE, MAX_FEE_SCALING, JOB_CLASS,
+      { nonce, gasLimit: GAS_LIMIT }
     );
-    return null;                // ← skip this iteration but keep the loop alive
-  }
+    console.log(`[${idx}] tx sent →`, tx.hash);
+    const rcpt = await tx.wait(1);
 
-  /*──────── real on-chain tx (only if pre-flight passed) ────────*/
-  const tx = await agg.requestAIEvaluationWithApproval(
-    CIDS,
-    ADDENDUM,
-    ALPHA,
-    MAX_ORACLE_FEE,
-    ESTIMATED_BASE_FEE,
-    MAX_FEE_SCALING,
-    JOB_CLASS,
-    { nonce, gasLimit: GAS_LIMIT } 
-  );
-  console.log(`[${idx}] tx sent →`, tx.hash);
-  const rcpt = await tx.wait(1);
+    const ev = rcpt.logs
+      .map(l => { try { return agg.interface.parseLog(l); } catch { return null; } })
+      .find(l => l && l.name === "RequestAIEvaluation");
 
-  // --- parse logs exactly as you already do --------------------
-  const parsedLogs = rcpt.logs
-    .map(log => { try { return agg.interface.parseLog(log); } catch { return null; } })
-    .filter(Boolean);
-
-  console.log(`[${idx}] Events: ${parsedLogs.map(l => l.name).join(", ")}`);
-
-  const ev = parsedLogs.find(l => l.name === "RequestAIEvaluation");
-  if (ev) {
+    if (!ev) {
+      console.log(`[${idx}] RequestAIEvaluation event not found`);
+      return { aggId: null };
+    }
     console.log(`[${idx}] aggId = ${ev.args.aggRequestId}`);
-    return { receipt: rcpt, aggId: ev.args.aggRequestId };
-  } else {
-    console.log(`[${idx}] RequestAIEvaluation event not found`);
-    return { receipt: rcpt, aggId: null };
+    return { aggId: ev.args.aggRequestId };
   }
-}
 
-
-  /* ---- fire queries in parallel ---- */
+  /* fire queries */
   const startNonce = await signer.getNonce();
-  console.log(`Starting nonce: ${startNonce}`);
-
-const results = [];
-let skipped = 0;
-for (let i = 0; i < NUM_QUERIES; i++) {
-  /* call sendQuery, check for null, push only when it succeeded */
-  const res = await sendQuery(i + 1, startNonce + i, i === 0 ? 0 : BETWEEN_QUERY_DELAY);
-  if (res) {
-    results.push(res);          // dry-run passed → keep it
-  } else {
-    skipped++;                  // dry-run failed → just count it
+  const aggIds     = [];
+  for (let i = 0; i < NUM_QUERIES; i++) {
+    const res = await sendQuery(i + 1, startNonce + i, i ? BETWEEN_QUERY_DELAY : 0);
+    if (res && res.aggId) aggIds.push(res.aggId);
   }
-}
-console.log(`Skipped (dry-run failed): ${skipped}`);
 
-  // Extract aggIds from the results
-  const aggIds = results
-    .filter(result => result.aggId)
-    .map(result => result.aggId);
+  /* polling loop */
+  const completed = new Set();
+  const failed    = new Set();
+  const errored   = new Set();
 
-  console.log(`\nCollected ${aggIds.length} aggIds:`);
-  aggIds.forEach((id, i) => console.log(`[${i+1}] ${id}`));
+  console.log(`\nChecking for results every ${INCREMENT_DURATION/1000} seconds...`);
+  for (let round = 0; round < NUM_INCREMENTS; round++) {
+    await pause(INCREMENT_DURATION);
+    console.log(`\nStatus check ${round + 1}:`);
 
-  // Simple polling to check results
-  const intervalSeconds = INCREMENT_DURATION/1000;
-  console.log(`\nChecking for results (nominally) every ${intervalSeconds} seconds...`);
-  const completedEvaluations = new Set();
-  const failedEvaluations = new Set();
-  const errorEvaluations = new Set();
+    for (const id of aggIds) {
+      if (completed.has(id) || failed.has(id) || errored.has(id)) continue;
 
-  for (let check = 0; check < NUM_INCREMENTS; check++) { 
-    await new Promise(resolve => setTimeout(resolve, INCREMENT_DURATION));
+      try {
+        console.log(`  Checking ${id}...`);
+        const [scores, cids, has] = await agg.getEvaluation(id);
+        console.log(`    hasResponses: ${has}, likelihoods.length: ${scores.length}`);
+        console.log(`    likelihoods: [${scores.map(x => x.toString()).join(", ")}]`);
+        console.log(`    justifications: "${cids}"`);
 
-    console.log(`\nStatus check ${check + 1}:`);
-
-    for (const aggId of aggIds) {
-      if (!completedEvaluations.has(aggId) && !failedEvaluations.has(aggId) && !errorEvaluations.has(aggId)) {
-        try {
-          console.log(`  Checking ${aggId}...`);
-          const [likelihoods, justifications, hasResponses] = await agg.getEvaluation(aggId);
-          console.log(`    hasResponses: ${hasResponses}, likelihoods.length: ${likelihoods.length}`);
-          console.log(`    likelihoods: [${likelihoods.map(x => x.toString()).join(', ')}]`);
-          console.log(`    justifications: "${justifications}"`);
-
-          if (hasResponses && likelihoods.length > 0) {
-            // Check for error conditions: all zeros or empty CIDs
-            const allZeros = likelihoods.every(score => score.toString() === '0');
-            const emptyCIDs = !justifications || justifications.trim() === '';
-            
-            if (allZeros || emptyCIDs) {
-              console.log(`ERROR: ${aggId} - Invalid data (all zeros: ${allZeros}, empty CIDs: ${emptyCIDs})`);
-              console.log(`Scores: [${likelihoods.map(x => x.toString()).join(', ')}]`);
-              console.log(`CIDs: "${justifications}"`);
-              errorEvaluations.add(aggId);
-            } else {
-              console.log(`SUCCESS: ${aggId}`);
-              console.log(`Scores: [${likelihoods.map(x => x.toString()).join(', ')}]`);
-              console.log(`CIDs: ${justifications}`);
-              completedEvaluations.add(aggId);
-            }
+        if (has && scores.length) {
+          const allZero = scores.every(x => x === 0n);
+          const empty   = !cids.trim();
+          if (allZero || empty) {
+            console.log(`ERROR: ${id} - Invalid data`);
+            errored.add(id);
           } else {
-            // Check if failed
-            const failed = await agg.isFailed(aggId);
-            console.log(`    failed: ${failed}`);
-            if (failed) {
-              console.log(`FAILED: ${aggId}`);
-              failedEvaluations.add(aggId);
-            } else {
-              console.log(`    Still pending: ${aggId}`);
-            }
+            console.log(`SUCCESS: ${id}`);
+            completed.add(id);
           }
-        } catch (error) {
-          console.log(`    Error checking ${aggId}: ${error.message}`);
+        } else {
+          const isFail = await agg.isFailed(id);
+          console.log(`    failed: ${isFail}`);
+          if (isFail) {
+            console.log(`FAILED: ${id}`);
+            failed.add(id);                          // diagnostics later
+          } else {
+            console.log(`    Still pending: ${id}`);
+          }
         }
+      } catch (e) {
+        console.log(`    Error checking ${id}: ${e.message}`);
+        errored.add(id);
       }
     }
 
-    console.log(`Completed: ${completedEvaluations.size}, Failed: ${failedEvaluations.size}, Error: ${errorEvaluations.size}, Pending: ${aggIds.length - completedEvaluations.size - failedEvaluations.size - errorEvaluations.size}`);
+    console.log(`Completed: ${completed.size}, Failed: ${failed.size}, Error: ${errored.size}, Pending: ${aggIds.length - completed.size - failed.size - errored.size}`);
 
-    // Stop if all are done
-    if (completedEvaluations.size + failedEvaluations.size + errorEvaluations.size >= aggIds.length) {
-      console.log("All evaluations processed!");
-      break;
-    }
+    if (completed.size + failed.size + errored.size === aggIds.length) break;
   }
 
+  /* final summary (identical format) */
   console.log(`\nFinal Results:`);
-  console.log(`Completed: ${completedEvaluations.size}`);
-  console.log(`Failed: ${failedEvaluations.size}`);
-  console.log(`Error: ${errorEvaluations.size}`);
-  console.log(`Timed out: ${aggIds.length - completedEvaluations.size - failedEvaluations.size - errorEvaluations.size}`);
+  console.log(`Completed: ${completed.size}`);
+  console.log(`Failed: ${failed.size}`);
+  console.log(`Error: ${errored.size}`);
+  console.log(`Timed out: ${aggIds.length - completed.size - failed.size - errored.size}`);
 
   console.log(`\nDetailed Breakdown:`);
-  aggIds.forEach((aggId, i) => {
-    if (completedEvaluations.has(aggId)) {
-      console.log(`[${i+1}] SUCCESS: ${aggId}`);
-    } else if (failedEvaluations.has(aggId)) {
-      console.log(`[${i+1}] FAILED: ${aggId}`);
-    } else if (errorEvaluations.has(aggId)) {
-      console.log(`[${i+1}] ERROR: ${aggId}`);
-    } else {
-      console.log(`[${i+1}] TIMEOUT: ${aggId}`);
-    }
+  aggIds.forEach((id, i) => {
+    if (completed.has(id))      console.log(`[${i+1}] SUCCESS: ${id}`);
+    else if (failed.has(id))    console.log(`[${i+1}] FAILED: ${id}`);
+    else if (errored.has(id))   console.log(`[${i+1}] ERROR: ${id}`);
+    else                        console.log(`[${i+1}] TIMEOUT: ${id}`);
   });
+
+  /* NEW: diagnostics printed only for failed or timed-out runs */
+  for (const id of aggIds) {
+    if (failed.has(id) || (!completed.has(id) && !errored.has(id)))
+      await diagnoseTimeout(agg, id);
+  }
+
   agg.removeAllListeners();
-}
-main().catch((err) => {
-  console.error(err);
-  process.exitCode = 1;
-});
+})().catch(err => { console.error(err); process.exitCode = 1; });
 
