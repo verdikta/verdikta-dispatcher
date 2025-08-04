@@ -8,10 +8,10 @@ const pause  = ms => new Promise(r => setTimeout(r, ms));
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
    EDIT ONLY THESE CONSTANTS
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
-const AGGREGATOR          = "0x2bF73a372CA04C30e9a689BAc4BfC976DfBEb504";
+const AGGREGATOR          = "0x8c0B89a9Be09c72C1cdC6d8b922D689C528b85d6";
 const LINK_TOKEN          = "0xE4aB69C077896252FAFBD49EFD26B5D171A32410";
 
-const NUM_QUERIES         = 5;
+const NUM_QUERIES         = 8;
 const BETWEEN_QUERY_DELAY = 200;         // ms between tx submissions
 const NUM_INCREMENTS      = 11;
 const INCREMENT_DURATION  = 30_000;      // ms between polling rounds
