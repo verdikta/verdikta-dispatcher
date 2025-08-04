@@ -8,12 +8,12 @@ const pause  = ms => new Promise(r => setTimeout(r, ms));
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
    EDIT ONLY THESE CONSTANTS
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
-const AGGREGATOR          = "0x65863e5e0B2c2968dBbD1c95BDC2e0EA598E5e02";
+const AGGREGATOR          = "0xC60f4532F104EDD422335a9103c8Ce7B2DF5Bc84";
 const LINK_TOKEN          = "0xE4aB69C077896252FAFBD49EFD26B5D171A32410";
 
 const NUM_QUERIES         = 10;
 const BETWEEN_QUERY_DELAY = 200;         // ms between tx submissions
-const NUM_INCREMENTS      = 11;
+const NUM_INCREMENTS      = 5;
 const INCREMENT_DURATION  = 30_000;      // ms between polling rounds
 
 const JOB_CLASS           = 128;
@@ -56,9 +56,10 @@ async function diagnoseTimeout(agg, aggId) {
   const logs = raw.map(l => agg.interface.parseLog(l));
 
   const commits = new Map();   // slot -> operator
-  const reveals = new Map();
+  const reveals = new Map();   // slot -> operator
   const totalSlots = Number(await agg.commitOraclesToPoll()); // K
-  const slots   = new Map();   // all poll indices ever seen
+  const requiredRev = Number(await agg.oraclesToPoll());       // M
+  const slots = new Map();     // tracks every pollIndex we see
 
   logs.forEach(l => {
     if (l.name === "CommitReceived") {
@@ -78,7 +79,8 @@ async function diagnoseTimeout(agg, aggId) {
   const missingReveal = [];
   for (const [slot, op] of slots) {
     if (!commits.has(slot))       missingCommit.push(op);
-    else if (!reveals.has(slot))  missingReveal.push(op);
+    else if (!reveals.has(slot) && !missingReveal.includes(op))
+                                 missingReveal.push(op);
   }
 
   console.log("\n┌─ Diagnostic for", aggId, "──────────────────────────────────┐");
@@ -87,7 +89,7 @@ async function diagnoseTimeout(agg, aggId) {
                 : "timeout (undetermined)"}`
                 .padEnd(58) + "│");
   console.log(`│ Commits:  ${commits.size} / ${totalSlots}`.padEnd(58) + "│");
-  console.log(`│ Reveals:  ${reveals.size} / ${commits.size}`.padEnd(58) + "│");
+  console.log(`│ Reveals:  ${reveals.size} / ${requiredRev}`.padEnd(58) + "│");
   if (missingCommit.length)
     console.log(`│ Missing commit from: ${missingCommit.join(" ")}`.padEnd(58) + "│");
   if (missingReveal.length)
