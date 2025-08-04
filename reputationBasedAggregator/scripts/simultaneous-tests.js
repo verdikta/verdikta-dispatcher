@@ -8,12 +8,12 @@ const pause  = ms => new Promise(r => setTimeout(r, ms));
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
    EDIT ONLY THESE CONSTANTS
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
-const AGGREGATOR          = "0xC60f4532F104EDD422335a9103c8Ce7B2DF5Bc84";
+const AGGREGATOR          = "0x2bF73a372CA04C30e9a689BAc4BfC976DfBEb504";
 const LINK_TOKEN          = "0xE4aB69C077896252FAFBD49EFD26B5D171A32410";
 
-const NUM_QUERIES         = 10;
+const NUM_QUERIES         = 5;
 const BETWEEN_QUERY_DELAY = 200;         // ms between tx submissions
-const NUM_INCREMENTS      = 5;
+const NUM_INCREMENTS      = 11;
 const INCREMENT_DURATION  = 30_000;      // ms between polling rounds
 
 const JOB_CLASS           = 128;
@@ -57,7 +57,10 @@ async function diagnoseTimeout(agg, aggId) {
 
   const commits = new Map();   // slot -> operator
   const reveals = new Map();   // slot -> operator
-  const totalSlots = Number(await agg.commitOraclesToPoll()); // K
+  let revealReqCnt  = 0;       // how many RevealRequestDispatched
+  let   hashMismatch  = 0;     // how many mismatches
+  let   badFormat     = 0;     // how many bad formats
+  const totalSlots = Number(await agg.commitOraclesToPoll());  // K
   const requiredRev = Number(await agg.oraclesToPoll());       // M
   const slots = new Map();     // tracks every pollIndex we see
 
@@ -70,6 +73,9 @@ async function diagnoseTimeout(agg, aggId) {
       reveals.set(l.args.pollIndex.toString(), l.args.operator);
       slots.set (l.args.pollIndex.toString(), l.args.operator);
     }
+    if (l.name === "RevealRequestDispatched") revealReqCnt += 1;
+    if (l.name === "RevealHashMismatch")      hashMismatch += 1;
+    if (l.name === "InvalidRevealFormat")     badFormat    += 1;
   });
 
   const evFail = logs.find(l => l.name === "EvaluationFailed");
@@ -83,18 +89,20 @@ async function diagnoseTimeout(agg, aggId) {
                                  missingReveal.push(op);
   }
 
-  console.log("\n┌─ Diagnostic for", aggId, "──────────────────────────────────┐");
+  console.log("\n┌─ Diagnostic for", aggId, "──────────────");
   console.log(`│ Outcome: ${phase === "commit" ? "commit-phase timeout"
                 : phase === "reveal" ? "reveal-phase timeout"
-                : "timeout (undetermined)"}`
-                .padEnd(58) + "│");
-  console.log(`│ Commits:  ${commits.size} / ${totalSlots}`.padEnd(58) + "│");
-  console.log(`│ Reveals:  ${reveals.size} / ${requiredRev}`.padEnd(58) + "│");
+                : "timeout (undetermined)"}` );
+  console.log(`│ Commits:  ${commits.size} / ${totalSlots}` );
+  console.log(`│ Reveals requested: ${revealReqCnt}` );
+  console.log(`│ Reveal hash mismatches: ${hashMismatch}` );
+  console.log(`│ Invalid reveal formats: ${badFormat}`);
+  console.log(`│ Reveals:  ${reveals.size} / ${requiredRev}` );
   if (missingCommit.length)
-    console.log(`│ Missing commit from: ${missingCommit.join(" ")}`.padEnd(58) + "│");
+    console.log(`│ Missing commits from: ${missingCommit.join(" ")}`.padEnd(58) );
   if (missingReveal.length)
-    console.log(`│ Missing reveal from: ${missingReveal.join(" ")}`.padEnd(58) + "│");
-  console.log("└" + "─".repeat(58) + "┘");
+    console.log(`│ Missing reveals from: ${missingReveal.join(" ")}`.padEnd(58) );
+  console.log("└" + "─".repeat(98) );
 }
 
 /* ------------------------------------------------------------------ */
