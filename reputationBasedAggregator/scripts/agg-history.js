@@ -125,6 +125,27 @@ const pad = (v, n) => String(v).padEnd(n);
     console.log("Error checking aggregation:", e.message);
   }
   
+  // Get the transaction that created the RequestAIEvaluation to see all oracle assignments
+  console.log("Analyzing the original request transaction...");
+  const requestTx = await provider.getTransactionReceipt(requestLogs[0].transactionHash);
+  
+  // Debug: Look at ChainlinkRequested events to understand structure
+  console.log("Debug: Examining ChainlinkRequested events...");
+  for (const log of requestTx.logs) {
+    if (log.address.toLowerCase() === agg.target.toLowerCase()) {
+      try {
+        const parsed = agg.interface.parseLog(log);
+        if (parsed.name === "ChainlinkRequested") {
+          console.log("ChainlinkRequested event args:", Object.keys(parsed.args));
+          console.log("Sample event:", parsed.args);
+          break; // Just show one example
+        }
+      } catch (e) {
+        // Skip unparseable logs
+      }
+    }
+  }
+  
   // Now get all events related to this aggregation
   const eventsFilter = {
     address: agg.target,
