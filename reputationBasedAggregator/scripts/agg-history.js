@@ -48,7 +48,8 @@ const pad = (v, n) => String(v).padEnd(n);
     RevealHashMismatch:        "RevealHashMismatch",
     InvalidRevealFormat:       "InvalidRevealFormat",
     EvaluationFailed:          "EvaluationFailed",
-    FulfillAIEvaluation:       "FulfillAIEvaluation"
+    FulfillAIEvaluation:       "FulfillAIEvaluation",
+    OracleSelected:            "OracleSelected"
   };
 
   // Create a proper topics object mapping event names to topic hashes
@@ -156,7 +157,8 @@ const pad = (v, n) => String(v).padEnd(n);
         topics.InvalidRevealFormat,
         topics.RevealHashMismatch,
         topics.EvaluationFailed,
-        topics.FulfillAIEvaluation
+        topics.FulfillAIEvaluation,
+        topics.OracleSelected
       ],
       aggId  // indexed parameter where applicable
     ],
@@ -173,16 +175,22 @@ const pad = (v, n) => String(v).padEnd(n);
     try {
       const parsed = agg.interface.parseLog(log);
       matchingLogs++;
-      
-      if (parsed.args.pollIndex !== undefined && parsed.args.operator) {
-        const slot = Number(parsed.args.pollIndex);
-        const operator = parsed.args.operator;
-        
-        console.log(`Found event: ${parsed.name} slot=${slot} operator=${operator}`);
-        
-        if (slot < K && !oracles[slot]) {
-          oracles[slot] = { oracle: operator, jobId: "unknown" };
-        }
+       if (parsed.name === "OracleSelected") {
+         const slot    = Number(parsed.args.pollIndex);
+         const oracle  = parsed.args.oracle;
+         const jobId   = parsed.args.jobId;
+         console.log(`OracleSelected  slot=${slot} oracle=${oracle} jobId=${jobId}`);
+         oracles[slot] = { oracle, jobId: jobId };
+         continue;
+       }
+ 
+       /* other per-slot events ------------------------- */
+       if (parsed.args.pollIndex !== undefined && parsed.args.operator) {
+         const slot     = Number(parsed.args.pollIndex);
+         const operator = parsed.args.operator;
+         if (slot < K && !oracles[slot]) {
+           oracles[slot] = { oracle: operator, jobId: "unknown" };
+         }
       }
     } catch (e) {
       console.log("Failed to parse log:", e.message);
@@ -247,6 +255,7 @@ const pad = (v, n) => String(v).padEnd(n);
       case "NewOracleResponseRecorded":reveals.set(idx, log);    break;
       case "RevealHashMismatch":       mismatches.set(idx, log); break;
       case "InvalidRevealFormat":      badFormats.set(idx, log); break;
+      case "OracleSelected": oracles.set(log.args.pollIndex.toString(), { oracle: log.args.oracle, jobId:  log.args.jobId }); break;
     }
   };
   indexedLogs.forEach(collect);
