@@ -84,7 +84,7 @@ const pad = (v, n) => String(v).padEnd(n);
   const requestLogs = await provider.getLogs(requestFilter);
 
   if (requestLogs.length === 0) {
-    console.log("❌ No RequestAIEvaluation event found for this aggId in recent blocks");
+    console.log("No RequestAIEvaluation event found for this aggId in recent blocks");
     console.log("This could mean:");
     console.log("  1. The aggId is incorrect");
     console.log("  2. The request is older than 10000 blocks");
@@ -109,7 +109,7 @@ const pad = (v, n) => String(v).padEnd(n);
     return; // Exit early
   }
 
-  console.log(`✅ Found RequestAIEvaluation event at block ${requestLogs[0].blockNumber}`);
+  console.log(`Found RequestAIEvaluation event at block ${requestLogs[0].blockNumber}`);
 
   // Check aggregation status
   try {
@@ -275,10 +275,10 @@ const pad = (v, n) => String(v).padEnd(n);
   console.log("\n======================================================================");
   console.log("Aggregator :", argv.aggregator);
   console.log("aggId      :", aggId);
-  console.log(`K = ${K}   M = ${M}`);
-  console.log("----------------------------------------------------------------------");
+  console.log(`Poll for Commit = ${K}   Poll for Reveal = ${M}`);
+  console.log("-------------------------------------------------------------------------------------------------------------------------");
   console.log(
-    pad("slot",4), pad("oracle",42), pad("jobId",66),
+    pad("slot",4), pad("oracle",42), pad("jobId",24),
     pad("commit",8), pad("revealReq",11),
     pad("revealOK",10), pad("hashMis",8), pad("badFmt",7)
   );
@@ -292,7 +292,7 @@ const pad = (v, n) => String(v).padEnd(n);
     console.log(
       pad(slot,4),
       pad(oracle,42),
-      pad(jobId,66),
+      pad(jobId,24),
       pad(commits.has(idx)    ? "yes" : "no",8),
       pad(revealReq.has(idx)  ? "yes" : "no",11),
       pad(reveals.has(idx)    ? "yes" : "no",10),
@@ -305,13 +305,13 @@ const pad = (v, n) => String(v).padEnd(n);
   const failed  = indexedLogs.find(l => l.name === "EvaluationFailed");
   const success = indexedLogs.find(l => l.name === "FulfillAIEvaluation");
 
-  console.log("----------------------------------------------------------------------");
+  console.log("-------------------------------------------------------------------------------------------------------------------------");
   if (success)  console.log("Outcome : COMPLETED");
   else if (failed) console.log(`Outcome : FAILED in ${failed.args.phase} phase`);
   else            console.log("Outcome : still running or timed-out");
   
   // Add analysis section
-  console.log("\n🔍 Analysis:");
+  console.log("\nAnalysis:");
   const commitCount = commits.size;
   const revealCount = reveals.size;
   console.log(`• ${commitCount}/${K} oracles committed, ${revealCount}/${K} revealed`);
