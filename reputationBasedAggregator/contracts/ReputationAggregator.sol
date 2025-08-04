@@ -177,6 +177,15 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     event InvalidRevealFormat(bytes32 indexed aggRequestId, uint256 indexed pollIndex,
                               address operator, string  badCid);
 
+    /// @notice Emitted for every oracle that is picked for a poll slot  
+    /// @param aggRequestId  Aggregator-level request identifier  
+    /// @param pollIndex     Zero-based slot number (0‥K-1)  
+    /// @param oracle        Oracle operator address  
+    /// @param jobId         Job-ID used for this request
+    event OracleSelected( bytes32 indexed aggRequestId, uint256 indexed pollIndex,
+        address oracle, bytes32 jobId
+    );
+
     // ----------------------------------------------------------------------
     //                               STRUCTS
     // ----------------------------------------------------------------------
@@ -418,11 +427,13 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
 
             require(LinkTokenInterface(_chainlinkTokenAddress()).transferFrom(msg.sender, address(this), fee), "fee xferFrom failed");
 
-            bytes32 opReq = _sendSingleOracleRequest(sel[i].oracle, jobId, fee, cidConcat);
+            bytes32 opReq = _sendSingleOracleRequest(aggId, sel[i].oracle, jobId, fee, cidConcat);
             requestIdToAggregatorId[opReq] = aggId;
             requestIdToPollIndex[opReq] = i;  // slot == i
             agg.requestIds[opReq] = true;
             agg.pollFees.push(fee);
+
+            emit OracleSelected(aggId, i, sel[i].oracle, sel[i].jobId);
         }
 
         emit RequestAIEvaluation(aggId, cids);
@@ -622,7 +633,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
             
             ReputationKeeper.OracleIdentity memory oid = agg.polledOracles[slot];
             string memory cid2 = string(abi.encodePacked("2:", _bytes16ToHexStringLower(hash128)));
-            bytes32 opReq = _sendSingleOracleRequest(oid.oracle, oid.jobId, 0, cid2);
+            bytes32 opReq = _sendSingleOracleRequest(aggId, oid.oracle, oid.jobId, 0, cid2);
             requestIdToAggregatorId[opReq] = aggId;
             requestIdToPollIndex[opReq] = slot;
             agg.requestIds[opReq] = true;
@@ -635,6 +646,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     //                       HELPER: BUILD & SEND REQUEST
     // ----------------------------------------------------------------------
     function _sendSingleOracleRequest(
+        bytes32 aggId,
         address operator,
         bytes32 jobId,
         uint256 fee,
@@ -642,6 +654,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     ) internal returns (bytes32) {
         Chainlink.Request memory req = _buildOperatorRequest(jobId, this.fulfill.selector);
         req._add("cid", cidPayload);
+        req._add("aggId", _bytes32ToHexString(aggId));
         return _sendOperatorRequestTo(operator, req, fee);
     }
 
@@ -772,6 +785,18 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
             hexChars[2 * i + 1] = _lowerHexChar(b & 0x0f);
         }
         return string(hexChars);
+    }
+
+    function _bytes32ToHexString(bytes32 x) internal pure returns (string memory) {
+        bytes memory s = new bytes(2+64);
+        s[0] = "0";
+        s[1] = "x";
+        for (uint256 i; i < 32; ++i) {
+            uint8 b = uint8(x[i]);
+            s[2*i]     = _lowerHexChar(b >> 4);
+            s[2*i + 1] = _lowerHexChar(b & 0x0f);
+        }
+        return string(s);
     }
 
     // ----------------------------------------------------------------------
