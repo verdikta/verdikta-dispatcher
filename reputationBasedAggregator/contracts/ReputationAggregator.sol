@@ -109,7 +109,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     /// @param requestId The Chainlink request identifier
     /// @param pollIndex The oracle's slot index
     /// @param operator Address of the oracle operator
-    event NewOracleResponseRecorded(bytes32 requestId, uint256 pollIndex, address operator);
+    event NewOracleResponseRecorded(bytes32 requestId, uint256 pollIndex, bytes32 indexed aggRequestId, address operator);
     
     /// @notice Emitted when bonus payment is made to a clustered oracle
     /// @param operator Address of the oracle operator receiving bonus
@@ -602,7 +602,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
 
         agg.responses.push(resp);
         agg.responseCount += 1;
-        emit NewOracleResponseRecorded(requestId, slot, msg.sender);
+        emit NewOracleResponseRecorded(requestId, slot, aggId, msg.sender);
 
         if (agg.responseCount >= agg.requiredResponses) {
             _finalizeAggregation(aggId);
