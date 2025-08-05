@@ -1,12 +1,12 @@
 #!/usr/bin/env node
-/*  scripts/agg-history.js
+/*  scripts/agg-history-enhanced.js
 Usage:
 HARDHAT_NETWORK=base_sepolia \
-node scripts/agg-history.js \
+node scripts/agg-history-enhanced.js \
   --aggregator 0x2bF73a372CA04C30e9a689BAc4BfC976DfBEb504 \
   --aggid      0xe4bdcfa7195c2f67163f9d27c0728263e38b5b38d8f4b20a11047a243347b40c
     --------------------------------------------------
-    Full timeline for ONE ReputationAggregator request
+    Enhanced timeline with require() failure detection
     -------------------------------------------------- */
 require("dotenv").config();
 const hre        = require("hardhat");
@@ -37,26 +37,33 @@ const pad = (v, n) => String(v).padEnd(n);
   /* basic parameters */
   const K = Number(await agg.commitOraclesToPoll());
   const M = Number(await agg.oraclesToPoll());
+  const maxLikelihoodLength = Number(await agg.maxLikelihoodLength());
 
-  console.log(`Contract parameters: K=${K}, M=${M}`);
+  console.log(`Contract parameters: K=${K}, M=${M}, maxLikelihoodLength=${maxLikelihoodLength}`);
 
-  /* event names we care about */
+  /* event names we care about - ENHANCED with new failure events */
   const sigs = {
     CommitReceived:            "CommitReceived",
-    RevealRequestDispatched:   "RevealRequestDispatched",
+    RevealRequestDispatched:   "RevealRequestDispatched", 
     NewOracleResponseRecorded: "NewOracleResponseRecorded",
     RevealHashMismatch:        "RevealHashMismatch",
     InvalidRevealFormat:       "InvalidRevealFormat",
+    RevealTooManyScores:       "RevealTooManyScores",       // NEW
+    RevealWrongScoreCount:     "RevealWrongScoreCount",     // NEW  
+    RevealTooFewScores:        "RevealTooFewScores",        // NEW
     EvaluationFailed:          "EvaluationFailed",
     FulfillAIEvaluation:       "FulfillAIEvaluation",
     OracleSelected:            "OracleSelected"
   };
 
-  // Create a proper topics object mapping event names to topic hashes
+  // Create topics object mapping event names to topic hashes
   const topics = {};
   for (const [alias, eventName] of Object.entries(sigs)) {
     const ev = agg.interface.getEvent(eventName);
-    if (!ev) throw new Error(`Event not found in ABI: ${eventName}`);
+    if (!ev) {
+      console.log(`Warning: Event not found in ABI: ${eventName} - skipping`);
+      continue;
+    }
     topics[alias] = ev.topicHash;
   }
 
@@ -85,27 +92,6 @@ const pad = (v, n) => String(v).padEnd(n);
 
   if (requestLogs.length === 0) {
     console.log("No RequestAIEvaluation event found for this aggId in recent blocks");
-    console.log("This could mean:");
-    console.log("  1. The aggId is incorrect");
-    console.log("  2. The request is older than 10000 blocks");
-    console.log("  3. The request hasn't been made yet");
-
-    // Try to find recent requests to help debug
-    const anyRequestFilter = {
-      address: agg.target,
-      topics: [agg.interface.getEvent("RequestAIEvaluation").topicHash],
-      fromBlock: fromBlock,
-      toBlock: "latest"
-    };
-
-    const anyRequests = await provider.getLogs(anyRequestFilter);
-    console.log(`\nFound ${anyRequests.length} RequestAIEvaluation events in recent blocks:`);
-
-    for (let i = Math.max(0, anyRequests.length - 5); i < anyRequests.length; i++) {
-      const parsed = agg.interface.parseLog(anyRequests[i]);
-      console.log(`  Block ${anyRequests[i].blockNumber}: ${parsed.args.aggRequestId}`);
-    }
-
     return; // Exit early
   }
 
@@ -128,7 +114,7 @@ const pad = (v, n) => String(v).padEnd(n);
 
   // Get oracle assignments from OracleSelected events
   console.log("Fetching oracle assignments from OracleSelected events...");
-  
+
   const oracleSelectedFilter = {
     address: agg.target,
     topics: [
@@ -138,10 +124,10 @@ const pad = (v, n) => String(v).padEnd(n);
     fromBlock: fromBlock,
     toBlock: "latest"
   };
-  
+
   const oracleSelectedLogs = await provider.getLogs(oracleSelectedFilter);
   console.log(`Found ${oracleSelectedLogs.length} OracleSelected events`);
-  
+
   // Parse OracleSelected events to get all oracle assignments
   for (const log of oracleSelectedLogs) {
     try {
@@ -149,12 +135,12 @@ const pad = (v, n) => String(v).padEnd(n);
       const slot = Number(parsed.args.pollIndex);
       const oracle = parsed.args.oracle;
       const jobId = parsed.args.jobId;
-      
+
       console.log(`OracleSelected slot=${slot} oracle=${oracle} jobId=${jobId.toString().slice(0,10)}...`);
-      
+
       if (slot < K) {
-        oracles[slot] = { 
-          oracle, 
+        oracles[slot] = {
+          oracle,
           jobId: jobId.toString().length > 20 ? jobId.toString().slice(0,20) + "..." : jobId.toString()
         };
       }
@@ -163,18 +149,20 @@ const pad = (v, n) => String(v).padEnd(n);
     }
   }
 
-  // Now get all events related to this aggregation
+  // Get all failure events - ENHANCED with new events
+  const failureEventTopics = [];
+  for (const eventKey of ['CommitReceived', 'RevealRequestDispatched', 'InvalidRevealFormat', 
+                          'RevealHashMismatch', 'RevealTooManyScores', 'RevealWrongScoreCount', 
+                          'RevealTooFewScores', 'EvaluationFailed', 'FulfillAIEvaluation']) {
+    if (topics[eventKey]) {
+      failureEventTopics.push(topics[eventKey]);
+    }
+  }
+
   const eventsFilter = {
     address: agg.target,
     topics: [
-      [
-        topics.CommitReceived,
-        topics.RevealRequestDispatched,
-        topics.InvalidRevealFormat,
-        topics.RevealHashMismatch,
-        topics.EvaluationFailed,
-        topics.FulfillAIEvaluation
-      ],
+      failureEventTopics,
       aggId  // indexed parameter where applicable
     ],
     fromBlock: fromBlock,
@@ -251,53 +239,64 @@ const pad = (v, n) => String(v).padEnd(n);
   /* ▸ logs that already index aggId */
   const indexedLogs = eventLogs.map(l => agg.interface.parseLog(l));
 
-  /* build slot-wise tables */
-  const commits    = new Map();
-  const revealReq  = new Map();
-  const reveals    = new Map();
-  const mismatches = new Map();
-  const badFormats = new Map();
+  /* build slot-wise tables - ENHANCED */
+  const commits         = new Map();
+  const revealReq       = new Map();
+  const reveals         = new Map();
+  const mismatches      = new Map();
+  const badFormats      = new Map();
+  const tooManyScores   = new Map(); // NEW
+  const wrongScoreCount = new Map(); // NEW  
+  const tooFewScores    = new Map(); // NEW
 
   const collect = log => {
     const idx = String(log.args.pollIndex);
     switch (log.name) {
-      case "CommitReceived":           commits.set(idx, log);    break;
-      case "RevealRequestDispatched":  revealReq.set(idx, log);  break;
-      case "NewOracleResponseRecorded":reveals.set(idx, log);    break;
-      case "RevealHashMismatch":       mismatches.set(idx, log); break;
-      case "InvalidRevealFormat":      badFormats.set(idx, log); break;
+      case "CommitReceived":           commits.set(idx, log);         break;
+      case "RevealRequestDispatched":  revealReq.set(idx, log);       break;
+      case "NewOracleResponseRecorded":reveals.set(idx, log);         break;
+      case "RevealHashMismatch":       mismatches.set(idx, log);      break;
+      case "InvalidRevealFormat":      badFormats.set(idx, log);      break;
+      case "RevealTooManyScores":      tooManyScores.set(idx, log);   break; // NEW
+      case "RevealWrongScoreCount":    wrongScoreCount.set(idx, log); break; // NEW
+      case "RevealTooFewScores":       tooFewScores.set(idx, log);    break; // NEW
     }
   };
   indexedLogs.forEach(collect);
   ourResponseLogs.forEach(collect);
 
-  /* header */
+  /* header - ENHANCED */
   console.log("\n======================================================================");
   console.log("Aggregator :", argv.aggregator);
   console.log("aggId      :", aggId);
-  console.log(`Poll for Commit = ${K}   Poll for Reveal = ${M}`);
-  console.log("-------------------------------------------------------------------------------------------------------------------------");
+  console.log(`Poll for Commit = ${K}   Poll for Reveal = ${M}   maxScores = ${maxLikelihoodLength}`);
+  console.log("------------------------------------------------------------------------------------------------------------------------------------------------------------");
   console.log(
-    pad("slot",4), pad("oracle",42), pad("jobId",24),
-    pad("commit",8), pad("revealReq",11),
-    pad("revealOK",10), pad("hashMis",8), pad("badFmt",7)
+    pad("slot",4), pad("oracle",42), pad("jobId",20),
+    pad("commit",8), pad("revealReq",11), pad("revealOK",10), 
+    pad("hashMis",8), pad("badFmt",7),
+    pad("tooMany",8), pad("wrongCnt",9), pad("tooFew",7)  // NEW COLUMNS
   );
 
-  /* per-slot lines */
+  /* per-slot lines - ENHANCED */
   for (let slot = 0; slot < K; ++slot) {
     const oracleInfo = oracles[slot];
     const oracle = oracleInfo ? oracleInfo.oracle : "not assigned";
     const jobId = oracleInfo ? oracleInfo.jobId : "unknown";
     const idx = String(slot);
+    
     console.log(
       pad(slot,4),
       pad(oracle,42),
-      pad(jobId,24),
-      pad(commits.has(idx)    ? "yes" : "no",8),
-      pad(revealReq.has(idx)  ? "yes" : "no",11),
-      pad(reveals.has(idx)    ? "yes" : "no",10),
-      pad(mismatches.has(idx) ? "yes" : "no",8),
-      pad(badFormats.has(idx) ? "yes" : "no",7)
+      pad(jobId,20),
+      pad(commits.has(idx)         ? "yes" : "no",8),
+      pad(revealReq.has(idx)       ? "yes" : "no",11),
+      pad(reveals.has(idx)         ? "yes" : "no",10),
+      pad(mismatches.has(idx)      ? "yes" : "no",8),
+      pad(badFormats.has(idx)      ? "yes" : "no",7),
+      pad(tooManyScores.has(idx)   ? "yes" : "no",8),  // NEW
+      pad(wrongScoreCount.has(idx) ? "yes" : "no",9),  // NEW
+      pad(tooFewScores.has(idx)    ? "yes" : "no",7)   // NEW
     );
   }
 
@@ -305,35 +304,68 @@ const pad = (v, n) => String(v).padEnd(n);
   const failed  = indexedLogs.find(l => l.name === "EvaluationFailed");
   const success = indexedLogs.find(l => l.name === "FulfillAIEvaluation");
 
-  console.log("-------------------------------------------------------------------------------------------------------------------------");
+  console.log("------------------------------------------------------------------------------------------------------------------------------------------------------------");
   if (success)  console.log("Outcome : COMPLETED");
   else if (failed) console.log(`Outcome : FAILED in ${failed.args.phase} phase`);
   else            console.log("Outcome : still running or timed-out");
-  
-  // Add analysis section
-  console.log("\nAnalysis:");
+
+  // Enhanced analysis section
+  console.log("\nDetailed Analysis:");
   const commitCount = commits.size;
   const revealCount = reveals.size;
   console.log(`• ${commitCount}/${K} oracles committed, ${revealCount}/${K} revealed`);
-  
+
   if (commitCount < M) {
     console.log(`• Waiting for ${M - commitCount} more commits to start reveal phase`);
   }
-  
-  // Show responding vs non-responding slots
+
+  // Show specific failure types
+  if (tooManyScores.size > 0) {
+    console.log(`• ${tooManyScores.size} reveals failed: TOO MANY SCORES (>${maxLikelihoodLength})`);
+    tooManyScores.forEach((log, slot) => {
+      const parsed = log;
+      console.log(`  - Slot ${slot}: sent ${parsed.args?.responseLength || 'unknown'} scores, max allowed ${parsed.args?.maxAllowed || maxLikelihoodLength}`);
+    });
+  }
+
+  if (wrongScoreCount.size > 0) {
+    console.log(`• ${wrongScoreCount.size} reveals failed: WRONG SCORE COUNT`);
+    wrongScoreCount.forEach((log, slot) => {
+      const parsed = log;
+      console.log(`  - Slot ${slot}: sent ${parsed.args?.responseLength || 'unknown'} scores, expected ${parsed.args?.expectedLength || 'unknown'}`);
+    });
+  }
+
+  if (tooFewScores.size > 0) {
+    console.log(`• ${tooFewScores.size} reveals failed: TOO FEW SCORES (<2)`);
+    tooFewScores.forEach((log, slot) => {
+      const parsed = log;
+      console.log(`  - Slot ${slot}: sent ${parsed.args?.responseLength || 'unknown'} scores`);
+    });
+  }
+
+  if (mismatches.size > 0) {
+    console.log(`• ${mismatches.size} reveals failed: HASH MISMATCH`);
+  }
+
+  if (badFormats.size > 0) {
+    console.log(`• ${badFormats.size} reveals failed: BAD CID FORMAT`);
+  }
+
+  // Show responding vs non-responding slots  
   const respondingSlots = Array.from({length: K}, (_, i) => i).filter(i => commits.has(String(i)));
   const nonRespondingSlots = Array.from({length: K}, (_, i) => i).filter(i => !commits.has(String(i)));
-  
+
   console.log(`• Responding slots (committed): [${respondingSlots.join(', ')}]`);
   if (nonRespondingSlots.length > 0) {
     console.log(`• Non-responding slots: [${nonRespondingSlots.join(', ')}]`);
   }
-  
+
   // Show unique responding oracles
   const uniqueOracles = new Set(oracles.filter(o => o !== null).map(o => o.oracle));
   console.log(`• Unique oracle addresses assigned: ${uniqueOracles.size}`);
   uniqueOracles.forEach(addr => console.log(`  - ${addr}`));
-  
+
   console.log("======================================================================\n");
 })();
 
