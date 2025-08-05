@@ -54,15 +54,15 @@ async function main() {
     const tx1 = await keeper.approveContract(AGGREGATOR_ADDRESS, gasOptions);
     console.log("Transaction hash:", tx1.hash);
     await tx1.wait();
-    console.log("✓ Aggregator approved in keeper");
+    console.log("Aggregator approved in keeper");
     
     console.log("\n2. Setting keeper address in aggregator...");
     const tx2 = await aggregator.setReputationKeeper(KEEPER_ADDRESS, gasOptions);
     console.log("Transaction hash:", tx2.hash);
     await tx2.wait();
-    console.log("✓ Keeper set in aggregator");
+    console.log("Keeper set in aggregator");
     
-    console.log("\n🎉 Contracts successfully wired together!");
+    console.log("\nContracts successfully wired together!");
     console.log("ReputationAggregator:", AGGREGATOR_ADDRESS);
     console.log("ReputationKeeper:", KEEPER_ADDRESS);
     
@@ -70,7 +70,7 @@ async function main() {
     console.error("Error during wiring:", error.message);
     
     if (error.code === "INSUFFICIENT_FUNDS") {
-      console.log("\n💡 Need more Base Sepolia ETH from faucet");
+      console.log("\nNeed more Base Sepolia ETH from faucet");
     } else if (error.reason) {
       console.log("Revert reason:", error.reason);
     }
