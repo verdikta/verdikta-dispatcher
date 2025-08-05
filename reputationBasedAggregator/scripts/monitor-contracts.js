@@ -166,6 +166,7 @@ function bytes32ToAscii(b32) {
     console.log(`LINK Token:               ${linkAddr}`);
 
     /* Recent events (last 1000 blocks) --------------------- */
+    /*	  
     const head = await provider.getBlockNumber();
     const recent = await aggregator.queryFilter("*", Math.max(0, head - 1000), head);
     console.log("\nRecent Aggregator Events:");
@@ -175,6 +176,7 @@ function bytes32ToAscii(b32) {
       console.log("Args:", evt.args);
       console.log(`Block: ${evt.blockNumber}  Tx: ${evt.transactionHash}`);
     });
+    */
 
     /* Gas price -------------------------------------------- */
     const fee = await provider.getFeeData();
