@@ -186,6 +186,46 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         address oracle, bytes32 jobId
     );
 
+    /// @notice Emitted when a reveal fails because response array is too long
+    /// @param aggRequestId Aggregator request identifier
+    /// @param pollIndex Oracle's slot index
+    /// @param operator Oracle operator address
+    /// @param responseLength Length of the response array provided
+    /// @param maxAllowed Maximum allowed length (maxLikelihoodLength)
+    event RevealTooManyScores(
+        bytes32 indexed aggRequestId,
+        uint256 indexed pollIndex, 
+        address operator,
+        uint256 responseLength,
+        uint256 maxAllowed
+    );
+
+    /// @notice Emitted when a reveal fails because response array length doesn't match expected
+    /// @param aggRequestId Aggregator request identifier  
+    /// @param pollIndex Oracle's slot index
+    /// @param operator Oracle operator address
+    /// @param responseLength Length of the response array provided
+    /// @param expectedLength Expected length based on first successful reveal
+    event RevealWrongScoreCount(
+        bytes32 indexed aggRequestId,
+        uint256 indexed pollIndex,
+        address operator, 
+        uint256 responseLength,
+        uint256 expectedLength
+    );
+
+    /// @notice Emitted when a reveal fails because response array is too short (< 2 scores)
+    /// @param aggRequestId Aggregator request identifier
+    /// @param pollIndex Oracle's slot index  
+    /// @param operator Oracle operator address
+    /// @param responseLength Length of the response array provided
+    event RevealTooFewScores(
+         bytes32 indexed aggRequestId,
+        uint256 indexed pollIndex,
+        address operator,
+        uint256 responseLength
+    );
+
     // ----------------------------------------------------------------------
     //                               STRUCTS
     // ----------------------------------------------------------------------
@@ -559,7 +599,18 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
          *                     REVEAL  (Mode-2)
          * ──────────────────────────────────────────────────────── */
         require(agg.commitPhaseComplete, "Reveal arrived before commit phase complete");
-        require(response.length <= maxLikelihoodLength, "Too many likelihood scores");
+
+        // Check for too few scores (less than 2)
+        if (response.length < 2) {
+            emit RevealTooFewScores(aggId, slot, msg.sender, response.length);
+            return; // treat as not revealed
+        }
+        
+        // Check for too many scores
+        if (response.length > maxLikelihoodLength) {
+            emit RevealTooManyScores(aggId, slot, msg.sender, response.length, maxLikelihoodLength);
+            return; // treat as not revealed  
+        }
 
         // ─── DUPLICATE-REVEAL GUARD ──────────────────
         (bool seenAlready, ) = _getResponseForSlot(agg.responses, slot);
@@ -569,7 +620,10 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
 
         // first reveal fixes array length; every later reveal must match
         uint256[] storage totals = _ensureAggArrayExists(agg, response.length);
-        require(response.length == totals.length, "Wrong number of scores");
+        if (response.length != totals.length) {
+            emit RevealWrongScoreCount(aggId, slot, msg.sender, response.length, totals.length);
+            return; // treat as not revealed
+        }
 
         // Split "cleanCid:20hexSalt" -> (cid, saltUint)
         (bool ok, uint256 colonPos) = _isValidCidSalt(cid);
