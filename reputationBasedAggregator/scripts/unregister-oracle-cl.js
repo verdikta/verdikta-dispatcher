@@ -54,7 +54,7 @@ async function getOwnerOrSelf(addr, provider, signer) {
   const code = await provider.getCode(addr);
   if (code === "0x") {
     console.warn(
-      `⚠️  ${addr} has no byte-code (EOA?) – treating it as self-owned`
+      `${addr} has no byte-code (EOA?) – treating it as self-owned`
     );
     return addr.toLowerCase();
   }
@@ -63,7 +63,7 @@ async function getOwnerOrSelf(addr, provider, signer) {
     return owner.toLowerCase();
   } catch {
     console.warn(
-      `⚠️  ${addr} has byte-code but no owner() – treating it as self-owned`
+      `${addr} has byte-code but no owner() – treating it as self-owned`
     );
     return addr.toLowerCase();
   }
@@ -123,7 +123,7 @@ async function getOwnerOrSelf(addr, provider, signer) {
       console.log("Calling deregisterOracle…");
       const tx = await keeper.deregisterOracle(argv.oracle, jobId);
       await tx.wait();
-      console.log("✓ Deregistered (tx:", tx.hash, ")");
+      console.log("Deregistered (tx:", tx.hash, ")");
     }
 
     /* wVDKA balance after */
