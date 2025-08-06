@@ -56,7 +56,7 @@ const { ethers, deployments } = hre;
     console.log("Tx sent:", tx.hash, "(waiting …)");
     const receipt = await tx.wait();
     console.log(
-      `Done in block ${receipt.blockNumber} - gas used ${receipt.gasUsed}`
+      `Success. Done in block ${receipt.blockNumber} - gas used ${receipt.gasUsed}`
     );
 
     process.exit(0);
