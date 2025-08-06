@@ -93,7 +93,7 @@ async function pickSigner() {
     });
     console.log("Tx sent:", tx.hash);
     await tx.wait();
-    console.log("✓ Withdrawal confirmed");
+    console.log("Withdrawal confirmed.");
   } catch (err) {
     console.error("Error:", err);
     process.exit(1);
