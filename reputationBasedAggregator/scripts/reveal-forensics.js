@@ -15,150 +15,172 @@ const { ethers } = hre;
 const yargs = require("yargs/yargs");
 const { hideBin } = require("yargs/helpers");
 
-const operatorAbi = [
-  // v0.8 Operator events
-  "event OracleRequest(bytes32 indexed specId, address indexed requester, bytes32 indexed requestId, uint256 payment, address callbackAddr, bytes4 callbackFunctionId, uint256 cancelExpiration, uint256 dataVersion, bytes data)",
-  // If your Operator ABI/event name differs, add alternatives here:
-  "event OracleResponse(bytes32 indexed requestId)"
-];
+/* ---------- helpers ---------- */
+function normalizeAggId(s) {
+  s = (s || "").trim();
+  const m = s.match(/0x[0-9a-fA-F]{64}/) || s.match(/[0-9a-fA-F]{64}/);
+  if (!m) throw new Error(`--aggid must be 0x + 64 hex; got: ${s}`);
+  const hex = m[0].startsWith("0x") ? m[0] : "0x" + m[0];
+  return hex.toLowerCase();
+}
+
+function lc(x) { return (x || "").toLowerCase(); }
 
 (async () => {
   const argv = yargs(hideBin(process.argv))
     .option("aggregator", { type: "string", demandOption: true })
     .option("operator",   { type: "string", demandOption: true })
     .option("aggid",      { type: "string", demandOption: true })
-    .option("fromaddrs",  { type: "string", default: "" }) // comma-separated EOAs to scan
-    .option("lookahead",  { type: "number", default: 1200 }) // ~few mins of blocks
+    .option("fromaddrs",  { type: "string", default: "" }) // comma sep EOAs (optional)
+    .option("lookahead",  { type: "number", default: 1200 }) // blocks
     .strict().argv;
 
   const provider = ethers.provider;
-
   const aggAbi = (await hre.artifacts.readArtifact("ReputationAggregator")).abi;
   const agg = new ethers.Contract(argv.aggregator, aggAbi, provider);
-  const op  = new ethers.Contract(argv.operator,   operatorAbi, provider);
 
-  const aggId = argv.aggid.toLowerCase();
+  // Minimal Operator ABI (adjust if you run a custom Operator)
+  const operatorAbi = [
+    "event OracleRequest(bytes32 indexed specId, address indexed requester, bytes32 indexed requestId, uint256 payment, address callbackAddr, bytes4 callbackFunctionId, uint256 cancelExpiration, uint256 dataVersion, bytes data)",
+    "event OracleResponse(bytes32 indexed requestId)"
+  ];
+  const op = new ethers.Contract(argv.operator, operatorAbi, provider);
+
+  const aggId = normalizeAggId(argv.aggid);
   const scanEOAs = argv.fromaddrs
-      ? argv.fromaddrs.split(",").map(s => s.trim().toLowerCase()).filter(Boolean)
-      : [];
+    ? argv.fromaddrs.split(",").map(s => lc(s.trim())).filter(Boolean)
+    : [];
 
-  // 1) Find reveal dispatch + recorded responses to get slots and a block window
-  const dispEv = agg.interface.getEvent("RevealRequestDispatched");
-  const recEv  = agg.interface.getEvent("NewOracleResponseRecorded");
+  /* -------- 1) reveal dispatch & recorded responses -------- */
+  const evRevealReq = agg.interface.getEvent("RevealRequestDispatched");
+  const evRecorded  = agg.interface.getEvent("NewOracleResponseRecorded");
+  const evCLF       = agg.interface.getEvent?.("ChainlinkFulfilled"); // may exist via ChainlinkClient
 
+  // Use a reasonable backward window (tweak as needed)
   const latest = await provider.getBlockNumber();
-  const fromBlock = Math.max(0, latest - 50_000); // adjust if needed
+  const fromBlock = Math.max(0, latest - 50_000);
+  const toBlock = "latest";
 
-  const dispLogs = await provider.getLogs({
+  // Raw logs retain blockNumber
+  const dispLogsRaw = await provider.getLogs({
     address: agg.address,
-    topics: [dispEv.topicHash, aggId],
-    fromBlock, toBlock: "latest"
+    topics: [evRevealReq.topicHash, aggId],
+    fromBlock, toBlock
   });
-  const recLogs = await provider.getLogs({
+  const recLogsRaw  = await provider.getLogs({
     address: agg.address,
-    topics: [recEv.topicHash],
-    fromBlock, toBlock: "latest"
+    topics: [evRecorded.topicHash],
+    fromBlock, toBlock
   });
 
-  // Parse only those NewOracleResponseRecorded that belong to this aggId
+  // Parse “recorded” but filter to our aggId
   const ourRecorded = [];
-  for (const l of recLogs) {
+  for (const l of recLogsRaw) {
     try {
       const parsed = agg.interface.parseLog(l);
-      const parentAggId = await agg.requestIdToAggregatorId(parsed.args.requestId);
-      if (parentAggId.toLowerCase() === aggId) ourRecorded.push(parsed);
+      const parentAggId = (await agg.requestIdToAggregatorId(parsed.args.requestId)).toLowerCase();
+      if (parentAggId === aggId) {
+        ourRecorded.push({ parsed, blockNumber: l.blockNumber, txHash: l.transactionHash });
+      }
     } catch {}
   }
 
-  const dispatched = dispLogs.map(l => agg.interface.parseLog(l));
-  if (dispatched.length === 0) {
+  if (dispLogsRaw.length === 0) {
     console.log("No RevealRequestDispatched found for this aggId in recent blocks.");
     process.exit(0);
   }
 
-  const firstDispBlock = Math.min(...dispatched.map(d => d.blockNumber));
-  const lastDispBlock  = Math.max(...dispatched.map(d => d.blockNumber));
+  const dispatched = dispLogsRaw.map(l => ({
+    parsed: agg.interface.parseLog(l),
+    blockNumber: l.blockNumber,
+    txHash: l.transactionHash
+  }));
 
-  // Slots that were asked to reveal:
-  const dispatchedSlots = new Set(dispatched.map(d => Number(d.args.pollIndex)));
-  // Slots that actually recorded a reveal:
-  const recordedSlots   = new Set(ourRecorded.map(d => Number(d.args.pollIndex)));
+  const dispatchedSlots = new Set(dispatched.map(d => Number(d.parsed.args.pollIndex)));
+  const recordedSlots   = new Set(ourRecorded.map(d => Number(d.parsed.args.pollIndex)));
+  const missingSlots    = [...dispatchedSlots].filter(s => !recordedSlots.has(s));
 
-  const missingSlots = [...dispatchedSlots].filter(s => !recordedSlots.has(s));
   console.log("Dispatched slots:", [...dispatchedSlots].sort());
   console.log("Recorded slots  :", [...recordedSlots].sort());
   console.log("Missing slots   :", missingSlots);
 
-  // 2) Find the requestIds for *all* requests issued by this aggId near the dispatch blocks
-  //    by scanning Operator. We'll then map requestId -> pollIndex using aggregator mappings.
-  const opReqEv = op.interface.getEvent("OracleRequest");
-  const opResEv = op.interface.getEvent("OracleResponse");
+  const firstDispBlock = Math.min(...dispatched.map(d => d.blockNumber));
+  const lastDispBlock  = Math.max(...dispatched.map(d => d.blockNumber));
 
+  /* -------- 2) map slots -> requestIds via Operator OracleRequest -------- */
+  const opReqEv = op.interface.getEvent("OracleRequest");
   const opReqLogs = await provider.getLogs({
     address: op.address,
-    topics: [opReqEv.topicHash, null, null, null], // we'll filter requester below
+    topics: [opReqEv.topicHash, null, null, null],
     fromBlock: Math.max(0, firstDispBlock - 600),
     toBlock: lastDispBlock + argv.lookahead
   });
 
-  const revealReqPerSlot = new Map(); // slot -> requestId
-  const allReqIdsForAgg  = [];
-
+  const slotToReqId = new Map();
   for (const l of opReqLogs) {
-    const parsed = op.interface.parseLog(l);
-    const requester = parsed.args.requester.toLowerCase();
-    if (requester !== argv.aggregator.toLowerCase()) continue;
-
+    let parsed;
+    try { parsed = op.interface.parseLog(l); } catch { continue; }
+    const requester = lc(parsed.args.requester);
+    if (requester !== lc(argv.aggregator)) continue;
     const reqId = parsed.args.requestId;
-    // Filter only requests that belong to our aggId
-    const parentAggId = (await agg.requestIdToAggregatorId(reqId)).toLowerCase();
-    if (parentAggId !== aggId) continue;
-
+    const parentAggId = lc(await agg.requestIdToAggregatorId(reqId));
+    if (parentAggId !== aggId) continue; // belongs to another aggregation
     const slot = Number(await agg.requestIdToPollIndex(reqId));
-    revealReqPerSlot.set(slot, reqId);
-    allReqIdsForAgg.push(reqId);
+    slotToReqId.set(slot, reqId);
   }
 
-  console.log("RequestIds discovered (slot -> requestId):");
-  [...revealReqPerSlot.entries()]
-    .sort((a,b)=>a[0]-b[0])
-    .forEach(([slot, id]) => console.log(`  ${slot}: ${id}`));
-
-  // 3) For each missing slot, verify no successful Operator response
-  const opResLogs = await provider.getLogs({
-    address: op.address,
-    topics: [opResEv.topicHash],
-    fromBlock: Math.max(0, firstDispBlock - 600),
-    toBlock: lastDispBlock + argv.lookahead
-  });
-
-  const opRespondedReqIds = new Set(
-    opResLogs.map(l => op.interface.parseLog(l).args.requestId.toLowerCase())
+  console.log("RequestIds (slot -> requestId):");
+  [...slotToReqId.entries()].sort((a,b)=>a[0]-b[0]).forEach(([slot, r]) =>
+    console.log(`  ${slot}: ${r}`)
   );
 
-  for (const slot of missingSlots) {
-    const reqId = (revealReqPerSlot.get(slot) || "0x").toLowerCase();
-    if (reqId === "0x") {
-      console.log(`Slot ${slot}: could not find requestId (check wider block window).`);
-      continue;
+  /* -------- 3) check OperatorResponse or ChainlinkFulfilled -------- */
+  let opResReqIds = new Set();
+  try {
+    const opResEv = op.interface.getEvent("OracleResponse");
+    const opResLogs = await provider.getLogs({
+      address: op.address,
+      topics: [opResEv.topicHash],
+      fromBlock: Math.max(0, firstDispBlock - 600),
+      toBlock: lastDispBlock + argv.lookahead
+    });
+    opResReqIds = new Set(opResLogs.map(l => op.interface.parseLog(l).args.requestId.toLowerCase()));
+  } catch {
+    // OperatorResponse event not present; fall back to ChainlinkFulfilled on aggregator
+    if (evCLF) {
+      const clfLogs = await provider.getLogs({
+        address: agg.address,
+        topics: [evCLF.topicHash],
+        fromBlock: Math.max(0, firstDispBlock - 600),
+        toBlock: lastDispBlock + argv.lookahead
+      });
+      // We can’t get requestId from agg easily without parsing; skip—it’s only a fallback.
     }
-    const ok = opRespondedReqIds.has(reqId);
-    console.log(`Slot ${slot}: requestId=${reqId}  OperatorResponse=${ok ? "YES" : "NO"}`);
   }
 
-  // 4) Optional: try to find any *mined* tx attempts from the EOA keys to the Operator
-  //    that contain the missing requestIds in calldata. If none, it likely never mined.
+  for (const slot of missingSlots) {
+    const reqId = lc(slotToReqId.get(slot) || "0x");
+    if (reqId === "0x") {
+      console.log(`Slot ${slot}: could not find requestId (try increasing --lookahead).`);
+      continue;
+    }
+    const opResp = opResReqIds.has(reqId);
+    console.log(`Slot ${slot}: requestId=${reqId}  OperatorResponse=${opResp ? "YES" : "NO"}`);
+  }
+
+  /* -------- 4) OPTIONAL: look for any mined txs to Operator carrying requestId -------- */
   const searchStart = Math.max(0, firstDispBlock - 50);
   const searchEnd   = lastDispBlock + argv.lookahead;
 
   async function findTxForRequestId(reqIdLower) {
+    // Warning: block-by-block scan; keep window tight
     for (let b = searchStart; b <= searchEnd; b++) {
       const blk = await provider.getBlockWithTransactions(b);
       for (const tx of blk.transactions) {
         if (!tx.to) continue;
-        if (tx.to.toLowerCase() !== argv.operator.toLowerCase()) continue;
-        if (scanEOAs.length && !scanEOAs.includes(tx.from.toLowerCase())) continue;
-        const data = (tx.data || "0x").toLowerCase();
+        if (lc(tx.to) !== lc(argv.operator)) continue;
+        if (scanEOAs.length && !scanEOAs.includes(lc(tx.from))) continue;
+        const data = lc(tx.data || "0x");
         if (data.includes(reqIdLower.slice(2))) {
           const rcpt = await provider.getTransactionReceipt(tx.hash);
           return { hash: tx.hash, from: tx.from, blockNumber: b, status: rcpt.status, nonce: tx.nonce };
@@ -169,23 +191,13 @@ const operatorAbi = [
   }
 
   for (const slot of missingSlots) {
-    const reqId = (revealReqPerSlot.get(slot) || "0x").toLowerCase();
+    const reqId = lc(slotToReqId.get(slot) || "0x");
     if (reqId === "0x") continue;
     const tx = await findTxForRequestId(reqId);
     if (!tx) {
       console.log(`Slot ${slot}: no mined tx to Operator containing requestId (likely never mined / replaced).`);
     } else {
       console.log(`Slot ${slot}: found tx ${tx.hash} from ${tx.from} nonce=${tx.nonce} status=${tx.status} at block ${tx.blockNumber}`);
-      if (tx.status === 0) {
-        // Optional: try to recover revert reason
-        try {
-          const t = await provider.getTransaction(tx.hash);
-          const reason = await provider.call({ to: t.to, from: t.from, data: t.data }, tx.blockNumber);
-          console.log(`  Revert reason (decoded call): ${reason}`);
-        } catch (e) {
-          console.log(`  Could not decode revert reason: ${e.message}`);
-        }
-      }
     }
   }
 })();
