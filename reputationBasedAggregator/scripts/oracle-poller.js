@@ -94,7 +94,7 @@ const bytes32ToAscii = (b32) =>
     let n = 1;
     for (const { oracle, jobId, info, recentScores } of found) {
       console.log(`\nOracle ${n++}`);
-      console.log(`Address:            ${oracle}`);
+      console.log(`Operator Address:   ${oracle}`);
       console.log(`Active:             ${info.isActive}`);
       console.log(`Quality Score:      ${info.qualityScore}`);
       console.log(`Timeliness Score:   ${info.timelinessScore}`);
