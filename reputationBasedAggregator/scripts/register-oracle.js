@@ -23,7 +23,7 @@ const JOB_IDS = [
   "184c2fd08a634719adc9183846e91380",
   "858acbb95d90492bbff6a0eb568112b0"
 ];
-const LINK_FEE   = ethers.parseUnits("0.007", 18);  // 0.007 LINK
+const LINK_FEE   = ethers.parseUnits("0.006", 18);  // 0.007 LINK
 const VDKA_STAKE = ethers.parseUnits("100", 18);   // 100 wVDKA
 /* --------------------------------------------------------------------- */
 
