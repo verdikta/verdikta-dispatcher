@@ -8,15 +8,15 @@ const pause  = ms => new Promise(r => setTimeout(r, ms));
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
    EDIT ONLY THESE CONSTANTS
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
-const AGGREGATOR          = "0x8c0B89a9Be09c72C1cdC6d8b922D689C528b85d6";
+const AGGREGATOR          = "0x6a26f45D5BbFC3AEEd8De9bd2B8285b96554bC47";
 const LINK_TOKEN          = "0xE4aB69C077896252FAFBD49EFD26B5D171A32410";
 
-const NUM_QUERIES         = 8;
+const NUM_QUERIES         = 15;
 const BETWEEN_QUERY_DELAY = 200;         // ms between tx submissions
-const NUM_INCREMENTS      = 11;
+const NUM_INCREMENTS      = 12;
 const INCREMENT_DURATION  = 30_000;      // ms between polling rounds
 
-const JOB_CLASS           = 128;
+const JOB_CLASS           = 1001;
 const MAX_ORACLE_FEE      = ethers.parseUnits("0.01", 18);
 const ESTIMATE_BASE_FEE   = ethers.parseUnits("0.000001", 18);
 const MAX_FEE_SCALING     = 5;
@@ -129,39 +129,69 @@ async function diagnoseTimeout(agg, aggId) {
 
   /* helper to submit a single query (unchanged output) */
   async function sendQuery(idx, nonce, delayMs) {
-    if (delayMs) await pause(delayMs);
+  if (delayMs) await pause(delayMs);
 
-    /* dry-run */
-    try {
-      await agg.getFunction("requestAIEvaluationWithApproval").staticCall(
-        CIDS, ADDENDUM, ALPHA,
-        MAX_ORACLE_FEE, ESTIMATE_BASE_FEE, MAX_FEE_SCALING, JOB_CLASS
-      );
-    } catch (e) {
-      console.error(`[${idx}] dry-run revert → ${e.shortMessage || e}`);
-      return null;
-    }
-
-    /* on-chain tx */
-    const tx = await agg.requestAIEvaluationWithApproval(
+  // Dry-run to surface logic reverts early
+  try {
+    await agg.getFunction("requestAIEvaluationWithApproval").staticCall(
       CIDS, ADDENDUM, ALPHA,
-      MAX_ORACLE_FEE, ESTIMATE_BASE_FEE, MAX_FEE_SCALING, JOB_CLASS,
-      { nonce, gasLimit: GAS_LIMIT }
+      MAX_ORACLE_FEE, ESTIMATE_BASE_FEE, MAX_FEE_SCALING, JOB_CLASS
     );
-    console.log(`[${idx}] tx sent →`, tx.hash);
-    const rcpt = await tx.wait(1);
-
-    const ev = rcpt.logs
-      .map(l => { try { return agg.interface.parseLog(l); } catch { return null; } })
-      .find(l => l && l.name === "RequestAIEvaluation");
-
-    if (!ev) {
-      console.log(`[${idx}] RequestAIEvaluation event not found`);
-      return { aggId: null };
-    }
-    console.log(`[${idx}] aggId = ${ev.args.aggRequestId}`);
-    return { aggId: ev.args.aggRequestId };
+  } catch (e) {
+    console.error(`[${idx}] dry-run revert → ${e.shortMessage || e}`);
+    return null;
   }
+
+  // Gas estimate (+20% buffer), fallback to configured GAS_LIMIT
+  let gasLimit;
+  try {
+    const est = await agg.getFunction("requestAIEvaluationWithApproval").estimateGas(
+      CIDS, ADDENDUM, ALPHA,
+      MAX_ORACLE_FEE, ESTIMATE_BASE_FEE, MAX_FEE_SCALING, JOB_CLASS
+    );
+    gasLimit = (est * 120n) / 100n;
+  } catch {
+    gasLimit = BigInt(typeof GAS_LIMIT === "number" ? GAS_LIMIT : 3_000_000);
+  }
+
+  // Fee overrides (prefer EIP-1559)
+  let overrides = {};
+  try {
+    const fee = await signer.provider.getFeeData();
+    if (fee?.maxFeePerGas && fee?.maxPriorityFeePerGas) {
+      overrides = {
+        maxFeePerGas: fee.maxFeePerGas,
+        maxPriorityFeePerGas: fee.maxPriorityFeePerGas,
+      };
+    } else if (fee?.gasPrice) {
+      overrides = { gasPrice: fee.gasPrice };
+    }
+  } catch {
+    // ignore and send without explicit fee overrides
+  }
+
+  // Send transaction
+  const tx = await agg.requestAIEvaluationWithApproval(
+    CIDS, ADDENDUM, ALPHA,
+    MAX_ORACLE_FEE, ESTIMATE_BASE_FEE, MAX_FEE_SCALING, JOB_CLASS,
+    { nonce, gasLimit, ...overrides }
+  );
+  console.log(`[${idx}] tx sent →`, tx.hash);
+  const rcpt = await tx.wait(1);
+
+  // Extract RequestAIEvaluation event
+  const ev = rcpt.logs
+    .map(l => { try { return agg.interface.parseLog(l); } catch { return null; } })
+    .find(l => l && l.name === "RequestAIEvaluation");
+
+  if (!ev) {
+    console.log(`[${idx}] RequestAIEvaluation event not found`);
+    return { aggId: null };
+  }
+
+  console.log(`[${idx}] aggId = ${ev.args.aggRequestId}`);
+  return { aggId: ev.args.aggRequestId };
+}
 
   /* fire queries */
   const startNonce = await signer.getNonce();
