@@ -11,7 +11,7 @@
 
   Example (run with the secondary key):
 
-  USE_SECONDARY=1 HARDHAT_NETWORK=base_sepolia node scripts/withdraw-link-from-oracle.js \
+  HARDHAT_NETWORK=base_sepolia node scripts/withdraw-link-from-oracle.js \
     --operator 0x00A08b75178de0e0d7FF13Fdd4ef925AC3572503 \
     --deposit  0xFBDE840eb654E0f8B9F3e6c69C354B309A9ffE6b \
     --link     0xE4aB69C077896252FAFBD49EFD26B5D171A32410
