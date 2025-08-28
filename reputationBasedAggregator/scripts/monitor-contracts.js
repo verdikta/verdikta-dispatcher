@@ -47,7 +47,13 @@ function bytes32ToAscii(b32) {
       verdiktaAddr = t.address;
       verdiktaAbi  = t.abi;
     } catch {
-      verdiktaAddr = process.env.WRAPPED_VERDIKTA_TOKEN;
+      // Choose per-network env var, else generic fallback
+      const netName = hre.network.name; // e.g., "base" or "base_sepolia"
+      const envMap = {
+        base:         process.env.WRAPPED_VERDIKTA_TOKEN_BASE,
+        base_sepolia: process.env.WRAPPED_VERDIKTA_TOKEN_BASE_SEPOLIA,
+      };
+      verdiktaAddr = envMap[netName] || process.env.WRAPPED_VERDIKTA_TOKEN;
       if (!verdiktaAddr)
         throw new Error("Token not deployed and WRAPPED_VERDIKTA_TOKEN is missing");
       verdiktaAbi = [
