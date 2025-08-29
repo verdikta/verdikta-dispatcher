@@ -11,12 +11,12 @@ const pause  = ms => new Promise(r => setTimeout(r, ms));
 const AGGREGATOR          = "0x6a26f45D5BbFC3AEEd8De9bd2B8285b96554bC47";
 const LINK_TOKEN          = "0xE4aB69C077896252FAFBD49EFD26B5D171A32410";
 
-const NUM_QUERIES         = 15;
+const NUM_QUERIES         = 10;
 const BETWEEN_QUERY_DELAY = 200;         // ms between tx submissions
 const NUM_INCREMENTS      = 12;
 const INCREMENT_DURATION  = 30_000;      // ms between polling rounds
 
-const JOB_CLASS           = 1001;
+const JOB_CLASS           = 128;
 const MAX_ORACLE_FEE      = ethers.parseUnits("0.01", 18);
 const ESTIMATE_BASE_FEE   = ethers.parseUnits("0.000001", 18);
 const MAX_FEE_SCALING     = 5;
