@@ -41,10 +41,21 @@ module.exports = {
       gasPrice: 300_000_000, // increase this if needed
       accounts: ACCOUNTS,
     },
+    base: {
+      url: `https://base-mainnet.infura.io/v3/${process.env.INFURA_API_KEY}`,
+      // url: "https://mainnet.base.org",
+      httpAgent: keepAliveAgent,
+      httpsAgent: keepAliveAgent,
+      chainId: 8453,
+      accounts: ACCOUNTS,
+      // Optional: explicit EIP-1559 caps if you want to pin them
+      // maxFeePerGas:  "30_000_000_000",  // 30 gwei
+      // maxPriorityFeePerGas: "1_000_000_000", // 1 gwei
+    },
   },
 
   // Tell hardhat-deploy to *always* use ordinary CREATE (no CREATE2)
-  deterministicDeployment: false,          // <-- add this line
+  deterministicDeployment: false,  
 
   namedAccounts: {
     deployer: 0,
@@ -63,6 +74,14 @@ module.exports = {
         urls: {
           apiURL:     "https://api-sepolia.basescan.org/api",
           browserURL: "https://sepolia.basescan.org",
+        },
+      },
+      {
+        network:  "base",  
+        chainId:  8453,
+        urls: {
+          apiURL:     "https://api.basescan.org/api",
+          browserURL: "https://basescan.org",
         },
       },
     ],
