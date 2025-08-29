@@ -19,12 +19,22 @@ module.exports = async ({ deployments, getNamedAccounts, ethers, network }) => {
 
   const { deploy }   = deployments;
   const { deployer } = await getNamedAccounts();
-  const CONFIRMATIONS = network.name === "base_sepolia" ? 2 : 1;
+  const CONFIRMATIONS =
+    (network.name === "base_sepolia" || network.name === "base") ? 2 : 1;
+
 
   /* ----------------------------------------------------------------------- */
   /* Resolve token address                                                   */
   /* ----------------------------------------------------------------------- */
-  const TOKEN_ADDR = process.env.WRAPPED_VERDIKTA_TOKEN;
+  let TOKEN_ADDR;
+  if (network.name === "base") {
+    TOKEN_ADDR = process.env.WRAPPED_VERDIKTA_TOKEN_BASE;
+  } else if (network.name === "base_sepolia") {
+    TOKEN_ADDR = process.env.WRAPPED_VERDIKTA_TOKEN_BASE_SEPOLIA;
+  } else {
+    TOKEN_ADDR = process.env.WRAPPED_VERDIKTA_TOKEN;
+  }
+
   if (!ethers.isAddress(TOKEN_ADDR)) {
     throw new Error("WRAPPED_VERDIKTA_TOKEN not set or invalid in .env");
   }

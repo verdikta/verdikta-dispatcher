@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/deploy.sh  – Hardhat version (no token/mocks step)
+# deploy.sh  – Hardhat version (no token/mocks step)
 # ----------------------------------------------------------
 # Deploy sequence:
 #   1. ReputationKeeper
@@ -7,13 +7,19 @@
 #   3. Post-deployment config
 #
 # Run with:
-#   ./scripts/deploy.sh
+#   ./deploy.sh
 #   # or explicitly:
-#   NET=base_sepolia ./scripts/deploy.sh
+#   NET=base_sepolia ./deploy.sh
 # ----------------------------------------------------------
 
 set -euo pipefail
-NET=${NET:-base_sepolia}   # override by exporting NET=<network>
+
+# Load HARDHAT_NETWORK from .env if it exists
+if [ -f .env ]; then
+  set -a; source .env; set +a
+fi
+
+NET=${NET:-${HARDHAT_NETWORK:-base_sepolia}}
 
 echo "=== Verdikta Deployment Script (Hardhat) ==="
 echo "Deploying keeper + aggregator + config to ${NET}..."

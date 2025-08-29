@@ -18,6 +18,8 @@ module.exports = async ({ ethers, getNamedAccounts, deployments }) => {
   }
 
   const { deployer } = await getNamedAccounts();
+  const CONFIRMATIONS =
+    (network.name === "base_sepolia" || network.name === "base") ? 2 : 1;
 
   /* ----------------------------------------------------------------------- */
   /* Contracts                                                                */
@@ -48,7 +50,15 @@ if (keeper.target === aggregator.target) {
   );
 }
 
-  const TOKEN_ADDR = process.env.WRAPPED_VERDIKTA_TOKEN;
+  let TOKEN_ADDR;
+  if (network.name === "base") {
+    TOKEN_ADDR = process.env.WRAPPED_VERDIKTA_TOKEN_BASE;
+  } else if (network.name === "base_sepolia") {
+    TOKEN_ADDR = process.env.WRAPPED_VERDIKTA_TOKEN_BASE_SEPOLIA;
+  } else {
+    TOKEN_ADDR = process.env.WRAPPED_VERDIKTA_TOKEN;
+  }
+
   if (!ethers.isAddress(TOKEN_ADDR)) {
     throw new Error("WRAPPED_VERDIKTA_TOKEN env var missing or invalid");
   }
@@ -59,17 +69,17 @@ if (keeper.target === aggregator.target) {
   const currentToken = await keeper.verdiktaToken();
   if (currentToken.toLowerCase() !== TOKEN_ADDR.toLowerCase()) {
     console.log("Updating Verdikta token address in keeper…");
-    await (await keeper.setVerdiktaToken(TOKEN_ADDR)).wait();
+    await (await keeper.setVerdiktaToken(TOKEN_ADDR)).wait(CONFIRMATIONS);
   }
 
   /* ----------------------------------------------------------------------- */
   /* 2. Configure aggregator                                                 */
   /* ----------------------------------------------------------------------- */
   console.log("Configuring aggregator parameters…");
-  await (await aggregator.setConfig(6, 4, 3, 2, 300)).wait();
+  await (await aggregator.setConfig(6, 4, 3, 2, 300)).wait(CONFIRMATIONS);
 
   const maxFee = ethers.parseEther("0.05"); // In LINK as maximum fee increment.
-  await (await aggregator.setMaxOracleFee(maxFee)).wait();
+  await (await aggregator.setMaxOracleFee(maxFee)).wait(CONFIRMATIONS);
 
   console.log("Aggregator configured.");
 };

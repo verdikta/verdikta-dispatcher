@@ -16,7 +16,8 @@ module.exports = async ({ deployments, getNamedAccounts, network }) => {
 
   const { deploy }   = deployments;
   const { deployer } = await getNamedAccounts();
-  const CONFIRMATIONS = network.name === "base_sepolia" ? 2 : 1;
+  const isBaseFamily = /^base(_|$)/.test(network.name); // base, base_sepolia, base_goerli
+  const CONFIRMATIONS = isBaseFamily ? 2 : 1;
 
   // LINK token address lookup (per network)
   const LINK_TOKEN_ADDRESS = {
