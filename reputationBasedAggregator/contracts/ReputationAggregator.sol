@@ -847,8 +847,8 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         s[1] = "x";
         for (uint256 i; i < 32; ++i) {
             uint8 b = uint8(x[i]);
-            s[2*i + 2*i]     = _lowerHexChar(b >> 4);
-            s[2*i + 2*i + 1] = _lowerHexChar(b & 0x0f);
+            s[2 + 2*i]     = _lowerHexChar(b >> 4);
+            s[3 + 2*i] = _lowerHexChar(b & 0x0f);
         }
         return string(s);
     }
