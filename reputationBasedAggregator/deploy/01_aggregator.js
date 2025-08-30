@@ -21,7 +21,7 @@ module.exports = async ({ deployments, getNamedAccounts, network }) => {
 
   // LINK token address lookup (per network)
   const LINK_TOKEN_ADDRESS = {
-    base:          "0xd886e2286fd1073df82462ea1822119600af80b6",
+    base:          "0x88Fb150BDc53A65fe94Dea0c9BA0a6dAf8C6e196",
     base_goerli:   "0xd886e2286fd1073df82462ea1822119600af80b6",
     base_sepolia:  "0xE4aB69C077896252FAFBD49EFD26B5D171A32410",
     development:   "0x0000000000000000000000000000000000000000",
