@@ -4,14 +4,15 @@ require("dotenv").config();
 const hre    = require("hardhat");
 const { ethers } = hre;
 const pause  = ms => new Promise(r => setTimeout(r, ms));
+const IS_BASE = hre.network.name === "base";
 
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
    EDIT ONLY THESE CONSTANTS
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
-const AGGREGATOR          = "0x6a26f45D5BbFC3AEEd8De9bd2B8285b96554bC47";
-const LINK_TOKEN          = "0xE4aB69C077896252FAFBD49EFD26B5D171A32410";
+const AGGREGATOR          = IS_BASE? "0x2a4195bfCf6892b0e72fB7ca58f59702d11f3af1" : "0x6a26f45D5BbFC3AEEd8De9bd2B8285b96554bC47";
+const LINK_TOKEN          = IS_BASE? "0x88Fb150BDc53A65fe94Dea0c9BA0a6dAf8C6e196" : "0xE4aB69C077896252FAFBD49EFD26B5D171A32410";
 
-const NUM_QUERIES         = 10;
+const NUM_QUERIES         = 1;
 const BETWEEN_QUERY_DELAY = 200;         // ms between tx submissions
 const NUM_INCREMENTS      = 12;
 const INCREMENT_DURATION  = 30_000;      // ms between polling rounds
