@@ -46,7 +46,9 @@ const VDKA_STAKE = ethers.parseUnits("100", 18);   // 100 wVDKA
     try {
       vdkaInfo = await deployments.get("WrappedVerdiktaToken");
     } catch {
-      const addr = process.env.WRAPPED_VERDIKTA_TOKEN;
+      const addr = process.env[
+        hre.network.name === "base" ? "WRAPPED_VERDIKTA_TOKEN_BASE" : "WRAPPED_VERDIKTA_TOKEN_BASE_SEPOLIA"
+      ];
       if (!addr) throw new Error("WrappedVerdiktaToken not deployed and env var missing");
       vdkaInfo = {
         address: addr,
