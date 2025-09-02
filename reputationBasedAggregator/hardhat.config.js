@@ -66,6 +66,7 @@ module.exports = {
     apiKey: {
       sepolia:      process.env.ETHERSCAN_API_KEY,
       base_sepolia: process.env.BASESCAN_API_KEY,
+      base:         process.env.BASESCAN_API_KEY,
     },
     customChains: [
       {
@@ -88,5 +89,6 @@ module.exports = {
   },
 
   mocha: { timeout: 100_000 },
+  sourcify: {enabled: false},
 };
 
