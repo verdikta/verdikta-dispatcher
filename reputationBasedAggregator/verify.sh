@@ -1,24 +1,33 @@
+#!/usr/bin/env bash
+# verify.sh – Hardhat version
+
+set -euo pipefail
+set -a; source .env; set +a
+
 # Aggregator
 # npx hardhat verify --network base_sepolia \
 # 0xYourContractAddressHere \
 # 0xChainlinkAddressHere \
 # 0x0000000000000000000000000000000000000000
-
-if false; then
+if true; then
 echo "Running Aggregator verification..."
-npx hardhat verify --network base_sepolia \
-  0xC60f4532F104EDD422335a9103c8Ce7B2DF5Bc84 \
-  0xE4aB69C077896252FAFBD49EFD26B5D171A32410 \
-  0x0000000000000000000000000000000000000000
+npx hardhat verify --network "${HARDHAT_NETWORK:-base_sepolia}" \
+  --contract contracts/ReputationAggregator.sol:ReputationAggregator \
+  0xb10f6D7fD908311BfEa947881a835Df828f7bBE1 \
+  0x88Fb150BDc53A65fe94Dea0c9BA0a6dAf8C6e196 \
+  0x0000000000000000000000000000000000000000 \
+  || echo "Aggregator already verified (or verify failed); continuing"
 fi
 
 # Reputation Keeper
 # npx hardhat verify --network base_sepolia \
-#  0xYourReputationKeeperAddress \
-#  0xYourWrappedVerdiktaTokenAddress
+# 0xYourReputationKeeperAddress \
+# 0xYourWrappedVerdiktaTokenAddress
 if true; then
 echo "Running ReputationKeeper verification..."
-npx hardhat verify --network base_sepolia \
-  0x4B2e6728addc52968a1dCcAc79a7b70b9A661ccB \
-  0x94e3c031fe9403c80E14DaFbCb73f191C683c2B1
+npx hardhat verify --network "${HARDHAT_NETWORK:-base_sepolia}" \
+  --contract contracts/ReputationKeeper.sol:ReputationKeeper \
+  0xD3cA6b320c8d7AAdBc0fc759fe6A5800fbA445bd \
+  0x1EA68D018a11236E07D5647175DAA8ca1C3D0280 \
+  || echo "ReputationKeeper already verified (or verify failed); continuing"
 fi
