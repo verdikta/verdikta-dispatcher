@@ -7,6 +7,10 @@
 HARDHAT_NETWORK=base_sepolia \
 node scripts/monitor-contracts-cl.js \
   --aggregator 0xC60f4532F104EDD422335a9103c8Ce7B2DF5Bc84
+ 
+HARDHAT_NETWORK=base \
+node scripts/monitor-contracts-cl.js \
+  --aggregator 0xb10f6D7fD908311BfEa947881a835Df828f7bBE1
 */
 
 require("dotenv").config();
