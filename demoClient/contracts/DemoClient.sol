@@ -21,7 +21,7 @@ interface IReputationAggregator {
         uint64 jobClass
     ) external returns (bytes32);
     function getEvaluation(bytes32) 
-       external view returns (uint64[] memory, string memory, bool);
+       external view returns (uint256[] memory, string memory, bool);
     function isFailed(bytes32) external view returns (bool);
 }
 
@@ -63,7 +63,7 @@ contract DemoClient {
     }
 
     function publish() external {
-        (uint64[] memory s, string memory j, bool has) =
+        (uint256[] memory s, string memory j, bool has) =
             agg.getEvaluation(currentAggId);
         if (has) {
             emit Result(currentAggId, s, j);
