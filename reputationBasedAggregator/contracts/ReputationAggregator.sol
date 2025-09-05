@@ -309,10 +309,10 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         clusteredQualityScore = 60;      // quality score change when clustered
         selectedTimelinessScore = 0;     // timeliness score change when selected but not clustered
         selectedQualityScore = -60;      // quality score change when selected but not clustered
-        revealedTimelinessScore = -20;   // timeliness score change when revealed but not selected
-        revealedQualityScore = 0;        // quality score change when revealed but not selected
-        committedTimelinessScore = -20;  // timeliness score change when committed but not revealed
-        committedQualityScore = 0;       // quality score change when committed but not revealed
+        revealedTimelinessScore = -20;   // timeliness score change when chosen for reveal but not selected
+        revealedQualityScore = 0;        // quality score change when chosen for reveal but not selected
+        committedTimelinessScore = -20;  // timeliness score change when chosen for commit but not chosen for reveal
+        committedQualityScore = 0;       // quality score change when chosen for commit but not chosen for reveal
 
         responseTimeoutSeconds = 5 minutes;
         maxOracleFee = 0.1 * 10 ** 18;  // 0.1 LINK
@@ -1128,17 +1128,17 @@ function _ensureAggArrayExists(
             bool shouldPenalise;
 
             if (commitPhase) {
-                // commitHashPerSlot == 0  ⇒  oracle never committed
+                // commitHashPerSlot == 0 ->  oracle never committed
                 shouldPenalise = (agg.commitHashPerSlot[slot] == bytes16(0));
             } else {
-                // reveal phase ⇒ penalise only if no reveal received
+                // reveal phase -> penalise only if no reveal received
                 (bool responded, ) = _getResponseForSlot(agg.responses, slot);
                 shouldPenalise = !responded;
             }
 
             if (shouldPenalise) {
                 ReputationKeeper.OracleIdentity memory id = agg.polledOracles[slot];
-                try reputationKeeper.updateScores(id.oracle, id.jobId, int8(0), int8(-2)) { }
+                try reputationKeeper.updateScores(id.oracle, id.jobId, committedQualityScore, committedTimelinessScore) { }
                 catch { emit OracleScoreUpdateSkipped(id.oracle, id.jobId, "timeout penalty"); }
             }
         }
