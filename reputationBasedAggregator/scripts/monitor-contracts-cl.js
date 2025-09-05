@@ -10,7 +10,7 @@ node scripts/monitor-contracts-cl.js \
  
 HARDHAT_NETWORK=base \
 node scripts/monitor-contracts-cl.js \
-  --aggregator 0xb10f6D7fD908311BfEa947881a835Df828f7bBE1
+  --aggregator 0x2f7a02298D4478213057edA5e5bEB07F20c4c054
 */
 
 require("dotenv").config();
