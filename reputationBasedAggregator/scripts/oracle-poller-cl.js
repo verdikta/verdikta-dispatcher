@@ -10,6 +10,9 @@
 HARDHAT_NETWORK=base_sepolia node scripts/oracle-poller-cl.js \
   --aggregator 0x262f48f06DEf1FE49e0568dB4234a3478A191cFd
 
+HARDHAT_NETWORK=base node scripts/oracle-poller-cl.js \
+  --aggregator 0x2f7a02298D4478213057edA5e5bEB07F20c4c054
+
   Required flag:
     -a, --aggregator    ReputationAggregator contract address
 */
