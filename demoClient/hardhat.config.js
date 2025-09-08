@@ -16,8 +16,8 @@ module.exports = {
   solidity: {
     compilers: [
       {
-        version: "0.8.21",
-        settings: { optimizer: { enabled: true, runs: 200 } },
+        version: "0.8.30",
+        settings: { optimizer: { enabled: true, runs: 200 }, viaIR: true },
       },
     ],
   },
@@ -44,10 +44,24 @@ module.exports = {
       httpsAgent: keepAliveAgent,
       chainId: 84532,
       gas: 10_000_000,
-      gasPrice: 2_000_000_000,
+      gasPrice: 300_000_000,
       accounts: ACCOUNTS,
     },
+    base: {
+      url: `https://base-mainnet.infura.io/v3/${process.env.INFURA_API_KEY}`,
+      // url: "https://mainnet.base.org",
+      httpAgent: keepAliveAgent,
+      httpsAgent: keepAliveAgent,
+      chainId: 8453,
+      accounts: ACCOUNTS,
+      // Optional: explicit EIP-1559 caps if you want to pin them
+      // maxFeePerGas:  "30_000_000_000",  // 30 gwei
+      // maxPriorityFeePerGas: "1_000_000_000", // 1 gwei
+    },
   },
+
+  // Tell hardhat-deploy to *always* use ordinary CREATE (no CREATE2)
+  deterministicDeployment: false,
 
   // hardhat-deploy “named accounts”
   namedAccounts: {
@@ -59,6 +73,7 @@ module.exports = {
     apiKey: {
       sepolia:      process.env.ETHERSCAN_API_KEY,
       base_sepolia: process.env.BASESCAN_API_KEY,
+      base:         process.env.BASESCAN_API_KEY,
     },
     customChains: [
       {
@@ -69,9 +84,18 @@ module.exports = {
           browserURL: "https://sepolia.basescan.org",
         },
       },
+       {
+         network:  "base",
+         chainId:  8453,
+         urls: {
+           apiURL:     "https://api.basescan.org/api",
+           browserURL: "https://basescan.org",
+         },
+       },
     ],
   },
 
   mocha: { timeout: 100_000 },
+  sourcify: {enabled: false},
 };
 
