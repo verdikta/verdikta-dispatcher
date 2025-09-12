@@ -10,14 +10,14 @@ const IS_BASE = hre.network.name === "base";
    EDIT ONLY THESE CONSTANTS
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
 const AGGREGATOR = IS_BASE
-  ? "0xb10f6D7fD908311BfEa947881a835Df828f7bBE1"
+  ? "0x2f7a02298D4478213057edA5e5bEB07F20c4c054"
   : "0x6a26f45D5BbFC3AEEd8De9bd2B8285b96554bC47";
 
 const LINK_TOKEN = IS_BASE
   ? "0x88Fb150BDc53A65fe94Dea0c9BA0a6dAf8C6e196"
   : "0xE4aB69C077896252FAFBD49EFD26B5D171A32410";
 
-const NUM_QUERIES         = 2;
+const NUM_QUERIES         = 1;
 const BETWEEN_QUERY_DELAY = 200;         // ms between tx submissions
 const NUM_INCREMENTS      = 12;
 const INCREMENT_DURATION  = 30_000;      // ms between polling rounds
