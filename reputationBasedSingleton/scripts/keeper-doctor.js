@@ -3,25 +3,22 @@
 //
 // Usage (recommended):
 //   HARDHAT_NETWORK=base_sepolia node scripts/keeper-doctor.js \
-//     --singleton 0xf1aE90D897982D43C47Ca6b46e6c71209bC2a91a \
-//     --class 128 \
-//     --owner 0xYourBrowserEOA \
-//     --cid QmSHXfBcrfFf4pnuRYCbHA8rjKkDh1wjqas3Rpk3a2uAWH \
-//     --alpha 500 --maxFee 0.01 --base 0.0001 --scale 10
-//
-//   With auto-approval of LINK allowance (0.5 LINK by default):
-//   HARDHAT_NETWORK=base_sepolia node scripts/keeper-doctor.js \
 //     --singleton 0x92fDBEe3be721De0aC065F1E7Ed5E8E251CF9AcC \
 //     --class 128 \
-//     --owner 0xFBDE840eb654E0f8B9F3e6c69C354B309A9ffE6b \
+//     --owner 0xYourBrowserEOA \
+//     --cid QmSHXfBcrfFf4pnuRYCbHA8rjKkDh1wjqas3Rpk3a2uAWH \\
+/**     */ //     --alpha 500 --maxFee 0.01 --base 0.0001 --scale 10
+//
+//   With allowance commit (approve) of 0.5 LINK:
+//   HARDHAT_NETWORK=base_sepolia node scripts/keeper-doctor.js \
+//     --singleton 0x92fDBEe3be721De0aC065F1E7Ed5E8E251CF9AcC \
+//     --class 128 --owner 0xFBDE840eb654E0f8B9F3e6c69C354B309A9ffE6b \
 //     --cid QmSHXfBcrfFf4pnuRYCbHA8rjKkDh1wjqas3Rpk3a2uAWH \
 //     --alpha 500 --maxFee 0.01 --base 0.0001 --scale 10 \
 //     --approve --approveAmount 0.5
 //
 // Notes:
-// - By default this script is read-only. If you pass --approve, it will send a real ERC-20
-//   approval transaction from --owner to the singleton for --approveAmount LINK.
-// - To send that tx, the configured signer MUST control --owner.
+// - Read-only unless you pass --approve (then it sends an ERC‑20 approve tx from --owner).
 
 const hre = require("hardhat");
 const { ethers, deployments } = hre;
@@ -163,7 +160,7 @@ async function main() {
   console.log("Keeper from singleton:", keeperAddr);
   console.log("LINK from singleton  :", linkAddr);
 
-  // Code presence checks
+  // Presence checks
   const codeKeeper = await provider.getCode(keeperAddr);
   if (codeKeeper === "0x") throw new Error("No code at keeper address.");
   const codeLink = await provider.getCode(linkAddr);
@@ -188,10 +185,19 @@ async function main() {
   } else {
     console.log("RK view function not found (isContractApproved/approved*). Will rely on write-probe.");
   }
-  // Legacy ABI-aware approval check (if artifact exposes it)
   try {
     const legacy = await tryReadApprovalFlag(keeper, singletonAddr);
     if (legacy !== null) console.log("RK approval via artifact ABI:", legacy);
+  } catch {}
+
+  // Basic parameter validation against singleton limits
+  try {
+    if (argv.cid) {
+      const cidLen = String(argv.cid).length;
+      if (cidLen > 100) console.warn(`WARNING: CID length ${cidLen} exceeds MAX_CID_LENGTH (100).`);
+    }
+    const addendumLen = (argv.addendum || "").length;
+    if (addendumLen > 1000) console.warn(`WARNING: addendum length ${addendumLen} exceeds MAX_ADDENDUM_LENGTH (1000).`);
   } catch {}
 
   // Build selection params
@@ -214,6 +220,13 @@ async function main() {
   let gateEmpty = true;
 
   let firstCandidate = null;
+  let oracleAddr, jobId;
+  let oracleFee = 0n;
+
+  // PASS/FAIL bookkeeping
+  let passReasons = [];
+  let failReasons = [];
+
   try {
     const data = keeper.interface.encodeFunctionData(
       "selectOracles", [count, alpha, maxFee, estBase, scale, klass]
@@ -222,10 +235,11 @@ async function main() {
     selectedDecoded = keeper.interface.decodeFunctionResult("selectOracles", ret);
     const cands = Array.isArray(selectedDecoded[0]) ? selectedDecoded[0] : selectedDecoded;
     console.log(`selectOracles OK. Selected: ${cands.length}`);
+    if (cands.length === 0) failReasons.push("No candidate oracles returned.");
     if (cands.length > 0) {
       firstCandidate = cands[0];
-      const oracleAddr = firstCandidate.oracle ?? firstCandidate.operator ?? firstCandidate[0];
-      const jobId      = firstCandidate.jobId  ?? firstCandidate[1];
+      oracleAddr = firstCandidate.oracle ?? firstCandidate.operator ?? firstCandidate[0];
+      jobId      = firstCandidate.jobId  ?? firstCandidate[1];
 
       const jobAscii = bytes32ToAsciiMaybe(jobId);
       console.log("First candidate tuple:", {
@@ -233,51 +247,91 @@ async function main() {
         ...(jobAscii ? { jobId_ascii: jobAscii } : {})
       });
 
-      // ---- PROBE: recordUsedOracles(chosen) AS THE SINGLETON (keeper ABI + full array) ----
+      // ---- PROBE: recordUsedOracles(chosen) using keeper ABI + full array ----
       try {
-        const full = Array.isArray(selectedDecoded[0]) ? selectedDecoded[0] : selectedDecoded;
-        const dataRUO = keeper.interface.encodeFunctionData("recordUsedOracles", [full]);
+        const dataRUO = keeper.interface.encodeFunctionData("recordUsedOracles", [cands]);
         await provider.call({ to: keeperAddr, data: dataRUO, from: singletonAddr });
         console.log("recordUsedOracles (as singleton): WOULD SUCCEED");
+        passReasons.push("Keeper accepts recordUsedOracles from singleton.");
       } catch (e) {
         recordWouldRevert = true;
-        console.log("recordUsedOracles (as singleton): WOULD REVERT →", e.shortMessage || e.reason || e.message || String(e));
-      }
-
-      // ---- PROBE: transferAndCall(link -> operator) path (shape only) ----
-      try {
-        const LINK_ABI = [
-          "function transferAndCall(address to, uint256 value, bytes data) returns (bool)",
-          "function balanceOf(address) view returns (uint256)"
-        ];
-        const linkRW = await ethers.getContractAt(LINK_ABI, linkAddr, signer);
-
-        const dataVersion = 1;         // Operator v1 path
-        const fakeNonce   = 777n;      // arbitrary (read-only)
-        const callbackSel = singleton.interface.getFunction("fulfill").selector;
-        const fakeCbor    = ethers.getBytes("0x01"); // minimal non-empty bytes
-
-        const opReq = ethers.AbiCoder.defaultAbiCoder().encode(
-          ["bytes32","address","bytes4","uint256","uint256","bytes"],
-          [jobId, singletonAddr, callbackSel, fakeNonce, dataVersion, fakeCbor]
-        );
-
-        const feeWei = (await keeper.getOracleInfo(oracleAddr, jobId))[5]; // oracle fee
-        const enc = linkRW.interface.encodeFunctionData("transferAndCall", [oracleAddr, feeWei, opReq]);
-
-        const tret = await provider.call({ to: linkAddr, data: enc, from: singletonAddr });
-        const ok   = linkRW.interface.decodeFunctionResult("transferAndCall", tret)[0];
-        console.log("transferAndCall(link→operator) would succeed?", ok ? "YES" : "NO");
-      } catch (e) {
         const msg = e.shortMessage || e.reason || e.message || String(e);
-        console.log("transferAndCall(link→operator) would REVERT →", msg);
-        if (/transfer amount exceeds balance/i.test(msg)) {
-          console.log("NOTE: This is expected in the probe if the singleton hasn’t been funded yet. " +
-                      "In real flow, the contract first pulls LINK via transferFrom(owner→singleton).");
-        }
+        console.log("recordUsedOracles (as singleton): WOULD REVERT →", msg);
+        failReasons.push("Keeper rejected recordUsedOracles in write-probe.");
       }
 
-      // --- LINK balance, decimals, symbol ---
+      // --- Operator LINK + gating ---
+      const OP_ABI = [
+        "function isReputationKeeperListEmpty() view returns (bool)",
+        "function getReputationKeepers() view returns (address[])",
+        "function getChainlinkToken() view returns (address)",
+        "function getAuthorizedSenders() view returns (address[])"
+      ];
+      let opLinkKnown = false;
+      let opLinkAddr  = null;
+      try {
+        const op = await ethers.getContractAt(OP_ABI, oracleAddr, signer);
+        gateEmpty = await op.isReputationKeeperListEmpty();
+        console.log("Operator gate enabled? ", gateEmpty ? "NO (accept all)" : "YES (RK‑gated)");
+        try {
+          opLinkAddr = await op.getChainlinkToken();
+          opLinkKnown = true;
+          console.log("Operator LINK:", opLinkAddr);
+          if (opLinkAddr.toLowerCase() !== linkAddr.toLowerCase()) {
+            console.warn("WARNING: Operator LINK differs from Singleton LINK. Requests will revert on transferAndCall.");
+            failReasons.push("Operator LINK != Singleton LINK");
+          } else {
+            passReasons.push("Operator LINK matches Singleton LINK.");
+          }
+        } catch { /* ok */ }
+        if (!gateEmpty) {
+          try {
+            const rks = await op.getReputationKeepers();
+            console.log("Operator RK list:", rks);
+          } catch {
+            console.log("Operator getReputationKeepers() not available.");
+          }
+        }
+        try {
+          const senders = await op.getAuthorizedSenders();
+          console.log("Operator authorized fulfillers:", senders);
+        } catch {
+          console.log("Operator getAuthorizedSenders() not available.");
+        }
+      } catch (e) {
+        console.log("Operator gating probe failed:", e.message || String(e));
+      }
+
+      // ERC‑165 check for ArbiterOperator interface (optional but informative)
+      try {
+        const ERC165 = await ethers.getContractAt(
+          ["function supportsInterface(bytes4) view returns (bool)"],
+          oracleAddr
+        );
+        const isArbiter = await ERC165.supportsInterface("0xd9f812f9"); // IArbiterOperator
+        console.log("Operator supports IArbiterOperator?", isArbiter ? "YES" : "NO");
+      } catch { /* ignore */ }
+
+      // --- Oracle fee, caps, allowance math ---
+      try {
+        const info = await keeper.getOracleInfo(oracleAddr, jobId);
+        const active  = info[0];
+        const jobId2  = info[4];
+        oracleFee     = info[5];
+        const ascii2  = bytes32ToAsciiMaybe(jobId2);
+        console.log("Oracle info:", { active, jobId: jobId2, feeWei: oracleFee.toString(), feeLINK: fmt(oracleFee, 18), ...(ascii2 ? { jobId_ascii: ascii2 } : {}) });
+
+        if (oracleFee > maxFee) {
+          console.warn(`WARNING: Selected oracle fee (${fmt(oracleFee, 18)} LINK) exceeds your --maxFee (${argv.maxFee} LINK). This selection would fail.`);
+          failReasons.push("Selected oracle fee > --maxFee");
+        } else {
+          passReasons.push("Selected oracle fee ≤ --maxFee.");
+        }
+      } catch (e) {
+        console.log("getOracleInfo failed:", e.message || String(e));
+      }
+
+      // --- LINK balance / allowance / needs ---
       const linkPlus = await ethers.getContractAt(ERC20_PLUS_ABI, linkAddr, signer);
       const [sym, dec] = await Promise.all([
         linkPlus.symbol().catch(() => "LINK"),
@@ -286,23 +340,29 @@ async function main() {
       const balOwner = await linkPlus.balanceOf(ownerEOA).catch(() => 0n);
       console.log(`Owner LINK balance: ${ethers.formatUnits(balOwner, dec)} ${sym}`);
 
-      // Allowance & needs
-      const info = await keeper.getOracleInfo(oracleAddr, jobId);
-      const oracleFee = info[5];
       const needNow   = oracleFee;        // base pull at request time
       const needTotal = oracleFee * 2n;   // base + bonus at fulfill
-
       const allowanceWei = await linkPlus.allowance(ownerEOA, singletonAddr);
       console.log(`Allowance to singleton: ${fmt(allowanceWei, dec)} ${sym} (${allowanceWei.toString()} wei)`);
       console.log("Oracle fee (wei):", oracleFee.toString(),
                   "needNow:", needNow.toString(), "needTotal:", needTotal.toString());
 
+      // Show recommended allowance via singleton.maxTotalFee(--maxFee)
+      try {
+        const cap = await singleton.maxTotalFee(maxFee);
+        console.log(`Recommended allowance (maxTotalFee(--maxFee)): ${fmt(cap, 18)} LINK`);
+      } catch {}
+
       if (allowanceWei < needNow) {
         console.warn("WARNING: allowance < base fee. Entry call will revert: LINK pull failed.");
-      } else if (allowanceWei < needTotal) {
-        console.warn("NOTE: allowance < 2x fee. Entry call will succeed but bonus transfer at fulfill will later revert.");
+        failReasons.push("Allowance < base fee (needNow)");
       } else {
-        console.log("Allowance is sufficient for both base and bonus.");
+        passReasons.push("Allowance ≥ base fee.");
+        if (allowanceWei < needTotal) {
+          console.warn("NOTE: allowance < 2x fee. Entry call will succeed but bonus transfer at fulfill will later revert.");
+        } else {
+          console.log("Allowance is sufficient for both base and bonus.");
+        }
       }
 
       // ---- OPTIONAL: Send approval if requested ----
@@ -323,60 +383,90 @@ async function main() {
             const post = await linkPlus.allowance(ownerEOA, singletonAddr);
             console.log(`New allowance: ${fmt(post, dec)} ${sym}`);
             if (post < needNow) {
-              console.warn("Allowance still < base fee; increase --approveAmount or use --maxFee smaller.");
+              console.warn("Allowance still < base fee; increase --approveAmount or use smaller --maxFee.");
+              failReasons.push("Post-approve allowance still < base fee");
             }
           }
         }
       }
 
-      // Operator gating + RK list
-      const OP_ABI = [
-        "function isReputationKeeperListEmpty() view returns (bool)",
-        "function getReputationKeepers() view returns (address[])",
-        "function getChainlinkToken() view returns (address)"
-      ];
+      // ---- PROBE A: transferAndCall path (shape-only; expected to fail if unfunded) ----
       try {
-        const op = await ethers.getContractAt(OP_ABI, oracleAddr);
-        gateEmpty = await op.isReputationKeeperListEmpty();
-        console.log("Operator gate enabled? ", gateEmpty ? "NO (accept all)" : "YES (RK‑gated)");
-        try {
-          const opLink = await op.getChainlinkToken();
-          console.log("Operator LINK:", opLink);
-          if (opLink.toLowerCase() !== linkAddr.toLowerCase()) {
-            console.warn("WARNING: Operator LINK differs from Singleton LINK. Requests will revert on transferAndCall.");
-          }
-        } catch { /* older operator: no getter; ok */ }
-        if (!gateEmpty) {
-          try {
-            const rks = await op.getReputationKeepers();
-            console.log("Operator RK list:", rks);
-          } catch {
-            console.log("Operator getReputationKeepers() not available.");
-          }
-        }
+        const LINK_ABI = [
+          "function transferAndCall(address to, uint256 value, bytes data) returns (bool)",
+          "function balanceOf(address) view returns (uint256)"
+        ];
+        const linkRW = await ethers.getContractAt(LINK_ABI, linkAddr, signer);
+        const dataVersion = 1;
+        const fakeNonce   = 777n;
+        const callbackSel = singleton.interface.getFunction("fulfill").selector;
+        const fakeCbor    = ethers.getBytes("0x01");
+
+        // IMPORTANT: encode operatorRequest (function selector + args)
+        const OP_IFACE = new ethers.Interface([
+          "function operatorRequest(bytes32,address,bytes4,uint256,uint256,bytes)"
+        ]);
+        const opReq = OP_IFACE.encodeFunctionData(
+          "operatorRequest",
+          [jobId, singletonAddr, callbackSel, fakeNonce, dataVersion, fakeCbor]
+        );
+
+        const enc = linkRW.interface.encodeFunctionData("transferAndCall", [oracleAddr, oracleFee, opReq]);
+        const tret = await provider.call({ to: linkAddr, data: enc, from: singletonAddr });
+        const ok   = linkRW.interface.decodeFunctionResult("transferAndCall", tret)[0];
+        console.log("transferAndCall(link→operator) would succeed?", ok ? "YES" : "NO");
       } catch (e) {
-        console.log("Operator gating probe failed:", e.message || String(e));
+        const msg = e.shortMessage || e.reason || e.message || String(e);
+        console.log("transferAndCall(link→operator) would REVERT →", msg);
+        if (/transfer amount exceeds balance/i.test(msg)) {
+          console.log("NOTE: This is expected in this *isolated* probe because the singleton has not been funded yet.");
+          console.log("NOTE: In the real call, the contract first pulls LINK via transferFrom(owner→singleton), then calls transferAndCall.");
+        }
       }
 
-      // Fetch oracle info again, print human fee
+      // ---- PROBE B: operator.onTokenTransfer *as LINK token* (best revert reason) ----
       try {
-        const info2 = await keeper.getOracleInfo(oracleAddr, jobId);
-        const active  = info2[0];
-        const jobId2  = info2[4];
-        const feeWei  = info2[5];
-        const ascii2  = bytes32ToAsciiMaybe(jobId2);
-        console.log("Oracle info:", { active, jobId: jobId2, feeWei: feeWei.toString(), feeLINK: fmt(feeWei, 18), ...(ascii2 ? { jobId_ascii: ascii2 } : {}) });
+        const OP_OT_ABI = [ "function onTokenTransfer(address,uint256,bytes) external" ];
+        const opOT      = await ethers.getContractAt(OP_OT_ABI, oracleAddr, signer);
+        const dataVersion = 1;
+        const fakeNonce   = 888n;
+        const callbackSel = singleton.interface.getFunction("fulfill").selector;
+        const fakeCbor    = ethers.getBytes("0x01");
+
+        // IMPORTANT: operatorRequest selector must be present inside 'data'
+        const OP_IFACE2 = new ethers.Interface([
+          "function operatorRequest(bytes32,address,bytes4,uint256,uint256,bytes)"
+        ]);
+        const opReq2 = OP_IFACE2.encodeFunctionData(
+          "operatorRequest",
+          [jobId, singletonAddr, callbackSel, fakeNonce, dataVersion, fakeCbor]
+        );
+
+        const callData = opOT.interface.encodeFunctionData(
+          "onTokenTransfer",
+          [singletonAddr, oracleFee, opReq2]
+        );
+        await provider.call({ to: oracleAddr, data: callData, from: linkAddr }); // simulate LINK calling operator
+        console.log("operator.onTokenTransfer(...) would SUCCEED (simulated as LINK).");
+        passReasons.push("Operator accepts operatorRequest payload via onTokenTransfer.");
       } catch (e) {
-        console.log("getOracleInfo failed:", e.message || String(e));
+        const msg = e.shortMessage || e.reason || e.message || String(e);
+        console.log("operator.onTokenTransfer(...) would REVERT →", msg);
+        if (/whitelisted functions/i.test(msg)) {
+          console.log("NOTE: This usually happens if the payload is missing the operatorRequest selector.");
+          console.log("NOTE: The probe encodes operatorRequest correctly; if you see this, check Operator build.");
+        }
+        failReasons.push("Operator rejected onTokenTransfer probe.");
       }
     }
   } catch (e) {
     const msg = e?.shortMessage || e?.reason || e?.message || String(e);
     console.error("selectOracles (as singleton) reverted:", msg);
     console.error("This usually means: not approved, wrong class, or all filtered out.");
+    failReasons.push("selectOracles reverted.");
   }
 
-  // Optional dry-run of entry call
+  // Optional dry-run & gas estimate of the entry call
   if (argv.cid) {
     console.log("Dry-running requestAIEvaluationWithApproval via eth_call (from owner EOA)...");
     const cidArray = [argv.cid];
@@ -388,10 +478,27 @@ async function main() {
       );
       await provider.call({ to: singletonAddr, data: calldata, from: ownerEOA });
       console.log("Dry-run OK: request would succeed with current params and allowance.");
+      passReasons.push("Entry-call dry-run succeeded.");
     } catch (e) {
       const msg = e.shortMessage || e.reason || e.message || String(e);
       console.error("Dry-run revert:", msg);
-      console.error("Common causes: LINK pull failed (low allowance), RK gating (recordUsedOracles), no eligible oracles, CID/addendum limits, or keeper not set.");
+      console.error("Common causes: LINK pull failed (low allowance), Operator rejection, no eligible oracles, CID/addendum limits, or keeper not set.");
+      console.error("NOTE: If all other probes above are green, an eth_call revert can still occur depending on RPC simulation of token transfers.");
+      failReasons.push("Entry-call dry-run reverted.");
+    }
+
+    // Gas estimate (often yields a better revert reason than eth_call)
+    try {
+      const writeAsOwner = await ethers.getContractAt("ReputationSingleton", singletonAddr, await ethers.getSigner(ownerEOA).catch(() => signer));
+      const est = await writeAsOwner.requestAIEvaluationWithApproval.estimateGas(
+        cidArray, addendum, alpha, maxFee, estBase, scale, BigInt(klass)
+      );
+      console.log("estimateGas:", est.toString());
+      passReasons.push("estimateGas succeeded.");
+    } catch (e) {
+      console.log("estimateGas failed:", e.shortMessage || e.reason || e.message || String(e));
+      console.log("NOTE: estimateGas can fail for harmless reasons if underlying tokens/Operator revert in simulation.");
+      // Not marking as failure on its own.
     }
   } else {
     console.log("Tip: pass --cid <yourCID> to dry-run the full request from your EOA.");
@@ -399,10 +506,59 @@ async function main() {
 
   // ---- SUMMARY ----
   console.log("---- SUMMARY ----");
+  const rkApproved = approvalView.known ? approvalView.value : (recordWouldRevert === false);
   console.log(`RK approval view: ${approvalView.known ? (approvalView.value ? "APPROVED" : "NOT approved") : "unknown (no view fn)"}`);
   console.log(`recordUsedOracles write-probe: ${selectedDecoded ? (recordWouldRevert ? "WOULD REVERT (RK likely blocking)" : "WOULD SUCCEED") : "n/a (no candidates)"}`);
   console.log(`Operator gate: ${gateEmpty ? "ACCEPT-ALL" : "RK-GATED"}`);
   console.log("If NOT approved: fix in deploy step by ensuring RK.approveContract(singleton) is called by the RK owner.");
+
+  // PASS/FAIL decision:
+  // We require: RK approved, at least one candidate, recordUsedOracles succeeds, oracleFee ≤ maxFee,
+  // allowance ≥ base fee, and (if known) Operator LINK matches Singleton LINK.
+  let haveCandidate = false;
+  try {
+    const cands = Array.isArray(selectedDecoded?.[0]) ? selectedDecoded[0] : (selectedDecoded || []);
+    haveCandidate = cands.length > 0;
+  } catch {}
+  const recordOK = haveCandidate && !recordWouldRevert;
+  const feeCapOK = oracleFee > 0n ? (oracleFee <= maxFee) : true;
+
+  // Allowance check only if we computed needs:
+  let allowBaseOK = true;
+  try {
+    const linkPlus = await ethers.getContractAt(ERC20_PLUS_ABI, linkAddr, signer);
+    const allowanceWei = await linkPlus.allowance(ownerEOA, singletonAddr);
+    allowBaseOK = oracleFee === 0n ? true : (allowanceWei >= oracleFee);
+  } catch {}
+
+  // Operator LINK match status (if detectable)
+  let linkMatchOK = true;
+  try {
+    const opIface = new ethers.Interface(["function getChainlinkToken() view returns (address)"]);
+    const data = opIface.encodeFunctionData("getChainlinkToken", []);
+    const ret  = await provider.call({ to: oracleAddr, data });
+    if (ret && ret !== "0x") {
+      const [opLink] = opIface.decodeFunctionResult("getChainlinkToken", ret);
+      linkMatchOK = opLink.toLowerCase() === linkAddr.toLowerCase();
+    }
+  } catch {}
+
+  const overallPass = rkApproved && haveCandidate && recordOK && feeCapOK && allowBaseOK && linkMatchOK;
+
+  if (overallPass) {
+    console.log("OVERALL: PASS");
+  } else {
+    console.log("OVERALL: FAIL");
+    const why = [];
+    if (!rkApproved)    why.push("RK not approved for singleton (or unknown and write-probe failed).");
+    if (!haveCandidate) why.push("No oracle candidates returned by selectOracles.");
+    if (!recordOK)      why.push("recordUsedOracles would revert.");
+    if (!feeCapOK)      why.push("Selected oracle fee exceeds --maxFee.");
+    if (!allowBaseOK)   why.push("Allowance < base oracle fee.");
+    if (!linkMatchOK)   why.push("Operator LINK != Singleton LINK.");
+    if (why.length) console.log("Reasons:", "- " + why.join("\n- "));
+  }
+
   console.log("Diagnostics complete.");
 }
 
