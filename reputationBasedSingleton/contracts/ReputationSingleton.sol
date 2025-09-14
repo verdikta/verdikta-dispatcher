@@ -270,7 +270,7 @@ contract ReputationSingleton is ChainlinkClient, Ownable, ReentrancyGuard {
         /* pay bonus = fee from requester to oracle */
         LinkTokenInterface link=LinkTokenInterface(_chainlinkTokenAddress());
         require(link.transferFrom(m.requester,m.oracle,m.feeUsed),"bonus xferFrom failed");
-        emit BonusPaid(requestId,m.oracle,maxOracleFee);
+        emit BonusPaid(requestId,m.oracle,m.feeUsed);
 
         emit EvaluationFulfilled(requestId,likelihoods,justificationCID);
     }
