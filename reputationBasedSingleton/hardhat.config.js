@@ -44,7 +44,7 @@ module.exports = {
       httpsAgent: keepAliveAgent,
       chainId: 84532,
       gas: 10_000_000,
-      gasPrice: 1_000_000_000,
+      gasPrice: 800_000_000,
       accounts: ACCOUNTS,
     },
   },
