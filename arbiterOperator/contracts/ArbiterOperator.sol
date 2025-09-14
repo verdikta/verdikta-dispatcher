@@ -175,6 +175,14 @@ contract ArbiterOperator is OperatorMod, ERC165, IArbiterOperator {
     }
 
     /**
+     * @notice  Get full ReputationKeeper list
+     * @return Registered ReputationKeeper list
+     */
+    function getReputationKeepers() external view returns (address[] memory) {
+        return rkList;
+    }
+
+    /**
      * @notice Check if the ReputationKeeper allow-list is empty
      * @dev When empty, access control is disabled and all requests are allowed
      * @return bool True if no ReputationKeepers are registered
