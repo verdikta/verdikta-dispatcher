@@ -229,9 +229,9 @@ contract ReputationSingleton is ChainlinkClient, Ownable, ReentrancyGuard {
 
         /* 4. send request */
         Chainlink.Request memory req =
-            _buildOperatorRequest(chosen[0].jobId,this.fulfill.selector);
+            _buildChainlinkRequest(chosen[0].jobId, address(this), this.fulfill.selector);
         req._add("cid",payload);
-        bytes32 reqId = _sendOperatorRequestTo(chosen[0].oracle,req,oracleFee);
+        bytes32 reqId = _sendChainlinkRequestTo(chosen[0].oracle,req,oracleFee);
 
         /* 5. record meta */
         _reqMeta[reqId]=ReqMeta({
