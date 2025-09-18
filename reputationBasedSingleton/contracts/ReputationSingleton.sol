@@ -223,14 +223,16 @@ contract ReputationSingleton is ChainlinkClient, Ownable, ReentrancyGuard {
         ( /*active*/, , , , , uint256 oracleFee, , , ) =
               reputationKeeper.getOracleInfo(chosen[0].oracle, chosen[0].jobId);
 
-        /* 3. pull base fee */
-        require(LinkTokenInterface(_chainlinkTokenAddress())
-                .transferFrom(msg.sender,address(this),oracleFee),"LINK pull failed");
+        /* 3. pull base fee plux 1x base fee for bonus */
+        LinkTokenInterface link = LinkTokenInterface(_chainlinkTokenAddress());
+        require(link.transferFrom(msg.sender, address(this), oracleFee * 2), "LINK pull failed");
 
         /* 4. send request */
         Chainlink.Request memory req =
             _buildChainlinkRequest(chosen[0].jobId, address(this), this.fulfill.selector);
         req._add("cid",payload);
+        // placeholder for aggId for Singleton (that does not aggregate)
+        req._add("aggId", "0x0000000000000000000000000000000000000000000000000000000000000000");
         bytes32 reqId = _sendChainlinkRequestTo(chosen[0].oracle,req,oracleFee);
 
         /* 5. record meta */
@@ -268,8 +270,9 @@ contract ReputationSingleton is ChainlinkClient, Ownable, ReentrancyGuard {
         justificationByRequest[requestId]=justificationCID;
 
         /* pay bonus = fee from requester to oracle */
-        LinkTokenInterface link=LinkTokenInterface(_chainlinkTokenAddress());
-        require(link.transferFrom(m.requester,m.oracle,m.feeUsed),"bonus xferFrom failed");
+        LinkTokenInterface link = LinkTokenInterface(_chainlinkTokenAddress());
+        require(link.transfer(m.oracle, m.feeUsed), "bonus transfer failed");
+
         emit BonusPaid(requestId,m.oracle,m.feeUsed);
 
         emit EvaluationFulfilled(requestId,likelihoods,justificationCID);
