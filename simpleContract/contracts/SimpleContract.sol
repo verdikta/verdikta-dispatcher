@@ -147,6 +147,7 @@ contract SimpleContract is ChainlinkClient {
         Chainlink.Request memory req =
             _buildChainlinkRequest(jobId, address(this), this.fulfill.selector);
         req._add("cid", cidStr);
+        req._add("aggId", "0x0000000000000000000000000000000000000000000000000000000000000000");
 
         requestId = _sendChainlinkRequest(req, fee);
 
