@@ -1,15 +1,19 @@
 #!/usr/bin/env node
 /*
+Enhanced version that can auto-discover expected addresses
+
 HARDHAT_NETWORK=base_sepolia \
 node scripts/reveal-forensics.js \
   --aggregator 0x6a26f45D5BbFC3AEEd8De9bd2B8285b96554bC47 \
   --aggid      0x064e3289be2ffdda5257a7df59aab4b7e417bdb4f047d8ba0b3050091fd20857 \
-  --fromaddrs  0x21ADE4d3baE4dF7df710b3B37F319C02f6775060,0x7D1F2ed1d49f2711B301982dF121dd0F4E587759,0xA2944d1Dd73DB724d9bA31a80Ea240B5dF922498,0xF02E746A8f40EAAf7dCB0a3a9B31B0ba23e0387c,0xe9ECd1aE744eD9d1d63E7e0034ffCbd7f3B0a877
+  --auto-discover
+
 HARDHAT_NETWORK=base \
 node scripts/reveal-forensics.js \
-  --aggregator 0xb10f6D7fD908311BfEa947881a835Df828f7bBE1 \
-  --aggid      0x7216c948c667983f02293bcbd9de6367dd171d88723ee9113fc6f5fefda31938 \
-  --fromaddrs  0x71f0fD06F46beaA161e231416Cfa2f1e1f7a040a
+  --aggregator 0x2f7a02298D4478213057edA5e5bEB07F20c4c054 \
+  --aggid      0x56fcb9c02f8cd5b682c6cc50d2f64d3e7330f939c4c7ae30686dba69f1eb9050 \
+  --auto-discover
+
 */
 
 require("dotenv").config();
@@ -63,6 +67,7 @@ function decodeRevertData(dataHex) {
     .option("aggregator", { type: "string", demandOption: true })
     .option("aggid",      { type: "string", demandOption: true })
     .option("fromaddrs",  { type: "string", default: "" })
+    .option("auto-discover", { type: "boolean", default: false, description: "Automatically discover expected addresses from oracle operators" })
     .option("lookahead",  { type: "number", default: 1500 })
     .strict().argv;
 
@@ -74,10 +79,40 @@ function decodeRevertData(dataHex) {
   const AGG_ADDR_LC = lc(AGG_ADDR);
   const aggId       = normalizeAggId(argv.aggid);
 
-  const EXPECTED = (argv.fromaddrs || "")
-    .split(",").map(s => s.trim()).filter(Boolean)
-    .map(ethers.getAddress);
-  const EXPECTED_LC = new Set(EXPECTED.map(lc));
+  // Auto-discover expected addresses or use provided ones
+  let EXPECTED = [];
+  let EXPECTED_LC = new Set();
+  
+  if (argv.autoDiscover) {
+    console.log("Auto-discovering expected addresses from oracle operators...");
+    
+    const latest = await provider.getBlockNumber();
+    const fromBlock = Math.max(0, latest - 50_000);
+    
+    // Get all OracleSelected events for this aggId to find operator addresses
+    const topicOracleSel = agg.interface.getEvent("OracleSelected").topicHash;
+    const selLogs = await provider.getLogs({
+      address: AGG_ADDR,
+      topics: [topicOracleSel, aggId],
+      fromBlock, toBlock: "latest"
+    });
+    
+    const operatorAddresses = new Set();
+    for (const log of selLogs) {
+      const parsed = agg.interface.parseLog(log);
+      operatorAddresses.add(ethers.getAddress(parsed.args.oracle));
+    }
+    
+    EXPECTED = Array.from(operatorAddresses);
+    EXPECTED_LC = new Set(EXPECTED.map(lc));
+    
+    console.log(`Discovered ${EXPECTED.length} oracle operator addresses:`, EXPECTED);
+  } else if (argv.fromaddrs) {
+    EXPECTED = (argv.fromaddrs || "")
+      .split(",").map(s => s.trim()).filter(Boolean)
+      .map(ethers.getAddress);
+    EXPECTED_LC = new Set(EXPECTED.map(lc));
+  }
 
   /* ── Topics / ABIs ─────────────────────────────────────────── */
 
@@ -324,6 +359,12 @@ function decodeRevertData(dataHex) {
   function tagEOA(addrLc) {
     if (!addrLc) return "-";
     const chk = ethers.getAddress(addrLc);
+    
+    // If no expected addresses configured, just return the address without tags
+    if (EXPECTED_LC.size === 0) {
+      return chk;
+    }
+    
     const inSet = EXPECTED_LC.has(addrLc);
     return inSet ? `${chk} (expected)` : `${chk} (UNEXPECTED)`;
   }
