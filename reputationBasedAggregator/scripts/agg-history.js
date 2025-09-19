@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-/*  scripts/agg-history-enhanced.js
+/*  scripts/agg-history.js
 Usage:
 HARDHAT_NETWORK=base_sepolia \
-node scripts/agg-history-enhanced.js \
+node scripts/agg-history.js \
   --aggregator 0x2bF73a372CA04C30e9a689BAc4BfC976DfBEb504 \
   --aggid      0xe4bdcfa7195c2f67163f9d27c0728263e38b5b38d8f4b20a11047a243347b40c
     --------------------------------------------------
