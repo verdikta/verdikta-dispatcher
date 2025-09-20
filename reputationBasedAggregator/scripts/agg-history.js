@@ -3,8 +3,8 @@
 Usage:
 HARDHAT_NETWORK=base_sepolia \
 node scripts/agg-history.js \
-  --aggregator 0x2bF73a372CA04C30e9a689BAc4BfC976DfBEb504 \
-  --aggid      0xe4bdcfa7195c2f67163f9d27c0728263e38b5b38d8f4b20a11047a243347b40c
+  --aggregator 0xb2b724e4ee4Fa19Ccd355f12B4bB8A2F8C8D0089 \
+  --aggid      0x7d811207fedaf5c284360439c341082cfffb3e3187c109464728cef8c375fd46
     --------------------------------------------------
     Enhanced timeline with require() failure detection
     -------------------------------------------------- */
@@ -90,10 +90,73 @@ const pad = (v, n) => String(v).padEnd(n);
   console.log("Looking for RequestAIEvaluation event...");
   const requestLogs = await provider.getLogs(requestFilter);
 
-  if (requestLogs.length === 0) {
-    console.log("No RequestAIEvaluation event found for this aggId in recent blocks");
-    return; // Exit early
+if (requestLogs.length === 0) {
+  console.log("No RequestAIEvaluation event found for this aggId in the last 10k blocks; widening window…");
+
+  // widen once to 50k blocks
+  const widenedFrom = Math.max(0, currentBlock - 50000);
+  const widenedFilter = {
+    address: agg.target,
+    topics: [
+      agg.interface.getEvent("RequestAIEvaluation").topicHash,
+      aggId // keep the aggId topic
+    ],
+    fromBlock: widenedFrom,
+    toBlock: "latest"
+  };
+  const widenedLogs = await provider.getLogs(widenedFilter);
+
+  if (widenedLogs.length === 0) {
+    console.log("Still no RequestAIEvaluation for the provided aggId in the last 50k blocks.");
+
+    // Print all RequestAIEvaluation aggIds we DO see in this window to help pick the right one
+    console.log("\nRequestAIEvaluation aggIds observed in the last 50k blocks:");
+    const allFilter = {
+      address: agg.target,
+      topics: [ agg.interface.getEvent("RequestAIEvaluation").topicHash ],
+      fromBlock: widenedFrom,
+      toBlock: "latest"
+    };
+    const allLogs = await provider.getLogs(allFilter);
+
+    if (allLogs.length === 0) {
+      console.log("(No RequestAIEvaluation events found for this aggregator in that window.)");
+      return;
+    }
+
+    // Parse and list; cap output so very busy chains don’t spam the console
+    const MAX_PRINT = 200; // adjust as you like
+    const rows = [];
+    for (const log of allLogs) {
+      try {
+        const parsed = agg.interface.parseLog(log);
+        const foundAggId = String(parsed.args.aggRequestId).toLowerCase();
+        rows.push({
+          blockNumber: log.blockNumber,
+          txHash: log.transactionHash,
+          aggId: foundAggId,
+        });
+      } catch (_) {}
+    }
+
+    rows.sort((a, b) => a.blockNumber - b.blockNumber);
+    const unique = new Map();
+    rows.forEach(r => { if (!unique.has(r.aggId)) unique.set(r.aggId, r); });
+
+    console.log(`Found ${rows.length} RequestAIEvaluation events (${unique.size} unique aggIds). Showing up to ${MAX_PRINT}:`);
+    let printed = 0;
+    for (const r of rows) {
+      console.log(`${String(r.blockNumber).padEnd(9)}  ${r.aggId}`);
+      if (++printed >= MAX_PRINT) break;
+    }
+    return;
   }
+
+  // Found after widening — keep going with that log set
+  console.log(`Found RequestAIEvaluation event at block ${widenedLogs[0].blockNumber} (widened search)`);
+  requestLogs.splice(0, requestLogs.length, ...widenedLogs);
+}
+
 
   console.log(`Found RequestAIEvaluation event at block ${requestLogs[0].blockNumber}`);
 
