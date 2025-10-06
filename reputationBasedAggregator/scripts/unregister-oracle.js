@@ -60,7 +60,7 @@ const JOB_IDS = [
     try {
       vdkaInfo = await deployments.get("WrappedVerdiktaToken");
     } catch {
-      const addr = process.env.WRAPPED_VERDIKTA_TOKEN;
+      const addr = process.env.WRAPPED_VERDIKTA_TOKEN_BASE_SEPOLIA;
       if (!addr)
         throw new Error("WrappedVerdiktaToken not deployed and env var missing");
       vdkaInfo = {
