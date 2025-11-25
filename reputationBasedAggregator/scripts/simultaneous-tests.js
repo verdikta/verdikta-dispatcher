@@ -11,7 +11,7 @@ const IS_BASE = hre.network.name === "base";
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
 const AGGREGATOR = IS_BASE
   ? "0x2f7a02298D4478213057edA5e5bEB07F20c4c054"
-  : "0x6a26f45D5BbFC3AEEd8De9bd2B8285b96554bC47";
+  : "0xb2b724e4ee4Fa19Ccd355f12B4bB8A2F8C8D0089";
 
 const LINK_TOKEN = IS_BASE
   ? "0x88Fb150BDc53A65fe94Dea0c9BA0a6dAf8C6e196"
@@ -22,13 +22,16 @@ const BETWEEN_QUERY_DELAY = 200;         // ms between tx submissions
 const NUM_INCREMENTS      = 12;
 const INCREMENT_DURATION  = 30_000;      // ms between polling rounds
 
-const JOB_CLASS           = 128;
+const JOB_CLASS           = 717;
+// const JOB_CLASS           = 128;
 const MAX_ORACLE_FEE      = ethers.parseUnits("0.01", 18);
 const ESTIMATE_BASE_FEE   = ethers.parseUnits("0.000001", 18);
 const MAX_FEE_SCALING     = 5;
 const ALPHA               = 500;
 
-const CIDS     = ["QmSHXfBcrfFf4pnuRYCbHA8rjKkDh1wjqas3Rpk3a2uAWH"];
+const CIDS     = ["QmeY9cjdQJ1yvT5pcVmXfFwNwehEnLm12qpQZA2UiTmQ1D","QmXmMr5pTMRwb6nKeuF8UGwsmsDXXxfyMBfARzLyUzMSy2"];
+// const CIDS     = ["QmSHXfBcrfFf4pnuRYCbHA8rjKkDh1wjqas3Rpk3a2uAWH"];
+// const CIDS     = ["QmfDsqNzpwZnMy135JsFK5QTQW4yw3cUkrijT7gKZcrSag"];
 const ADDENDUM = "";
 const GAS_LIMIT = 3_000_000;
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
