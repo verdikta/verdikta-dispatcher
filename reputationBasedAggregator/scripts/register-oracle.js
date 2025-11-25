@@ -10,18 +10,10 @@ const hre = require("hardhat");
 const { ethers, deployments } = hre;
 
 /* --------------------------------------------------------------------- */
-const ORACLE_ADDR = "0x00A08b75178de0e0d7FF13Fdd4ef925AC3572503";
+const ORACLE_ADDR = "0xcD98fbbeEF2234e6AaA7E0eA0895f14BeB06b4aD";
 const JOB_IDS = [
-  "6c751f1a36f348dc8655c11e0f804b31",
-  "4d48270ca94f45188b3ec06f0dba8742",
-  "c6a5a82aa4814f8296c30fa44aff715e",
-  "cdee0a127bc74a5188cbabf7aadcc84f",
-  "39515f75ac2947beb7f2eeae4d8eaf3e",
-  "38f19572c51041baa5f2dea284614590",
-  "6f0ab41b6ffd4245bb1be16064043bfc",
-  "6230e342f7ff47aca7e62f9b0bc097df",
-  "184c2fd08a634719adc9183846e91380",
-  "858acbb95d90492bbff6a0eb568112b0"
+  "0857f1e5efb14a96a2bb26b7c8995d80",
+  "effe38857bec4ece8d5d970547250458"
 ];
 const LINK_FEE   = ethers.parseUnits("0.006", 18);  // 0.007 LINK
 const VDKA_STAKE = ethers.parseUnits("100", 18);   // 100 wVDKA
@@ -117,7 +109,7 @@ const VDKA_STAKE = ethers.parseUnits("100", 18);   // 100 wVDKA
         continue;
       }
 
-      const classes = [128, 707, 128 + idx];   // example classes
+      const classes = [128, 717, 717 + idx];   // example classes
       console.log("Calling registerOracle…", classes);
       await (
         await keeper.registerOracle(ORACLE_ADDR, jobId, LINK_FEE, classes)
