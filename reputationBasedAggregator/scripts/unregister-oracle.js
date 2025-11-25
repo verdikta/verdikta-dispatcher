@@ -16,18 +16,18 @@ const { ethers, deployments } = hre;
 /* ------------------------------------------------------------------- */
 /* Constants                                                           */
 /* ------------------------------------------------------------------- */
-const ORACLE_ADDR = "0x00A08b75178de0e0d7FF13Fdd4ef925AC3572503";
+const ORACLE_ADDR = "0xcD98fbbeEF2234e6AaA7E0eA0895f14BeB06b4aD";
 const JOB_IDS = [
-  "6c751f1a36f348dc8655c11e0f804b31",
-  "4d48270ca94f45188b3ec06f0dba8742",
-  "c6a5a82aa4814f8296c30fa44aff715e",
-  "cdee0a127bc74a5188cbabf7aadcc84f",
-  "39515f75ac2947beb7f2eeae4d8eaf3e",
-  "38f19572c51041baa5f2dea284614590",
-  "6f0ab41b6ffd4245bb1be16064043bfc",
-  "6230e342f7ff47aca7e62f9b0bc097df",
-  "184c2fd08a634719adc9183846e91380",
-  "858acbb95d90492bbff6a0eb568112b0"
+"639f4810bf3543ccac0249b44f49d87d",
+"34281012a46b45a98f6db07d79f6c7d0",
+"60568680560b40538301f8a85d77a110",
+"cbcc6e32520e444f9c6dbff906dc2008",
+"75b40e14138b42abaf2ee306273805d7",
+"41efd4f85fd2451d99da15467d0ec4f5",
+"053fdd8194c5452895ee57e858bd2b2c",
+"d1eb055ce8c847d79d1996bebbab971f",
+"8cd27da50f384cfa9142c50ce429f6ed",
+"358a35ba97c640e285f24bfda5b925e8"
 ];
 
 /* ------------------------------------------------------------------- */
