@@ -11,7 +11,7 @@ HARDHAT_NETWORK=base_sepolia \
 node scripts/unregister-oracle-by-class-cl.js \
   --aggregator      0xb2b724e4ee4Fa19Ccd355f12B4bB8A2F8C8D0089 \
   --wrappedverdikta 0x2F1d1aF9d5C25A48C29f56f57c7BAFFa7cc910a3 \
-  --class           4040 
+  --class           4040
 
   Add --dry-run to preview without actually deregistering.
 */
@@ -72,6 +72,25 @@ async function confirm(question) {
   });
 }
 
+/* ─────── helper: get balances for multiple addresses ───── */
+async function getBalances(verdikta, addresses) {
+  const balances = {};
+  for (const addr of addresses) {
+    balances[addr.toLowerCase()] = await verdikta.balanceOf(addr);
+  }
+  return balances;
+}
+
+/* ─────── helper: print balance comparison ───── */
+function printBalanceComparison(label, address, before, after) {
+  const diff = after - before;
+  const sign = diff >= 0n ? "+" : "";
+  console.log(`  ${label} (${address}):`);
+  console.log(`    Before: ${ethers.formatEther(before)} wVDKA`);
+  console.log(`    After:  ${ethers.formatEther(after)} wVDKA`);
+  console.log(`    Change: ${sign}${ethers.formatEther(diff)} wVDKA`);
+}
+
 /* ───────────────────────────── Main ───────────────────────────────── */
 (async () => {
   try {
@@ -121,6 +140,7 @@ async function confirm(question) {
 
     const keeper = new ethers.Contract(keeperAddr, KeeperABI, signer);
     const keeperOwner = (await keeper.owner()).toLowerCase();
+    console.log(`ReputationKeeper owner: ${keeperOwner}`);
 
     /* Scan for oracles matching the specified class */
     console.log(`\nScanning for oracles with capability class ${argv.class}...`);
@@ -206,10 +226,26 @@ async function confirm(question) {
       }
     }
 
-    /* wVDKA balance before */
+    /* Collect unique addresses to track */
+    const uniqueOracleOwners = [...new Set(canDeregister.map(o => o.oracleOwner))];
+    const addressesToTrack = new Set([
+      caller.toLowerCase(),
+      keeperOwner,
+      ...uniqueOracleOwners,
+    ]);
+
+    /* wVDKA balances before */
     const verdikta = new ethers.Contract(argv.wrappedverdikta, ERC20_BALANCE, signer);
-    const balBefore = await verdikta.balanceOf(caller);
-    console.log("\nInitial wVDKA balance:", ethers.formatEther(balBefore));
+    const balancesBefore = await getBalances(verdikta, [...addressesToTrack]);
+
+    console.log("\n--- Initial wVDKA Balances ---");
+    console.log(`  Caller (${caller}): ${ethers.formatEther(balancesBefore[caller.toLowerCase()])}`);
+    console.log(`  Keeper Owner (${keeperOwner}): ${ethers.formatEther(balancesBefore[keeperOwner])}`);
+    for (const owner of uniqueOracleOwners) {
+      if (owner !== caller.toLowerCase() && owner !== keeperOwner) {
+        console.log(`  Oracle Owner (${owner}): ${ethers.formatEther(balancesBefore[owner])}`);
+      }
+    }
 
     /* Deregister each oracle */
     let successCount = 0;
@@ -232,12 +268,22 @@ async function confirm(question) {
       }
     }
 
-    /* wVDKA balance after */
-    const balAfter = await verdikta.balanceOf(caller);
-    console.log("\nFinal wVDKA balance:", ethers.formatEther(balAfter));
-    console.log(
-      `Recovered: ${ethers.formatEther(balAfter - balBefore)} wVDKA`
-    );
+    /* wVDKA balances after */
+    const balancesAfter = await getBalances(verdikta, [...addressesToTrack]);
+
+    console.log("\n--- Final wVDKA Balance Summary ---");
+    printBalanceComparison("Caller", caller, balancesBefore[caller.toLowerCase()], balancesAfter[caller.toLowerCase()]);
+    
+    if (keeperOwner !== caller.toLowerCase()) {
+      printBalanceComparison("Keeper Owner", keeperOwner, balancesBefore[keeperOwner], balancesAfter[keeperOwner]);
+    }
+    
+    for (const owner of uniqueOracleOwners) {
+      if (owner !== caller.toLowerCase() && owner !== keeperOwner) {
+        printBalanceComparison("Oracle Owner", owner, balancesBefore[owner], balancesAfter[owner]);
+      }
+    }
+
     console.log(`\nDeregistered ${successCount}/${canDeregister.length} oracle(s).`);
 
     process.exit(0);
