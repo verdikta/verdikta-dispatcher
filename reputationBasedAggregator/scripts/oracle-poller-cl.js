@@ -11,10 +11,17 @@ HARDHAT_NETWORK=base_sepolia node scripts/oracle-poller-cl.js \
   --aggregator 0x262f48f06DEf1FE49e0568dB4234a3478A191cFd
 
 HARDHAT_NETWORK=base node scripts/oracle-poller-cl.js \
-  --aggregator 0x2f7a02298D4478213057edA5e5bEB07F20c4c054
+  --aggregator 0xb2b724e4ee4Fa19Ccd355f12B4bB8A2F8C8D0089
+
+# Filter to oracles supporting class 128:
+HARDHAT_NETWORK=base_sepolia node scripts/oracle-poller-cl.js \
+  --aggregator 0xb2b724e4ee4Fa19Ccd355f12B4bB8A2F8C8D0089 --class 128
 
   Required flag:
     -a, --aggregator    ReputationAggregator contract address
+
+  Optional flag:
+    -c, --class         Filter to oracles supporting this capability class
 */
 
 require("dotenv").config();
@@ -111,6 +118,11 @@ const minimalOwnerABI = [
         describe: "ReputationAggregator contract address",
         demandOption: true,
       })
+      .option("class", {
+        alias: "c",
+        type: "number",
+        describe: "Filter to oracles supporting this capability class",
+      })
       .strict()
       .argv;
 
@@ -120,6 +132,10 @@ const minimalOwnerABI = [
     const aggregator = new ethers.Contract(argv.aggregator, AggregatorABI, provider);
     const keeperAddress = await aggregator.reputationKeeper();
     console.log(`Found ReputationKeeper at: ${keeperAddress}`);
+
+    if (argv.class !== undefined) {
+      console.log(`Filtering to oracles with capability class: ${argv.class}`);
+    }
 
     const keeper = new ethers.Contract(keeperAddress, ReputationKeeperABI, provider);
 
@@ -133,7 +149,20 @@ const minimalOwnerABI = [
         const { oracle, jobId } = await keeper.registeredOracles(i);
         if (oracle !== ethers.ZeroAddress) {
           const info = await keeper.getOracleInfo(oracle, jobId);
-          foundOracles.push({ oracle, jobId, info });
+
+          // Fetch classes for filtering (and cache for later display)
+          let classes = [];
+          try {
+            classes = await keeper.getOracleClassesByKey(oracle, jobId);
+          } catch (_) { }
+
+          // Skip if class filter specified and not matched
+          if (argv.class !== undefined) {
+            const hasClass = classes.some(c => Number(c) === argv.class);
+            if (!hasClass) continue;
+          }
+
+          foundOracles.push({ oracle, jobId, info, classes });
         }
       } catch (_) {
         break; // out‑of‑bounds revert -> stop scanning
@@ -141,7 +170,10 @@ const minimalOwnerABI = [
     }
 
     if (!foundOracles.length) {
-      console.log("\nNo oracles found.\n" +
+      const msg = argv.class !== undefined
+        ? `\nNo oracles found matching class ${argv.class}.`
+        : "\nNo oracles found.";
+      console.log(msg + "\n" +
         "To register an oracle, ensure that:\n" +
         "1. You have the required VDKA tokens (100 VDKA).\n" +
         "2. You call registerOracle() with the oracle address, jobId, and fee.");
@@ -150,8 +182,8 @@ const minimalOwnerABI = [
 
     console.log(`\nFound ${foundOracles.length} oracle(s):`);
     let idx = 1;
-    for (const oracle of foundOracles) {
-      const { oracle: addr, jobId, info } = oracle;
+    for (const entry of foundOracles) {
+      const { oracle: addr, jobId, info, classes } = entry;
       console.log(`\nOracle ${idx++}:`);
       console.log(`Address:           ${addr}`);
       console.log(`Active:            ${info.isActive}`);
@@ -170,13 +202,8 @@ const minimalOwnerABI = [
       }
       console.log(`Job ID:            ${printableJobId}`);
 
-      /* Capability classes */
-      try {
-        const classes = await keeper.getOracleClassesByKey(addr, jobId);
-        console.log(`Capability Classes:${classes}`);
-      } catch (_) {
-        console.log("Capability Classes: not available");
-      }
+      /* Capability classes (already fetched) */
+      console.log(`Capability Classes: ${classes.length ? classes.join(", ") : "none"}`);
 
       console.log(`Fee:               ${info.fee}`);
 
