@@ -13,7 +13,20 @@ node scripts/unregister-oracle-by-class-cl.js \
   --wrappedverdikta 0x2F1d1aF9d5C25A48C29f56f57c7BAFFa7cc910a3 \
   --class           4040
 
+HARDHAT_NETWORK=base_sepolia \
+node scripts/unregister-oracle-by-class-cl.js \
+  --aggregator      0xb2b724e4ee4Fa19Ccd355f12B4bB8A2F8C8D0089 \
+  --wrappedverdikta 0x94e3c031fe9403c80E14DaFbCb73f191C683c2B1 \
+  --class           5050
+
   Add --dry-run to preview without actually deregistering.
+
+HARDHAT_NETWORK=base \
+node scripts/unregister-oracle-by-class-cl.js \
+  --aggregator      0x2f7a02298D4478213057edA5e5bEB07F20c4c054 \
+  --wrappedverdikta 0x1EA68D018a11236E07D5647175DAA8ca1C3D0280 \
+  --class           129
+
 */
 
 require("dotenv").config();
