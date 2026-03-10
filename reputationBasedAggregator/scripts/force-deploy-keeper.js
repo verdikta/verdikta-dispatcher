@@ -109,13 +109,35 @@ async function main() {
     
   } catch (error) {
     console.error("\n❌ Deployment failed:", error.message);
-    
+
     if (error.message.includes("Timeout")) {
       console.log("💡 Transaction might still be pending. Check your nonce and try again.");
     } else if (error.code === "INSUFFICIENT_FUNDS") {
       console.log("💡 Need more Base Sepolia ETH from faucet");
     } else {
-      console.log("Error details:", error);
+      // Try custom error decoding from available contract interfaces
+      let decoded = false;
+      if (error.data) {
+        const contracts = [];
+        try { contracts.push(keeper); } catch {}
+        try { contracts.push(aggregator); } catch {}
+        for (const c of contracts) {
+          try {
+            const parsed = c.interface.parseError(error.data);
+            if (parsed) {
+              const args = parsed.args.length ? `(${parsed.args.join(", ")})` : "";
+              console.log("Revert:", parsed.name + args);
+              decoded = true;
+              break;
+            }
+          } catch {}
+        }
+      }
+      if (!decoded && error.reason) {
+        console.log("Revert reason:", error.reason);
+      } else if (!decoded) {
+        console.log("Error details:", error);
+      }
     }
   }
 }

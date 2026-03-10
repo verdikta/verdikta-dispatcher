@@ -172,7 +172,18 @@ if (requestLogs.length === 0) {
       responseCount: Number(aggData.responseCount)
     });
   } catch (e) {
-    console.log("Error checking aggregation:", e.message);
+    let msg = e.message;
+    if (e.data) {
+      try {
+        const parsed = agg.interface.parseError(e.data);
+        if (parsed) {
+          const args = parsed.args.length ? `(${parsed.args.join(", ")})` : "";
+          msg = parsed.name + args;
+        }
+      } catch {}
+    }
+    if (!msg && e.reason) msg = e.reason;
+    console.log("Error checking aggregation:", msg);
   }
 
   // Get oracle assignments from OracleSelected events

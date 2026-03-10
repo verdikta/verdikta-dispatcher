@@ -277,7 +277,18 @@ function printBalanceComparison(label, address, before, after) {
         console.log(`  ✓ Deregistered (tx: ${tx.hash})`);
         successCount++;
       } catch (err) {
-        console.error(`  ✗ Failed: ${err.message}`);
+        let msg = err.message;
+        if (err.data) {
+          try {
+            const parsed = keeper.interface.parseError(err.data);
+            if (parsed) {
+              const args = parsed.args.length ? `(${parsed.args.join(", ")})` : "";
+              msg = parsed.name + args;
+            }
+          } catch {}
+        }
+        if (!msg && err.reason) msg = err.reason;
+        console.error(`  ✗ Failed: ${msg}`);
       }
     }
 

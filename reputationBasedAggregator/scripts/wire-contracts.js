@@ -68,11 +68,28 @@ async function main() {
     
   } catch (error) {
     console.error("Error during wiring:", error.message);
-    
+
     if (error.code === "INSUFFICIENT_FUNDS") {
       console.log("\nNeed more Base Sepolia ETH from faucet");
-    } else if (error.reason) {
-      console.log("Revert reason:", error.reason);
+    } else {
+      // Try custom error decoding first, then fall back to string reason
+      let decoded = false;
+      if (error.data) {
+        for (const c of [keeper, aggregator]) {
+          try {
+            const parsed = c.interface.parseError(error.data);
+            if (parsed) {
+              const args = parsed.args.length ? `(${parsed.args.join(", ")})` : "";
+              console.log("Revert:", parsed.name + args);
+              decoded = true;
+              break;
+            }
+          } catch {}
+        }
+      }
+      if (!decoded && error.reason) {
+        console.log("Revert reason:", error.reason);
+      }
     }
   }
 }

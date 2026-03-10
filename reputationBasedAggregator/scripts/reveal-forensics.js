@@ -45,7 +45,7 @@ function hexToAscii(hex) {
   return out;
 }
 
-function decodeRevertData(dataHex) {
+function decodeRevertData(dataHex, contracts) {
   if (!dataHex || typeof dataHex !== "string") return "";
   const d = dataHex.startsWith("0x") ? dataHex : "0x" + dataHex;
   const sel = d.slice(0, 10);
@@ -59,6 +59,18 @@ function decodeRevertData(dataHex) {
       return `panic code ${code}`;
     }
   } catch {}
+  // Try custom error decoding against known contract interfaces
+  if (contracts) {
+    for (const c of contracts) {
+      try {
+        const parsed = c.interface.parseError(d);
+        if (parsed) {
+          const args = parsed.args.length ? `(${parsed.args.join(", ")})` : "";
+          return parsed.name + args;
+        }
+      } catch {}
+    }
+  }
   return d.length > 74 ? `revert data ${d.slice(0, 74)}…` : d;
 }
 
@@ -465,7 +477,7 @@ function decodeRevertData(dataHex) {
             try {
               const p = operatorIface.parseLog(lg);
               cbSuccess = p.args.success ? "yes" : "no";
-              cbReason  = p.args.success ? "-" : decodeRevertData(p.args.returnData);
+              cbReason  = p.args.success ? "-" : decodeRevertData(p.args.returnData, [agg]);
             } catch {}
           }
         }
