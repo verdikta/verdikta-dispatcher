@@ -71,11 +71,8 @@ async function main () {
   //   N = 3  first 3 reveals are accepted for clustering
   //   P = 2  cluster size rewarded
   //
-  console.log("Setting phase counts to (K,M,N,P) = (6,4,3,2)…");
-  await (await aggregator.setPhaseCounts(6, 4, 3, 2)).wait();
-
-  console.log("Setting response timeout to 300 seconds…");
-  await (await aggregator.setResponseTimeout(300)).wait();
+  console.log("Setting config (K,M,N,P,timeout) = (6,4,3,2,300)…");
+  await (await aggregator.setConfig(6, 4, 3, 2, 300)).wait();
 
   console.log("Setting max oracle fee to 0.08 LINK…");
   await (await aggregator.setMaxOracleFee(ethers.parseEther("0.08"))).wait();
