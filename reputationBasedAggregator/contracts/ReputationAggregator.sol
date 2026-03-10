@@ -322,36 +322,6 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     //                            CONFIGURATION API
     // ----------------------------------------------------------------------
     /**
-     * @notice Set all phase counts at once (K, M, N, P) - DEPRECATED
-     * @dev This function is deprecated. Use setConfig instead for better validation
-     * @param _k Number of oracles to poll in commit phase (commitOraclesToPoll)
-     * @param _m Number of reveals requested from first M commits (oraclesToPoll)
-     * @param _n Number of reveals required for final aggregation (requiredResponses)
-     * @param _p Cluster size for bonus payments (clusterSize)
-     */
-    function setPhaseCounts(uint256 _k, uint256 _m, uint256 _n, uint256 _p) external onlyOwner {
-        require(_k >= _m, "K must be >= M");
-        require(_m >= _n, "M must be >= N");
-        require(_n >= _p, "N must be >= P");
-        require(_p >= 1, "P must be >= 1");
-        
-        commitOraclesToPoll = _k;
-        oraclesToPoll = _m;
-        requiredResponses = _n;
-        clusterSize = _p;
-    }
-
-    /**
-     * @notice Set the number of oracles to poll in commit phase
-     * @dev Must be greater than or equal to oraclesToPoll (M)
-     * @param _k Number of oracles to poll in commit phase
-     */
-    function setCommitOraclesToPoll(uint256 _k) external onlyOwner {
-        require(_k >= oraclesToPoll, "K must be >= M");
-        commitOraclesToPoll = _k;
-    }
-
-    /**
      * @notice Set the response timeout in seconds
      * @dev Timeout applies to both commit and reveal phases
      * @param _seconds Timeout duration in seconds
@@ -1160,18 +1130,6 @@ function _ensureAggArrayExists(
         AggregatedEvaluation storage agg = aggregatedEvaluations[reqId];
         bool hasValidData = agg.isComplete && agg.aggregatedLikelihoods.length > 0;
         return (agg.aggregatedLikelihoods, agg.combinedJustificationCIDs, hasValidData);
-    }
-
-    /**
-     * @notice Get evaluation results (legacy interface for backwards compatibility)
-     * @dev Simplified interface that returns only scores and justifications
-     * @param reqId The aggregator request ID
-     * @return likelihoods Array of aggregated likelihood scores
-     * @return justifications Combined IPFS CIDs of justifications
-     */
-    function evaluations(bytes32 reqId) external view returns (uint256[] memory, string memory) {
-        (uint256[] memory l, string memory j, ) = getEvaluation(reqId);
-        return (l, j);
     }
 
     /**
