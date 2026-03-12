@@ -33,6 +33,31 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     using Chainlink for Chainlink.Request;
 
     // ----------------------------------------------------------------------
+    //                          CUSTOM ERRORS
+    // ----------------------------------------------------------------------
+    error LengthTooShort();
+    error InvalidConfig();
+    error InvalidBonusMultiplier();
+    error KeeperNotSet();
+    error EmptyCIDList();
+    error TooManyCIDs();
+    error CIDTooLong();
+    error AddendumTooLong();
+    error InactiveOracle();
+    error AggregationComplete();
+    error NotTimedOut();
+    error UnknownRequest();
+    error InvalidRequest();
+    error MalformedPayload();
+    error RevealBeforeCommit();
+    error NeedMoreResponses();
+    error ArrayLengthMismatch();
+    error FeeTransferFailed();
+    error BonusTransferFailed();
+    error LinkTransferFailed();
+    error ZeroAddress();
+
+    // ----------------------------------------------------------------------
     //                          CONFIGURATION
     // ----------------------------------------------------------------------
     uint256 public commitOraclesToPoll;      // K – commit-phase polls
@@ -336,7 +361,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
      * @param _len New upper bound (must be >= 2)
      */
     function setMaxLikelihoodLength(uint256 _len) external onlyOwner {
-        require(_len >= 2, "length must be >= 2");
+        if (_len < 2) revert LengthTooShort();
         maxLikelihoodLength = _len;
     }
 
@@ -386,13 +411,13 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         uint256 _maxFeeBasedScalingFactor,
         uint64 _requestedClass
     ) public nonReentrant returns (bytes32) {
-        require(address(reputationKeeper) != address(0), "ReputationKeeper not set");
-        require(cids.length > 0, "Empty CID list");
-        require(cids.length <= MAX_CID_COUNT, "Too many CIDs");
+        if (address(reputationKeeper) == address(0)) revert KeeperNotSet();
+        if (cids.length == 0) revert EmptyCIDList();
+        if (cids.length > MAX_CID_COUNT) revert TooManyCIDs();
         for (uint256 i = 0; i < cids.length; i++) {
-            require(bytes(cids[i]).length <= MAX_CID_LENGTH, "CID too long");
+            if (bytes(cids[i]).length > MAX_CID_LENGTH) revert CIDTooLong();
         }
-        require(bytes(addendumText).length <= MAX_ADDENDUM_LENGTH, "Addendum too long");
+        if (bytes(addendumText).length > MAX_ADDENDUM_LENGTH) revert AddendumTooLong();
 
         // build CID payload
         bytes memory cat;
@@ -433,9 +458,9 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
             agg.polledOracles.push(sel[i]);
 
             (bool active, , , , bytes32 jobId, uint256 fee, , , ) = reputationKeeper.getOracleInfo(sel[i].oracle, sel[i].jobId);
-            require(active, "Inactive oracle");
+            if (!active) revert InactiveOracle();
 
-            require(LinkTokenInterface(_chainlinkTokenAddress()).transferFrom(msg.sender, address(this), fee), "fee xferFrom failed");
+            if (!LinkTokenInterface(_chainlinkTokenAddress()).transferFrom(msg.sender, address(this), fee)) revert FeeTransferFailed();
 
             bytes32 opReq = _sendSingleOracleRequest(aggId, sel[i].oracle, jobId, fee, cidConcat);
             requestIdToAggregatorId[opReq] = aggId;
@@ -462,11 +487,8 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
      */
     function finalizeEvaluationTimeout(bytes32 aggId) external nonReentrant {
         AggregatedEvaluation storage agg = aggregatedEvaluations[aggId];
-        require(!agg.isComplete, "Aggregation already completed");
-        require(
-            block.timestamp >= agg.startTimestamp + responseTimeoutSeconds,
-            "Evaluation not yet timed out"
-        );
+        if (agg.isComplete) revert AggregationComplete();
+        if (block.timestamp < agg.startTimestamp + responseTimeoutSeconds) revert NotTimedOut();
 
         /* ----------------- commit phase timed out ----------------- */
         if (!agg.commitPhaseComplete) {
@@ -520,11 +542,11 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     ) public recordChainlinkFulfillment(requestId) nonReentrant {
 
         bytes32 aggId = requestIdToAggregatorId[requestId];
-        require(aggId != bytes32(0), "Unknown reqId");
+        if (aggId == bytes32(0)) revert UnknownRequest();
 
         AggregatedEvaluation storage agg = aggregatedEvaluations[aggId];
-        require(!agg.isComplete, "Aggregation done");
-        require(agg.requestIds[requestId], "Invalid reqId");
+        if (agg.isComplete) revert AggregationComplete();
+        if (!agg.requestIds[requestId]) revert InvalidRequest();
 
         uint256 slot = requestIdToPollIndex[requestId];
         ReputationKeeper.OracleIdentity memory id = agg.polledOracles[slot];
@@ -532,7 +554,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         // ---------- decide phase from *payload shape* ----------
         bool looksLikeCommit = (response.length == 1) && (bytes(cid).length == 0);
         bool looksLikeReveal = (response.length >= 2) && (bytes(cid).length > 0);
-        require(looksLikeCommit || looksLikeReveal, "Callback payload malformed");
+        if (!looksLikeCommit && !looksLikeReveal) revert MalformedPayload();
 
         /* ────────────────────────────────────────────────────────
          *                     COMMIT  (Mode-1)
@@ -568,7 +590,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         /* ────────────────────────────────────────────────────────
          *                     REVEAL  (Mode-2)
          * ──────────────────────────────────────────────────────── */
-        require(agg.commitPhaseComplete, "Reveal arrived before commit phase complete");
+        if (!agg.commitPhaseComplete) revert RevealBeforeCommit();
 
         // Check for too few scores (less than 2)
         if (response.length < 2) {
@@ -687,7 +709,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     // ----------------------------------------------------------------------
     function _finalizeAggregation(bytes32 aggId) internal {
         AggregatedEvaluation storage agg = aggregatedEvaluations[aggId];
-        require(!agg.isComplete, "already-finalised");
+        if (agg.isComplete) revert AggregationComplete();
 
         uint256 selectedCount = 0;
         for (uint256 i = 0; i < agg.responses.length; i++) {
@@ -869,11 +891,10 @@ function _ensureAggArrayExists(
             
             if (userFunded) {
                 // If user funded, transfer from requester
-                require(link.transferFrom(requester, operator, amount), "bonus xferFrom failed");
+                if (!link.transferFrom(requester, operator, amount)) revert BonusTransferFailed();
             } else {
                 // Otherwise transfer from contract
-                bool success = link.transfer(operator, amount);
-                require(success, "bonus transfer failed");
+                if (!link.transfer(operator, amount)) revert BonusTransferFailed();
             }
             
             emit BonusPayment(operator, amount);
@@ -932,7 +953,7 @@ function _ensureAggArrayExists(
     ) internal pure returns (uint256[] memory)
     {
         uint256 count = selectedResponseIndices.length;
-        require(count >= 2, "Need at least 2 responses");
+        if (count < 2) revert NeedMoreResponses();
 
         // Cap P to available responses
         if (P > count) P = count;
@@ -999,7 +1020,7 @@ function _ensureAggArrayExists(
     function _calculateDistance(uint256[] memory a, uint256[] memory b) 
         internal pure returns (uint256) 
     {
-        require(a.length == b.length, "Array length mismatch");
+        if (a.length != b.length) revert ArrayLengthMismatch();
         uint256 sum = 0;
         for (uint256 i = 0; i < a.length; i++) {
             uint256 diff = (a[i] > b[i]) ? a[i] - b[i] : b[i] - a[i];
@@ -1165,7 +1186,7 @@ function _ensureAggArrayExists(
      */
     function withdrawLink(address payable _to, uint256 _amount) external onlyOwner {
         LinkTokenInterface link = LinkTokenInterface(_chainlinkTokenAddress());
-        require(link.transfer(_to, _amount), "LINK transfer failed");
+        if (!link.transfer(_to, _amount)) revert LinkTransferFailed();
     }
 
     /**
@@ -1174,7 +1195,7 @@ function _ensureAggArrayExists(
      * @param newKeeper Address of the new ReputationKeeper contract
      */
     function setReputationKeeper(address newKeeper) external onlyOwner {
-        require(newKeeper != address(0), "ReputationKeeper: zero address");
+        if (newKeeper == address(0)) revert ZeroAddress();
         address old = address(reputationKeeper);
         reputationKeeper = ReputationKeeper(newKeeper);
         emit ReputationKeeperChanged(old, newKeeper);
@@ -1197,10 +1218,10 @@ function _ensureAggArrayExists(
         uint256 _timeoutSecs
     ) external onlyOwner {
         // same safety checks as individual setters
-        require(_k >= _m, "K >= M");
-        require(_m >= _n, "M >= N");
-        require(_n >= _p, "N >= P");
-        require(_p >= 1,  "P >= 1");
+        if (_k < _m) revert InvalidConfig();
+        if (_m < _n) revert InvalidConfig();
+        if (_n < _p) revert InvalidConfig();
+        if (_p < 1)  revert InvalidConfig();
 
         commitOraclesToPoll   = _k;
         oraclesToPoll         = _m;
@@ -1215,7 +1236,7 @@ function _ensureAggArrayExists(
      * @param _m Bonus multiplier (0-20x), typically 3x
      */
     function setBonusMultiplier(uint256 _m) external onlyOwner {
-        require(_m <= 20, "bonus 0-20x");
+        if (_m > 20) revert InvalidBonusMultiplier();
         bonusMultiplier = _m;
     }
 
