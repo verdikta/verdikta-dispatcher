@@ -8,6 +8,8 @@
 //   • Tagged "aggregator" so you can run: npx hardhat deploy --tags aggregator
 // -----------------------------------------------------------------------------
 
+const { verifyContract } = require("./helpers");
+
 module.exports = async ({ deployments, getNamedAccounts, network }) => {
   if (process.env.SKIP_MIGRATIONS) {
     console.log("[deploy/01_aggregator] SKIP_MIGRATIONS is set → skipping deploy");
@@ -36,12 +38,20 @@ module.exports = async ({ deployments, getNamedAccounts, network }) => {
 
   const ZERO = "0x0000000000000000000000000000000000000000"; // placeholder keeper
 
-  await deploy("ReputationAggregator", {
+  const result = await deploy("ReputationAggregator", {
     from: deployer,
     args: [linkAddr, ZERO],
     log: true,
     waitConfirmations: CONFIRMATIONS
   });
+
+  if (result.newlyDeployed) {
+    await verifyContract(
+      result.address,
+      [linkAddr, ZERO],
+      "contracts/ReputationAggregator.sol:ReputationAggregator"
+    );
+  }
 };
 
 module.exports.tags = ["aggregator"];

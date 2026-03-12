@@ -9,7 +9,7 @@
 // -----------------------------------------------------------------------------
 
 require("dotenv").config();
-const { execute } = deployments;
+const { verifyContract } = require("./helpers");
 
 module.exports = async ({ deployments, getNamedAccounts, ethers, network }) => {
   if (process.env.SKIP_MIGRATIONS) {
@@ -17,7 +17,7 @@ module.exports = async ({ deployments, getNamedAccounts, ethers, network }) => {
     return;
   }
 
-  const { deploy }   = deployments;
+  const { deploy, execute } = deployments;
   const { deployer } = await getNamedAccounts();
   const CONFIRMATIONS =
     (network.name === "base_sepolia" || network.name === "base") ? 2 : 1;
@@ -57,6 +57,14 @@ module.exports = async ({ deployments, getNamedAccounts, ethers, network }) => {
 
   const keeperAddr = keeperRes.address;
   console.log("ReputationKeeper deployment completed:", keeperAddr);
+
+  if (keeperRes.newlyDeployed) {
+    await verifyContract(
+      keeperAddr,
+      [TOKEN_ADDR],
+      "contracts/ReputationKeeper.sol:ReputationKeeper"
+    );
+  }
 
   /* ----------------------------------------------------------------------- */
   /* Wire keeper ↔ aggregator                                                */
