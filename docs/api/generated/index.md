@@ -29,6 +29,10 @@ The following contracts are automatically documented:
 - Event definitions
 - Error codes and descriptions
 
+## Integration Examples
+
+For end-to-end usage examples, see [Examples](../../examples/index.md).
+
 ---
 
 *Last updated: Automatically updated on every contract change*
