@@ -1,6 +1,11 @@
 site_name: Verdikta Dispatcher Smart Contracts
 site_description: Smart contract documentation for the Verdikta Dispatcher ecosystem
 
+# Repository
+repo_name: verdikta-dispatcher
+repo_url: https://github.com/verdikta/verdikta-dispatcher
+edit_uri: edit/master/docs/
+
 # Docs directory (set to docs subdirectory)
 docs_dir: docs
 
