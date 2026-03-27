@@ -5,27 +5,22 @@
   Finds all oracles registered in a ReputationKeeper that support a given
   capability class, then deregisters them.
 
+  The wVDKA token address is resolved automatically from the on-chain
+  aggregator → keeper → verdiktaToken chain.
+
   Example:
 
 HARDHAT_NETWORK=base_sepolia \
 node scripts/unregister-oracle-by-class-cl.js \
-  --aggregator      0xb2b724e4ee4Fa19Ccd355f12B4bB8A2F8C8D0089 \
-  --wrappedverdikta 0x2F1d1aF9d5C25A48C29f56f57c7BAFFa7cc910a3 \
-  --class           4040
-
-HARDHAT_NETWORK=base_sepolia \
-node scripts/unregister-oracle-by-class-cl.js \
-  --aggregator      0xb2b724e4ee4Fa19Ccd355f12B4bB8A2F8C8D0089 \
-  --wrappedverdikta 0x94e3c031fe9403c80E14DaFbCb73f191C683c2B1 \
-  --class           5050
+  --aggregator 0xb2b724e4ee4Fa19Ccd355f12B4bB8A2F8C8D0089 \
+  --class      4040
 
   Add --dry-run to preview without actually deregistering.
 
 HARDHAT_NETWORK=base \
 node scripts/unregister-oracle-by-class-cl.js \
-  --aggregator      0x2f7a02298D4478213057edA5e5bEB07F20c4c054 \
-  --wrappedverdikta 0x1EA68D018a11236E07D5647175DAA8ca1C3D0280 \
-  --class           129
+  --aggregator 0x2f7a02298D4478213057edA5e5bEB07F20c4c054 \
+  --class      129
 
 */
 
@@ -47,6 +42,7 @@ const KeeperABI = [
   "function getOracleClassesByKey(address,bytes32) view returns (uint64[])",
   "function deregisterOracle(address,bytes32)",
   "function owner() view returns (address)",
+  "function verdiktaToken() view returns (address)",
 ];
 
 const ERC20_BALANCE = [
@@ -114,12 +110,6 @@ function printBalanceComparison(label, address, before, after) {
         describe: "ReputationAggregator contract address",
         demandOption: true,
       })
-      .option("wrappedverdikta", {
-        alias: "w",
-        type: "string",
-        describe: "Wrapped VDKA token address",
-        demandOption: true,
-      })
       .option("class", {
         alias: "c",
         type: "number",
@@ -154,6 +144,9 @@ function printBalanceComparison(label, address, before, after) {
     const keeper = new ethers.Contract(keeperAddr, KeeperABI, signer);
     const keeperOwner = (await keeper.owner()).toLowerCase();
     console.log(`ReputationKeeper owner: ${keeperOwner}`);
+
+    const verdiktaTokenAddr = await keeper.verdiktaToken();
+    console.log(`Verdikta token (wVDKA): ${verdiktaTokenAddr}`);
 
     /* Scan for oracles matching the specified class */
     console.log(`\nScanning for oracles with capability class ${argv.class}...`);
@@ -248,7 +241,7 @@ function printBalanceComparison(label, address, before, after) {
     ]);
 
     /* wVDKA balances before */
-    const verdikta = new ethers.Contract(argv.wrappedverdikta, ERC20_BALANCE, signer);
+    const verdikta = new ethers.Contract(verdiktaTokenAddr, ERC20_BALANCE, signer);
     const balancesBefore = await getBalances(verdikta, [...addressesToTrack]);
 
     console.log("\n--- Initial wVDKA Balances ---");

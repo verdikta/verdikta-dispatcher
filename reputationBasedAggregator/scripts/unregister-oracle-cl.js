@@ -9,11 +9,10 @@
 
 HARDHAT_NETWORK=base_sepolia \
 node scripts/unregister-oracle-cl.js \
-  --aggregator      0x262f48f06DEf1FE49e0568dB4234a3478A191cFd \
-  --oracle          0x00A08b75178de0e0d7FF13Fdd4ef925AC3572503 \
-  --wrappedverdikta 0x2F1d1aF9d5C25A48C29f56f57c7BAFFa7cc910a3 \
-  --jobids          "38f19572c51041baa5f2dea284614590" \
-                    "39515f75ac2947beb7f2eeae4d8eaf3e"
+  --aggregator 0x262f48f06DEf1FE49e0568dB4234a3478A191cFd \
+  --oracle     0x00A08b75178de0e0d7FF13Fdd4ef925AC3572503 \
+  --jobids     "38f19572c51041baa5f2dea284614590" \
+               "39515f75ac2947beb7f2eeae4d8eaf3e"
 */
 
 require("dotenv").config();
@@ -30,7 +29,8 @@ const AggregatorABI = [
 const KeeperABI = [
   "function deregisterOracle(address,bytes32)",
   "function getOracleInfo(address,bytes32) view returns (bool isActive,int256,int256,uint256,bytes32,uint256,uint256,uint256,bool)",
-  "function owner() view returns (address)"
+  "function owner() view returns (address)",
+  "function verdiktaToken() view returns (address)",
 ];
 
 const ERC20_BALANCE = [
@@ -76,7 +76,6 @@ async function getOwnerOrSelf(addr, provider, signer) {
     const argv = yargs(hideBin(process.argv))
       .option("aggregator",      { alias: "a", type: "string", demandOption: true })
       .option("oracle",          { alias: "o", type: "string", demandOption: true })
-      .option("wrappedverdikta", { alias: "w", type: "string", demandOption: true })
       .option("jobids",          { alias: "j", type: "array",  demandOption: true })
       .strict().argv;
 
@@ -90,6 +89,8 @@ async function getOwnerOrSelf(addr, provider, signer) {
     console.log("ReputationKeeper:", keeperAddr);
 
     const keeper = new ethers.Contract(keeperAddr, KeeperABI, signer);
+    const verdiktaTokenAddr = await keeper.verdiktaToken();
+    console.log("Verdikta token (wVDKA):", verdiktaTokenAddr);
 
     /* Authorisation check */
     const [oracleOwner, keeperOwner] = await Promise.all([
@@ -105,7 +106,7 @@ async function getOwnerOrSelf(addr, provider, signer) {
     }
 
     /* wVDKA balance before */
-    const verdikta  = new ethers.Contract(argv.wrappedverdikta, ERC20_BALANCE, signer);
+    const verdikta  = new ethers.Contract(verdiktaTokenAddr, ERC20_BALANCE, signer);
     const balBefore = await verdikta.balanceOf(caller);
     console.log("Initial wVDKA balance:", ethers.formatEther(balBefore));
 

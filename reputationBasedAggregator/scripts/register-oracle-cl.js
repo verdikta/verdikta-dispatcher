@@ -9,12 +9,11 @@
 
 HARDHAT_NETWORK=base_sepolia \
 node scripts/register-oracle-cl.js \
-  --aggregator      0x262f48f06DEf1FE49e0568dB4234a3478A191cFd \
-  --link            0xE4aB69C077896252FAFBD49EFD26B5D171A32410 \
-  --oracle          0x00A08b75178de0e0d7FF13Fdd4ef925AC3572503 \
-  --wrappedverdikta 0x2F1d1aF9d5C25A48C29f56f57c7BAFFa7cc910a3 \
-  --jobids          "38f19572c51041baa5f2dea284614590" "39515f75ac2947beb7f2eeae4d8eaf3e" \
-  --classes         128 129
+  --aggregator 0x262f48f06DEf1FE49e0568dB4234a3478A191cFd \
+  --link       0xE4aB69C077896252FAFBD49EFD26B5D171A32410 \
+  --oracle     0x00A08b75178de0e0d7FF13Fdd4ef925AC3572503 \
+  --jobids     "38f19572c51041baa5f2dea284614590" "39515f75ac2947beb7f2eeae4d8eaf3e" \
+  --classes    128 129
 
 
 */
@@ -35,7 +34,8 @@ const AggregatorABI = [
 
 const KeeperABI = [
   "function registerOracle(address,bytes32,uint256,uint64[])",
-  "function getOracleInfo(address,bytes32) view returns (bool isActive,int256,int256,uint256,bytes32,uint256,uint256,uint256,bool)"
+  "function getOracleInfo(address,bytes32) view returns (bool isActive,int256,int256,uint256,bytes32,uint256,uint256,uint256,bool)",
+  "function verdiktaToken() view returns (address)",
 ];
 
 const ERC20_ABI = [
@@ -62,7 +62,6 @@ const toBytes32 = (id) => {
       .option("aggregator",      { alias: "a", type: "string", demandOption: true })
       .option("link",            { alias: "l", type: "string", demandOption: true })
       .option("oracle",          { alias: "o", type: "string", demandOption: true })
-      .option("wrappedverdikta", { alias: "w", type: "string", demandOption: true })
       .option("jobids",          { alias: "j", type: "array",  demandOption: true })
       .option("classes",         { alias: "c", type: "array",  demandOption: true })
       .strict()
@@ -80,7 +79,9 @@ const toBytes32 = (id) => {
     console.log("ReputationKeeper:", keeperAddr);
 
     const keeper     = new ethers.Contract(keeperAddr, KeeperABI, signer);
-    const verdikta   = new ethers.Contract(argv.wrappedverdikta, ERC20_ABI, signer);
+    const verdiktaTokenAddr = await keeper.verdiktaToken();
+    console.log("Verdikta token (wVDKA):", verdiktaTokenAddr);
+    const verdikta   = new ethers.Contract(verdiktaTokenAddr, ERC20_ABI, signer);
     const linkToken  = new ethers.Contract(argv.link,           ERC20_ABI, signer);
 
     const oracleAddr = argv.oracle;
