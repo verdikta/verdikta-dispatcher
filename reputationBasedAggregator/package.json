@@ -18,8 +18,7 @@
     "dotenv": "^16.5.0",
     "fs-extra": "^11.3.0",
     "hardhat": "^2.23.0",
-    "hardhat-deploy": "^1.0.2",
-    "truffle-flattener": "^1.6.0"
+    "hardhat-deploy": "^1.0.2"
   },
   "dependencies": {
     "@openzeppelin/contracts": "^5.3.0"
