@@ -14,5 +14,8 @@
     "test": "hardhat test",
     "deploy:base": "hardhat deploy --network base_sepolia",
     "deploy:sep": "hardhat deploy --network sepolia"
+  },
+  "dependencies": {
+    "@nomicfoundation/hardhat-verify": "^2.1.3"
   }
 }
