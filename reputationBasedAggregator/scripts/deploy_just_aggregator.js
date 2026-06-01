@@ -38,9 +38,18 @@ async function main () {
   const linkAddr = LINK_TOKEN_ADDRESS[network.name];
   if (!linkAddr) throw new Error(`No LINK token address for network ${network.name}`);
 
+  // AggregatorLib holds the pure clustering/cid/hex helpers; link against it.
+  const libRes = await deploy("AggregatorLib", {
+    from: deployer,
+    log:  true,
+    skipIfAlreadyDeployed: false,
+    deterministicDeployment: false
+  });
+
   const aggRes = await deploy("ReputationAggregator", {
     from: deployer,
     args: [linkAddr, keeperAddr],   // LINK token and keeper addresses
+    libraries: { AggregatorLib: libRes.address },
     log:  true,
     skipIfAlreadyDeployed: false,
     deterministicDeployment: false

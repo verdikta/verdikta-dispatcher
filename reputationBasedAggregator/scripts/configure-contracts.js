@@ -52,8 +52,9 @@ async function main() {
   await (await keeper.setVerdiktaToken(TOKEN_ADDR)).wait();
 
   // ---------- 2. Aggregator → config ----------
-  console.log("→ aggregator.setConfig(4, 3, 2, 300)");
-  await (await aggregator.setConfig(4, 3, 2, 300)).wait();
+  // setConfig(K, M, N, P, timeoutSecs) — commit-reveal 6-4-3-2 layout.
+  console.log("→ aggregator.setConfig(6, 4, 3, 2, 300)");
+  await (await aggregator.setConfig(6, 4, 3, 2, 300)).wait();
 
   const maxFee = ethers.parseEther("0.08");
   console.log(`→ aggregator.setMaxOracleFee(${maxFee})`);

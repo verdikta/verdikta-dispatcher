@@ -38,9 +38,18 @@ module.exports = async ({ deployments, getNamedAccounts, network }) => {
 
   const ZERO = "0x0000000000000000000000000000000000000000"; // placeholder keeper
 
+  // AggregatorLib holds the pure clustering/cid/hex helpers; the aggregator
+  // links against it (DELEGATECALL) to stay under the 24 KB code-size limit.
+  const lib = await deploy("AggregatorLib", {
+    from: deployer,
+    log: true,
+    waitConfirmations: CONFIRMATIONS
+  });
+
   const result = await deploy("ReputationAggregator", {
     from: deployer,
     args: [linkAddr, ZERO],
+    libraries: { AggregatorLib: lib.address },
     log: true,
     waitConfirmations: CONFIRMATIONS
   });

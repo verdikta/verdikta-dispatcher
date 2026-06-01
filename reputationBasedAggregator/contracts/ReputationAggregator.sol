@@ -5,6 +5,7 @@ import "@chainlink/contracts/src/v0.8/ChainlinkClient.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "./ReputationKeeper.sol";
+import "./AggregatorLib.sol";
 
 /**
  * @title ReputationAggregator commit-reveal edition (ASCII only)
@@ -47,11 +48,8 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     error AggregationComplete();
     error NotTimedOut();
     error UnknownRequest();
-    error InvalidRequest();
     error MalformedPayload();
     error RevealBeforeCommit();
-    error NeedMoreResponses();
-    error ArrayLengthMismatch();
     error FeeTransferFailed();
     error BonusTransferFailed();
     error LinkTransferFailed();
@@ -262,9 +260,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     struct Response {
         uint256[] likelihoods;      /// @dev Array of likelihood scores provided by the oracle
         string justificationCID;    /// @dev IPFS CID containing the oracle's justification
-        bytes32 requestId;          /// @dev Chainlink request ID for this response
         bool selected;              /// @dev Whether this response was selected for aggregation
-        uint256 timestamp;          /// @dev Block timestamp when response was received
         address operator;           /// @dev Address of the oracle operator
         uint256 pollIndex;          /// @dev Oracle's slot index in the polling array
         bytes32 jobId;              /// @dev Oracle's job ID
@@ -295,8 +291,6 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         uint256[] pollFees;                               /// @dev fees paid to each oracle
 
         // accounting
-        mapping(bytes32 => bool) requestIds;    /// @dev valid requestIds (commit & reveal)
-        bool userFunded;                        /// @dev whether user provided funding
         address requester;                      /// @dev address that requested the evaluation
         uint256 startTimestamp;                 /// @dev when the evaluation was started
 
@@ -437,7 +431,6 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         agg.commitExpected = commitOraclesToPoll;
         agg.requiredResponses = requiredResponses;
         agg.clusterSize = clusterSize;
-        agg.userFunded = true;
         agg.requester = msg.sender;
         agg.startTimestamp = block.timestamp;
         agg.commitPhaseComplete = false;
@@ -465,7 +458,6 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
             bytes32 opReq = _sendSingleOracleRequest(aggId, sel[i].oracle, jobId, fee, cidConcat);
             requestIdToAggregatorId[opReq] = aggId;
             requestIdToPollIndex[opReq] = i;  // slot == i
-            agg.requestIds[opReq] = true;
             agg.pollFees.push(fee);
 
             emit OracleSelected(aggId, i, sel[i].oracle, sel[i].jobId);
@@ -546,7 +538,6 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
 
         AggregatedEvaluation storage agg = aggregatedEvaluations[aggId];
         if (agg.isComplete) revert AggregationComplete();
-        if (!agg.requestIds[requestId]) revert InvalidRequest();
 
         uint256 slot = requestIdToPollIndex[requestId];
         ReputationKeeper.OracleIdentity memory id = agg.polledOracles[slot];
@@ -618,12 +609,12 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         }
 
         // Split "cleanCid:20hexSalt" -> (cid, saltUint)
-        (bool ok, uint256 colonPos) = _isValidCidSalt(cid);
+        (bool ok, uint256 colonPos) = AggregatorLib.isValidCidSalt(cid);
         if (!ok) {
-            emit InvalidRevealFormat(aggId, slot, msg.sender, cid); 
+            emit InvalidRevealFormat(aggId, slot, msg.sender, cid);
             return;                         // treat as not revealed
         }
-        (string memory cleanCid, uint256 saltUint) = _parseCidSaltUnchecked(cid, colonPos);
+        (string memory cleanCid, uint256 saltUint) = AggregatorLib.parseCidSaltUnchecked(cid, colonPos);
 
         // verify commit-reveal hash
         bytes16 recomputed = bytes16(sha256(abi.encode(msg.sender, response, saltUint)));
@@ -649,9 +640,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         Response memory resp = Response({
             likelihoods:      response,
             justificationCID: cleanCid,
-            requestId:        requestId,
             selected:         selected,
-            timestamp:        block.timestamp,
             operator:         msg.sender,
             pollIndex:        slot,
             jobId:            id.jobId
@@ -678,11 +667,10 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
             }
             
             ReputationKeeper.OracleIdentity memory oid = agg.polledOracles[slot];
-            string memory cid2 = string(abi.encodePacked("2:", _bytes16ToHexStringLower(hash128)));
+            string memory cid2 = string(abi.encodePacked("2:", AggregatorLib.bytes16ToHexLower(hash128)));
             bytes32 opReq = _sendSingleOracleRequest(aggId, oid.oracle, oid.jobId, 0, cid2);
             requestIdToAggregatorId[opReq] = aggId;
             requestIdToPollIndex[opReq] = slot;
-            agg.requestIds[opReq] = true;
 
             emit RevealRequestDispatched(aggId, slot, hash128);
         }
@@ -700,7 +688,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     ) internal returns (bytes32) {
         Chainlink.Request memory req = _buildOperatorRequest(jobId, this.fulfill.selector);
         req._add("cid", cidPayload);
-        req._add("aggId", _bytes32ToHexString(aggId));
+        req._add("aggId", AggregatorLib.bytes32ToHex(aggId));
         return _sendOperatorRequestTo(operator, req, fee);
     }
 
@@ -722,9 +710,18 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
             if (agg.responses[i].selected) selIdx[k++] = i;
         }
         
-        uint256[] memory cluster = (selectedCount >= 2)
-            ? _findBestClusterFromResponses(agg.responses, selIdx, agg.clusterSize)
-            : new uint256[](selectedCount);
+        uint256[] memory cluster;
+        if (selectedCount >= 2) {
+            // Copy only the likelihood vectors into memory for the clustering
+            // library (avoids passing the whole Response[] across the call).
+            uint256[][] memory ll = new uint256[][](agg.responses.length);
+            for (uint256 i = 0; i < agg.responses.length; i++) {
+                ll[i] = agg.responses[i].likelihoods;
+            }
+            cluster = AggregatorLib.findBestCluster(ll, selIdx, agg.clusterSize);
+        } else {
+            cluster = new uint256[](selectedCount);
+        }
 
         if (agg.responses.length > 0) {
             agg.aggregatedLikelihoods = new uint256[](agg.responses[0].likelihoods.length);
@@ -796,7 +793,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
                             emit OracleScoreUpdateSkipped(resp.operator, resp.jobId, "updateScores failed for clustered selected response");
                         }
                         uint256 bonus = agg.pollFees[slot] * bonusMultiplier;
-                        _payBonus(agg.requester, agg.userFunded, bonus, resp.operator);
+                        _payBonus(agg.requester, bonus, resp.operator);
                         return (true, 1);
                     } else {
                         try reputationKeeper.updateScores(id.oracle, resp.jobId, selectedQualityScore, selectedTimelinessScore) {} catch {
@@ -821,31 +818,6 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     }
 
     // ----------------------------------------------------------------------
-    //                       HELPER: CONVERSIONS
-    // ----------------------------------------------------------------------
-    function _bytes16ToHexStringLower(bytes16 data) internal pure returns (string memory) {
-        bytes memory hexChars = new bytes(32);
-        for (uint256 i = 0; i < 16; i++) {
-            uint8 b = uint8(data[i]);
-            hexChars[2 * i] = _lowerHexChar(b >> 4);
-            hexChars[2 * i + 1] = _lowerHexChar(b & 0x0f);
-        }
-        return string(hexChars);
-    }
-
-    function _bytes32ToHexString(bytes32 x) internal pure returns (string memory) {
-        bytes memory s = new bytes(2+64);
-        s[0] = "0";
-        s[1] = "x";
-        for (uint256 i; i < 32; ++i) {
-            uint8 b = uint8(x[i]);
-            s[2 + 2*i]     = _lowerHexChar(b >> 4);
-            s[3 + 2*i] = _lowerHexChar(b & 0x0f);
-        }
-        return string(s);
-    }
-
-    // ----------------------------------------------------------------------
     //                          HELPER FUNCTIONS
     // ----------------------------------------------------------------------
 
@@ -864,10 +836,6 @@ function _ensureAggArrayExists(
     return agg.aggregatedLikelihoods;  // this is a STORAGE alias
 }
 
-    function _lowerHexChar(uint8 nib) internal pure returns (bytes1) {
-        return bytes1(uint8(nib < 10 ? 48 + nib : 87 + nib)); // 0-9 → '0'-'9', 10-15 → 'a'-'f'
-    }
-
     /**
      * @notice Get the current request counter value
      * @dev Used for generating unique aggregator request IDs
@@ -882,21 +850,13 @@ function _ensureAggArrayExists(
      */
     function _payBonus(
         address requester,
-        bool userFunded,
         uint256 amount,
         address operator
     ) internal {
         if (amount > 0) {
             LinkTokenInterface link = LinkTokenInterface(_chainlinkTokenAddress());
-            
-            if (userFunded) {
-                // If user funded, transfer from requester
-                if (!link.transferFrom(requester, operator, amount)) revert BonusTransferFailed();
-            } else {
-                // Otherwise transfer from contract
-                if (!link.transfer(operator, amount)) revert BonusTransferFailed();
-            }
-            
+            // All requests are user-funded: pull the bonus from the requester.
+            if (!link.transferFrom(requester, operator, amount)) revert BonusTransferFailed();
             emit BonusPayment(operator, amount);
         }
     }
@@ -943,149 +903,7 @@ function _ensureAggArrayExists(
         return (false, 0);
     }
     
-    /**
-     * @dev Find the best cluster from responses
-     */
-    function _findBestClusterFromResponses(
-        Response[] memory responses,
-        uint256[] memory selectedResponseIndices,
-        uint256 P                              // desired cluster size
-    ) internal pure returns (uint256[] memory)
-    {
-        uint256 count = selectedResponseIndices.length;
-        if (count < 2) revert NeedMoreResponses();
-
-        // Cap P to available responses
-        if (P > count) P = count;
-
-        // ---- step 1: find the closest pair ----
-        uint256 bestA;
-        uint256 bestB;
-        uint256 bestDist = type(uint256).max;
-        for (uint256 i = 0; i < count - 1; ++i) {
-            for (uint256 j = i + 1; j < count; ++j) {
-                uint256 d = _calculateDistance(
-                    responses[selectedResponseIndices[i]].likelihoods,
-                    responses[selectedResponseIndices[j]].likelihoods
-                );
-                if (d < bestDist) {
-                    bestDist = d;
-                    bestA = i;
-                    bestB = j;
-                }
-            }
-        }
-
-        // flags: 1 = in cluster, 0 = out
-        uint256[] memory flags = new uint256[](count);
-        flags[bestA] = 1;
-        flags[bestB] = 1;
-        uint256 clusterSizeNow = 2;
-
-        // ---- step 2: greedy add until clusterSizeNow == P ----
-        while (clusterSizeNow < P) {
-            uint256 bestCand;
-            uint256 bestScore = type(uint256).max;
-
-            for (uint256 i = 0; i < count; ++i) {
-                if (flags[i] == 1) continue; // already in cluster
-
-                // score = sum distance to current cluster members
-                uint256 score = 0;
-                for (uint256 k = 0; k < count; ++k) {
-                    if (flags[k] == 1) {
-                        score += _calculateDistance(
-                            responses[selectedResponseIndices[i]].likelihoods,
-                            responses[selectedResponseIndices[k]].likelihoods
-                        );
-                    }
-                }
-                if (score < bestScore) {
-                    bestScore = score;
-                    bestCand  = i;
-                }
-            }
-
-            flags[bestCand] = 1;
-            ++clusterSizeNow;
-        }
-
-        return flags; // length == count, with exactly P ones
-    }
-
-
-    /**
-     * @dev Calculate the Euclidean distance between two arrays
-     */
-    function _calculateDistance(uint256[] memory a, uint256[] memory b) 
-        internal pure returns (uint256) 
-    {
-        if (a.length != b.length) revert ArrayLengthMismatch();
-        uint256 sum = 0;
-        for (uint256 i = 0; i < a.length; i++) {
-            uint256 diff = (a[i] > b[i]) ? a[i] - b[i] : b[i] - a[i];
-            sum += diff * diff;
-        }
-        return sum;
-    }
-
-    /// @dev Fast shape check for "cid:20hex" format.
-    ///      Returns (ok, lastColonPos) where `lastColonPos` is the index
-    ///      of ':' that separates cid and salt (undefined if !ok).
-    function _isValidCidSalt(string memory packed)
-        private pure
-        returns (bool, uint256)
-    {
-        bytes memory b = bytes(packed);
-
-        // at least 1 char + ':' + 20 chars
-        if (b.length <= 21) return (false, 0);
-
-        // find the last ':'
-        uint256 i = b.length;
-        while (i > 0 && b[i-1] != ":") { unchecked { --i; } }
-        if (i == 0 || (b.length - i) != 20) return (false, 0);
-
-        // check all 20 chars are hex
-        unchecked {
-            for (uint256 j = i; j < b.length; ++j) {
-                uint8 c = uint8(b[j]);
-                uint8 v = (c >= 97) ? c - 87
-                       : (c >= 65) ? c - 55
-                       : (c >= 48) ? c - 48
-                       : 255;
-                if (v >= 16) return (false, 0);
-            }
-        }
-        return (true, i);
-    }
-
-    /// @dev Call **only after** `_isValidCidSalt` returned (true, pos).
-    function _parseCidSaltUnchecked(string memory packed, uint256 colonPos)
-        private pure
-        returns (string memory cidOnly, uint256 salt)
-    {
-        bytes memory b = bytes(packed);
-
-        // copy CID bytes
-        bytes memory cidBytes = new bytes(colonPos - 1);
-        for (uint256 j; j < cidBytes.length; ++j) cidBytes[j] = b[j];
-
-        // parse 20-char hex salt
-        unchecked {
-            for (uint256 j = colonPos; j < b.length; ++j) {
-                uint8 c = uint8(b[j]);
-                uint8 v = (c >= 97) ? c - 87
-                       : (c >= 65) ? c - 55
-                       : (c >= 48) ? c - 48
-                       : 0;           // cannot overflow; already validated
-                salt = (salt << 4) | v;
-            }
-         }
-        cidOnly = string(cidBytes);
-    }
-
-    // Mix salt into 128-bit entropy    
+    // Mix salt into 128-bit entropy
     function _updateEntropy(bytes10 salt10) internal {
         // Mix previous entropy, new salt, and parent block-hash (prevents
         // extension-attack on keccak, adds 50% unknown bits).
