@@ -46,6 +46,14 @@ module.exports = async ({ deployments, getNamedAccounts, network }) => {
     waitConfirmations: CONFIRMATIONS
   });
 
+  if (lib.newlyDeployed) {
+    await verifyContract(
+      lib.address,
+      [],
+      "contracts/AggregatorLib.sol:AggregatorLib"
+    );
+  }
+
   const result = await deploy("ReputationAggregator", {
     from: deployer,
     args: [linkAddr, ZERO],
@@ -58,7 +66,8 @@ module.exports = async ({ deployments, getNamedAccounts, network }) => {
     await verifyContract(
       result.address,
       [linkAddr, ZERO],
-      "contracts/ReputationAggregator.sol:ReputationAggregator"
+      "contracts/ReputationAggregator.sol:ReputationAggregator",
+      { "contracts/AggregatorLib.sol:AggregatorLib": lib.address }
     );
   }
 };

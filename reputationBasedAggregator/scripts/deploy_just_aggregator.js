@@ -8,6 +8,7 @@
 // -----------------------------------------------------------------------------
 require("dotenv").config();
 const hre = require("hardhat");
+const { verifyContract } = require("../deploy/helpers");
 
 const LINK_TOKEN_ADDRESS = {
   base:         "0xd886e2286fd1073df82462ea1822119600af80b6",
@@ -56,6 +57,23 @@ async function main () {
   });
   const aggAddr = aggRes.address;
   console.log("New ReputationAggregator deployed:", aggAddr);
+
+  // Auto-verify the library and the (library-linked) aggregator.
+  if (libRes.newlyDeployed) {
+    await verifyContract(
+      libRes.address,
+      [],
+      "contracts/AggregatorLib.sol:AggregatorLib"
+    );
+  }
+  if (aggRes.newlyDeployed) {
+    await verifyContract(
+      aggAddr,
+      [linkAddr, keeperAddr],
+      "contracts/ReputationAggregator.sol:ReputationAggregator",
+      { "contracts/AggregatorLib.sol:AggregatorLib": libRes.address }
+    );
+  }
 
   /* ------------------------------------------------------------------ */
   /* 3. Approve the aggregator inside the keeper (if not yet approved)  */

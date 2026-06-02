@@ -14,8 +14,11 @@ const LOCAL_NETWORKS = new Set(["hardhat", "localhost", "development"]);
  * @param {string} [contractFQN]    - Fully qualified name, e.g.
  *                                    "contracts/Foo.sol:Foo"  (optional but
  *                                    recommended when multiple .sol files exist)
+ * @param {Object} [libraries]      - Linked external libraries, keyed by FQN,
+ *                                    e.g. { "contracts/Foo.sol:FooLib": "0x..." }
+ *                                    (required to verify a library-linked contract)
  */
-async function verifyContract(address, constructorArgs, contractFQN) {
+async function verifyContract(address, constructorArgs, contractFQN, libraries) {
   const network = hre.network.name;
 
   // Skip local/test networks
@@ -23,9 +26,9 @@ async function verifyContract(address, constructorArgs, contractFQN) {
 
   // Skip if no API key is configured
   const hasKey =
-    process.env.BASESCAN_API_KEY || process.env.ETHERSCAN_API_KEY;
+    process.env.ETHERSCAN_API_KEY || process.env.BASESCAN_API_KEY;
   if (!hasKey) {
-    console.log("No BASESCAN_API_KEY or ETHERSCAN_API_KEY set — skipping verification.");
+    console.log("No ETHERSCAN_API_KEY or BASESCAN_API_KEY set — skipping verification.");
     return;
   }
 
@@ -41,6 +44,7 @@ async function verifyContract(address, constructorArgs, contractFQN) {
         constructorArguments: constructorArgs,
       };
       if (contractFQN) verifyArgs.contract = contractFQN;
+      if (libraries && Object.keys(libraries).length) verifyArgs.libraries = libraries;
 
       await hre.run("verify:verify", verifyArgs);
       console.log("Verified successfully!");
