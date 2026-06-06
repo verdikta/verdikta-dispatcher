@@ -652,6 +652,26 @@ No keeper change (no `setFee`; see §5.4).
 Off-chain / clients:
 
 10. Update `DemoClient` and consumer examples to drop LINK approval and send ETH.
+
+    > **Client UX — one transaction per request (down from three).** Today a query is three
+    > MetaMask signatures: (1) fund/approve LINK into the consumer — the aggregator pulls
+    > payment via `transferFrom`, so `DemoClient` must hold LINK and pre-`approve` it
+    > (`DemoClient.sol:45-48`, plus `transfer-link`); (2) `request()`; (3) `publish()`, which
+    > also resets `currentAggId` so the next request may run. The ETH flow collapses this to
+    > **one signed transaction**:
+    > - Step 1 **disappears** — native ETH rides with the call as `msg.value`, so there is no
+    >   ERC-20 `approve`, no pre-funding the consumer with LINK, and no need to *source* LINK
+    >   at all (users already hold ETH for gas). Make the consumer `payable` and forward
+    >   `{value:}` to the aggregator. With fund-from-credit (§4.5), repeat requests may even
+    >   attach `msg.value = 0`, drawing on accumulated refund credit.
+    > - Step 2 is the **single irreducible tx** — `request{value:}()` starts the evaluation.
+    > - Step 3 is **not fundamental** — it is a `DemoClient` artifact (on-chain result write +
+    >   single-slot `currentAggId` bookkeeping). Read results via the gas-free
+    >   `getEvaluation(aggId)` **view** instead, and don't gate the next request on an
+    >   on-chain `publish()`. Result retrieval then costs no MetaMask step.
+    >
+    > The refund adds **no** step: it recycles into the next request via fund-from-credit;
+    > `withdrawEth()` is needed only to *exit* (pull ETH back out), never per request.
 11. Update scripts/tests under `reputationBasedAggregator/` to the ETH flow.
 12. Optionally pin `minContractPaymentLinkJuels = 0` in `verdikta-arbiter`'s
     `basicJobSpec` to make the 0-LINK path robust to node-config changes.
