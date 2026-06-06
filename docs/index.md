@@ -136,6 +136,7 @@ contract.on("EvaluationFulfilled", (requestId, likelihoods, justificationCID) =>
 - **[Fee Mechanisms](advanced/fees.md)** - Understanding fee calculations
 - **[Security Model](advanced/security.md)** - Commit-reveal and other protections
 - **[Oracle Selection](advanced/oracle-selection.md)** - Weighted selection algorithms
+- **[ETH Payment Migration](advanced/eth-payment-migration.md)** - Plan for paying arbiters in ETH while keeping the Chainlink rail
 
 ## Support
 
