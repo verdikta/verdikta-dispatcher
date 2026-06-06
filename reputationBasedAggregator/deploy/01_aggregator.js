@@ -54,6 +54,10 @@ module.exports = async ({ deployments, getNamedAccounts, network }) => {
     );
   }
 
+  // NOTE: `ReputationAggregator` is the ETH-funded contract. It still takes the LINK
+  // token address because the Chainlink request rail dispatches via transferAndCall(
+  // operator, 0, data) (0 juel) and ChainlinkClient needs the token wired. Do NOT drop
+  // the linkAddr arg — only the *consumer* (DemoClient) drops LINK. See docs section 7 step 16.
   const result = await deploy("ReputationAggregator", {
     from: deployer,
     args: [linkAddr, ZERO],

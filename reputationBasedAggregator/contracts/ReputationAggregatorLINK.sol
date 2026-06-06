@@ -8,8 +8,13 @@ import "./ReputationKeeper.sol";
 import "./AggregatorLib.sol";
 
 /**
- * @title ReputationAggregator commit-reveal edition, ETH-funded (ASCII only)
+ * @title ReputationAggregatorLINK commit-reveal edition (ASCII only)
  * @author Verdikta Team
+ * @dev LEGACY: this is the original LINK-funded aggregator, archived after the
+ *      LINK->ETH payment migration. Its logic is unchanged from the pre-migration
+ *      ReputationAggregator; the canonical name `ReputationAggregator` now refers
+ *      to the ETH-funded fork. Kept in-tree as a compiling archive only - it is no
+ *      longer wired into the deploy scripts.
  * @notice Two phase polling system for secure oracle aggregation with commit-reveal mechanism
  * @dev Implements a sophisticated oracle aggregation system with the following phases:
  *      - K = commitOraclesToPoll  - oracles polled in commit phase (Mode 1)
@@ -24,21 +29,13 @@ import "./AggregatorLib.sol";
  *      2. When first M commitments arrive, the contract sends Mode 2
  *         requests (reveal) back to those M oracles.
  *      3. After N valid reveals, responses are clustered and scored.
- *
- *      Payment (ETH, see docs/advanced/eth-payment-migration.md):
- *      - Arbiters are paid in ETH, not LINK. The Chainlink request rail is kept
- *        but carries 0 juel (transferAndCall(operator, 0, data)); the aggregator
- *        holds no LINK for routine operation.
- *      - The requester prepays the worst case in msg.value (and/or from existing
- *        ethOwed credit). The contract escrows that ETH and settles via a pull
- *        ledger (ethOwed): oracle owners and refund-due requesters withdraw it.
- *      - 1x base fee is credited to ALL K polled oracles' owners up front, at
- *        request time (so there is never an incentive to submit a fake commit
- *        just to collect base). A bonus of Bx the base fee is credited to each
- *        clustered oracle at finalize. Unspent ETH is refunded to the requester
- *        as an ethOwed credit. Invariant: balance == sum(ethOwed) + sum(reserved).
+ *        
+ *      Payment:
+ *      1. All oracles get 1x fee up front.
+ *      2. There is a bonus multiplier B, nominally 3.
+ *      3. Clustered oracles get this additional Bx fee at finish.
  */
-contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
+contract ReputationAggregatorLINK is ChainlinkClient, Ownable, ReentrancyGuard {
     using Chainlink for Chainlink.Request;
 
     // ----------------------------------------------------------------------
@@ -58,12 +55,10 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     error UnknownRequest();
     error MalformedPayload();
     error RevealBeforeCommit();
+    error FeeTransferFailed();
+    error BonusTransferFailed();
     error LinkTransferFailed();
     error ZeroAddress();
-    error InsufficientPayment();   // msg.value + applied credit < required worst-case
-    error NotAuthorized();         // withdrawEthFor caller is neither payee nor owner
-    error NothingOwed();           // withdrawal attempted with a zero ethOwed balance
-    error EthTransferFailed();     // payee.call{value:} returned false on withdrawal
 
     // ----------------------------------------------------------------------
     //                          CONFIGURATION
@@ -90,11 +85,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     int8 public committedTimelinessScore;   // timeliness score change when committed but not revealed
     int8 public committedQualityScore;      // quality score change when committed but not revealed
 
-    // owner-settable hard ceiling on a single oracle's fee, denominated in ETH wei.
-    // Unlike the legacy LINK contract this ceiling is ENFORCED in selection: the
-    // request entry point clamps the caller's _maxOracleFee down to this value
-    // before calling selectOracles, so it bounds which arbiters are eligible (see
-    // the fee clamp in requestAIEvaluationWithApproval and docs section 5.3).
+    // owner-settable LINK fee limits
     uint256 public maxOracleFee;
 
     // limits for user input
@@ -148,35 +139,10 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     /// @param operator Address of the oracle operator
     event NewOracleResponseRecorded(bytes32 requestId, uint256 pollIndex, bytes32 indexed aggRequestId, address operator);
     
-    /// @notice Emitted when a bonus is credited to a clustered oracle's owner
-    /// @param operator Address of the oracle operator whose owner is credited
-    /// @param bonusFee Amount of bonus ETH (wei) credited to ethOwed
+    /// @notice Emitted when bonus payment is made to a clustered oracle
+    /// @param operator Address of the oracle operator receiving bonus
+    /// @param bonusFee Amount of bonus LINK tokens paid
     event BonusPayment(address indexed operator, uint256 bonusFee);
-
-    /// @notice Emitted when base fee is credited to a polled oracle's owner at request time
-    /// @param aggRequestId Aggregator request identifier
-    /// @param pollIndex Oracle's slot index in the polling array
-    /// @param payee The credited address (oracle owner snapshotted at request)
-    /// @param amount Base fee (wei) credited to ethOwed
-    event BasePayment(bytes32 indexed aggRequestId, uint256 pollIndex, address indexed payee, uint256 amount);
-
-    /// @notice Emitted when unspent ETH is refunded to the requester as an ethOwed credit
-    /// @param aggRequestId Aggregator request identifier
-    /// @param requester The requester credited with the refund
-    /// @param amount Refund (wei) credited to ethOwed
-    event RequesterRefunded(bytes32 indexed aggRequestId, address indexed requester, uint256 amount);
-
-    /// @notice Emitted when a request draws on the caller's existing ethOwed credit
-    /// @param aggRequestId Aggregator request identifier
-    /// @param requester The requester (msg.sender) funding the round
-    /// @param fromCredit ETH (wei) drawn from ethOwed[requester]
-    /// @param fromValue ETH (wei) attached as msg.value
-    event RequestFunded(bytes32 indexed aggRequestId, address indexed requester, uint256 fromCredit, uint256 fromValue);
-
-    /// @notice Emitted when ETH is paid out from the pull ledger
-    /// @param payee The credited address that received the payout
-    /// @param amount ETH (wei) sent
-    event EthWithdrawn(address indexed payee, uint256 amount);
     
     /// @notice Emitted when an evaluation times out
     /// @param aggRequestId The aggregator request identifier
@@ -333,12 +299,6 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         address requester;                      /// @dev address that requested the evaluation
         uint256 startTimestamp;                 /// @dev when the evaluation was started
 
-        // ETH escrow accounting (see docs/advanced/eth-payment-migration.md section 4.5)
-        uint256 ethReceived;                    /// @dev ETH committed to this round (fromCredit + msg.value), set once at request
-        uint256 baseCredited;                   /// @dev sum of base fees credited to oracle owners (all K, at request time)
-        uint256 bonusCredited;                  /// @dev sum of bonus credited to clustered oracle owners at finalize
-        uint256 bonusMultiplierSnap;            /// @dev bonusMultiplier captured at request (prevents mid-round drift)
-
         // output
         string combinedJustificationCIDs;       /// @dev comma-separated CIDs from clustered oracles
         bool isComplete;                        /// @dev whether evaluation is finished
@@ -348,21 +308,9 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     // ----------------------------------------------------------------------
     //                         MAPPINGS
     // ----------------------------------------------------------------------
-    // Internal (not public): the auto-generated getter for this struct would ABI-encode
-    // all ~15 scalar fields in one tuple and overflow the stack even under viaIR. Read
-    // state via the curated getAggregationStatus() / getEthAccounting() views below.
-    mapping(bytes32 => AggregatedEvaluation) internal aggregatedEvaluations; // agg ID => evaluation
+    mapping(bytes32 => AggregatedEvaluation) public aggregatedEvaluations; // agg ID => evaluation
     mapping(bytes32 => bytes32) public requestIdToAggregatorId;            // nodeReq => aggReq
     mapping(bytes32 => uint256) public requestIdToPollIndex;               // nodeReq => poll slot
-
-    /// @notice Pull-payment ledger: ETH owed to a payee (an oracle owner credited
-    ///         base/bonus, or a requester awaiting a refund). Claimed via
-    ///         withdrawEth() / withdrawEthFor(payee). This is the only place ETH
-    ///         leaves the contract on the payment path.
-    /// @dev Global solvency invariant, true after every state transition:
-    ///      address(this).balance == sum(ethOwed) + sum_openAgg(reserved[aggId]),
-    ///      where reserved[aggId] = ethReceived - baseCredited - bonusCredited.
-    mapping(address => uint256) public ethOwed;
 
     // ----------------------------------------------------------------------
     //                              CONSTRUCTOR
@@ -391,11 +339,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         committedQualityScore = 0;       // quality score change when chosen for commit but not chosen for reveal
 
         responseTimeoutSeconds = 5 minutes;
-        // ETH ceiling: 0.0004 ETH (the live 0.05 LINK ceiling scaled by /125, see
-        // docs section 4.6). deploy/03_config.js sets this explicitly; the default
-        // is the same safe ETH-scale value so a config-less deploy cannot select
-        // LINK-scale arbiters.
-        maxOracleFee = 4 * 10 ** 14;  // 0.0004 ETH
+        maxOracleFee = 0.1 * 10 ** 18;  // 0.1 LINK
     }
 
     // ----------------------------------------------------------------------
@@ -430,14 +374,10 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     }
 
     /**
-     * @notice Estimate the maximum ETH needed for a complete evaluation with bonuses
-     * @dev Calculates: effFee × (K + bonus_multiplier × P) for the worst-case scenario,
-     *      where effFee = min(requestedMaxOracleFee, maxOracleFee) is the clamped per-oracle
-     *      ceiling actually used by selection. This is exactly the `required` amount the
-     *      request entry point enforces; callers size msg.value from this view (net of any
-     *      existing ethOwed credit). Denominated in ETH wei.
-     * @param requestedMaxOracleFee Requested maximum fee per oracle (clamped to maxOracleFee)
-     * @return Maximum total ETH (wei) required for the evaluation
+     * @notice Estimate the maximum LINK needed for complete evaluation with bonuses
+     * @dev Calculates: fee × (K + bonus_multiplier × P) for worst-case scenario
+     * @param requestedMaxOracleFee Requested maximum fee per oracle
+     * @return Maximum total LINK required for the evaluation
      */
     function maxTotalFee(uint256 requestedMaxOracleFee) public view returns (uint256) {
         uint256 eff = requestedMaxOracleFee < maxOracleFee ? requestedMaxOracleFee : maxOracleFee;
@@ -449,18 +389,14 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     // ----------------------------------------------------------------------
     
     /**
-     * @notice Request AI evaluation, funded with ETH (msg.value and/or existing credit)
+     * @notice Request AI evaluation with user-funded LINK payment
      * @dev Main entry point for requesting AI evaluation using commit-reveal aggregation.
-     *      The caller sends ETH with the call; the round may also draw on the caller's
-     *      existing ethOwed credit (fund-from-credit), so msg.value may be 0 when credit
-     *      covers the worst case. No LINK approval is required. The worst-case cost is
-     *      `maxTotalFee(_maxOracleFee)`; any unspent ETH is refunded to the caller as an
-     *      ethOwed credit at settlement. See docs/advanced/eth-payment-migration.md.
+     *      User must approve LINK tokens before calling this function.
      * @param cids Array of IPFS CIDs containing evidence/data to evaluate
      * @param addendumText Additional text to append to the evaluation request
      * @param _alpha Reputation weight factor for oracle selection (0-1000)
-     * @param _maxOracleFee Maximum fee per oracle in ETH wei (clamped to maxOracleFee)
-     * @param _estimatedBaseCost Estimated base cost for evaluation (ETH wei)
+     * @param _maxOracleFee Maximum fee per oracle in LINK wei
+     * @param _estimatedBaseCost Estimated base cost for evaluation
      * @param _maxFeeBasedScalingFactor Maximum scaling factor for fee-based selection
      * @param _requestedClass Oracle class/category requested for evaluation
      * @return bytes32 Unique aggregator request ID for tracking the evaluation
@@ -473,7 +409,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         uint256 _estimatedBaseCost,
         uint256 _maxFeeBasedScalingFactor,
         uint64 _requestedClass
-    ) public payable nonReentrant returns (bytes32) {
+    ) public nonReentrant returns (bytes32) {
         if (address(reputationKeeper) == address(0)) revert KeeperNotSet();
         if (cids.length == 0) revert EmptyCIDList();
         if (cids.length > MAX_CID_COUNT) revert TooManyCIDs();
@@ -481,18 +417,6 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
             if (bytes(cids[i]).length > MAX_CID_LENGTH) revert CIDTooLong();
         }
         if (bytes(addendumText).length > MAX_ADDENDUM_LENGTH) revert AddendumTooLong();
-
-        // ----- Fee clamp (docs section 5.3, layer 1) -----
-        // Clamp the caller's requested ceiling down to the contract ceiling BEFORE
-        // selection, so maxOracleFee is the authoritative ETH ceiling and the keeper's
-        // `fee <= maxFee` filter can never pull in a LINK-scale arbiter, regardless of
-        // what the caller passes. This mirrors the min() already in maxTotalFee().
-        uint256 effMaxFee = _maxOracleFee < maxOracleFee ? _maxOracleFee : maxOracleFee;
-
-        // ----- Fund the round: existing credit first, then fresh ETH (docs section 4.5) -----
-        // required == maxTotalFee(_maxOracleFee): the worst case effMaxFee * (K + B*P).
-        uint256 required = effMaxFee * (commitOraclesToPoll + bonusMultiplier * clusterSize);
-        uint256 fromCredit = _fundFromCredit(required);   // debits ethOwed[msg.sender] (CEI)
 
         // build CID payload
         bytes memory cat;
@@ -516,80 +440,36 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         agg.startTimestamp = block.timestamp;
         agg.commitPhaseComplete = false;
 
-        // ETH escrow: record what was committed and snapshot the bonus multiplier so a
-        // mid-round setBonusMultiplier() cannot size the bonus above the reserve.
-        agg.ethReceived = fromCredit + msg.value;
-        agg.bonusMultiplierSnap = bonusMultiplier;
-        emit RequestFunded(aggId, msg.sender, fromCredit, msg.value);
-
-        // select oracles (K) - pass the CLAMPED ceiling, not the raw caller value
+        // select oracles (K)
         ReputationKeeper.OracleIdentity[] memory sel = reputationKeeper.selectOracles(
             commitOraclesToPoll,
             _alpha,
-            effMaxFee,
+            _maxOracleFee,
             _estimatedBaseCost,
             _maxFeeBasedScalingFactor,
             _requestedClass
         );
         reputationKeeper.recordUsedOracles(sel);
 
-        // dispatch Mode 1 requests (per-oracle work extracted to keep this frame shallow)
+        // dispatch Mode 1 requests
         for (uint256 i = 0; i < sel.length; i++) {
-            _pollOracle(aggId, agg, sel[i], i, cidConcat);
+            agg.polledOracles.push(sel[i]);
+
+            (bool active, , , , bytes32 jobId, uint256 fee, , , ) = reputationKeeper.getOracleInfo(sel[i].oracle, sel[i].jobId);
+            if (!active) revert InactiveOracle();
+
+            if (!LinkTokenInterface(_chainlinkTokenAddress()).transferFrom(msg.sender, address(this), fee)) revert FeeTransferFailed();
+
+            bytes32 opReq = _sendSingleOracleRequest(aggId, sel[i].oracle, jobId, fee, cidConcat);
+            requestIdToAggregatorId[opReq] = aggId;
+            requestIdToPollIndex[opReq] = i;  // slot == i
+            agg.pollFees.push(fee);
+
+            emit OracleSelected(aggId, i, sel[i].oracle, sel[i].jobId);
         }
 
         emit RequestAIEvaluation(aggId, cids);
         return aggId;
-    }
-
-    /**
-     * @dev Debit the caller's existing ethOwed credit toward `required`, then require the
-     *      remaining shortfall to be covered by msg.value (docs section 4.5, fund-from-credit).
-     *      Only msg.sender's OWN credit can be spent, and the debit happens here - before any
-     *      external call in the caller - to satisfy checks-effects-interactions.
-     * @return fromCredit ETH drawn from ethOwed[msg.sender] (== min(credit, required)).
-     */
-    function _fundFromCredit(uint256 required) internal returns (uint256 fromCredit) {
-        uint256 credit = ethOwed[msg.sender];
-        fromCredit = credit < required ? credit : required;
-        if (msg.value + fromCredit < required) revert InsufficientPayment();
-        ethOwed[msg.sender] = credit - fromCredit;
-    }
-
-    /**
-     * @dev Poll a single selected oracle: record it, pay its 1x base fee up front to its
-     *      owner (pay-all decision, docs section 4.5), and dispatch the Mode-1 request with
-     *      0 juel (docs section 3). Extracted from the request loop both to keep that frame
-     *      under the stack limit and as the per-oracle transport/payment seam (docs section 6).
-     *      The charge-time guard (fee <= maxOracleFee) is layer 2 of the fee ceiling defense
-     *      (docs section 5.3); in correct operation selection already bounds fee <= effMaxFee.
-     */
-    function _pollOracle(
-        bytes32 aggId,
-        AggregatedEvaluation storage agg,
-        ReputationKeeper.OracleIdentity memory sel,
-        uint256 slot,
-        string memory cidConcat
-    ) internal {
-        agg.polledOracles.push(sel);
-
-        (bool active, , , , bytes32 jobId, uint256 fee, , , ) = reputationKeeper.getOracleInfo(sel.oracle, sel.jobId);
-        if (!active) revert InactiveOracle();
-        if (fee > maxOracleFee) revert InsufficientPayment();
-
-        // pay-all base: credit the oracle owner now, snapshotting the payee at credit time
-        address payee = _payeeFor(sel.oracle);
-        ethOwed[payee] += fee;
-        agg.baseCredited += fee;
-        emit BasePayment(aggId, slot, payee, fee);
-
-        // 0-juel dispatch: the Chainlink rail carries the request but no LINK
-        bytes32 opReq = _sendSingleOracleRequest(aggId, sel.oracle, jobId, 0, cidConcat);
-        requestIdToAggregatorId[opReq] = aggId;
-        requestIdToPollIndex[opReq] = slot;
-        agg.pollFees.push(fee);
-
-        emit OracleSelected(aggId, slot, sel.oracle, sel.jobId);
     }
 
     // ----------------------------------------------------------------------
@@ -616,11 +496,8 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
                 _dispatchRevealRequests(aggId, agg);
                 return;   // give them another timeout window
             }
-            // < M commits → fail job. Base was already credited to all K oracles at
-            // request time; no cluster formed (bonusCredited == 0), so the remainder
-            // refunds to the requester via the single uniform expression.
+            // < M commits → fail job
             _applyTimeoutPenalties(agg, true);  // penalise non-committing oracles only
-            _refundRequester(aggId, agg);
             agg.failed = true;
             agg.isComplete = true;
             emit EvaluationTimedOut(aggId);
@@ -631,7 +508,6 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         /* ----------------- reveal phase timed out ----------------- */
         if (agg.responseCount < agg.requiredResponses) {
             _applyTimeoutPenalties(agg, false); // penalise non-revealing oracles
-            _refundRequester(aggId, agg);       // bonusCredited == 0; refund the rest
             agg.failed = true;
             agg.isComplete = true;
             emit EvaluationTimedOut(aggId);
@@ -891,12 +767,6 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         }
         
         agg.combinedJustificationCIDs = combined;
-
-        // Bonus was credited per clustered slot in _processPollSlot above, so
-        // agg.bonusCredited is now final. Refund the requester the unspent remainder
-        // via the single uniform expression. All settlement is storage-only (credits,
-        // no external sends), so isComplete is purely the re-entry / double-settle guard.
-        _refundRequester(aggId, agg);
         agg.isComplete = true;
         emit FulfillAIEvaluation(aggId, agg.aggregatedLikelihoods, combined);
     }
@@ -927,15 +797,8 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
                         try reputationKeeper.updateScores(id.oracle, resp.jobId, clusteredQualityScore, clusteredTimelinessScore) {} catch {
                             emit OracleScoreUpdateSkipped(resp.operator, resp.jobId, "updateScores failed for clustered selected response");
                         }
-                        // Bonus credited as ETH to the clustered oracle's owner, using the
-                        // SNAPSHOT multiplier (not the live var) so a mid-round change cannot
-                        // size the bonus above the reserve. No external send - pure credit.
-                        uint256 bonus = agg.pollFees[slot] * agg.bonusMultiplierSnap;
-                        if (bonus > 0) {
-                            ethOwed[_payeeFor(resp.operator)] += bonus;
-                            agg.bonusCredited += bonus;
-                            emit BonusPayment(resp.operator, bonus);
-                        }
+                        uint256 bonus = agg.pollFees[slot] * bonusMultiplier;
+                        _payBonus(agg.requester, bonus, resp.operator);
                         return (true, 1);
                     } else {
                         try reputationKeeper.updateScores(id.oracle, resp.jobId, selectedQualityScore, selectedTimelinessScore) {} catch {
@@ -988,30 +851,18 @@ function _ensureAggArrayExists(
     }
 
     /**
-     * @dev Resolve the payee for an oracle: its owner() (docs section 4.3). This is the
-     *      single swappable seam between the operator/transport layer and the payment
-     *      ledger - ethOwed keys on a plain address, so when the Chainlink operator is
-     *      eventually removed only this helper changes. The result is snapshotted into
-     *      ethOwed at credit time, so earnings belong to whoever owned the arbiter when
-     *      the work was credited even if ownership later transfers.
+     * @dev Pay bonus to an operator
      */
-    function _payeeFor(address oracle) internal view returns (address) {
-        return IOracleOwner(oracle).owner();
-    }
-
-    /**
-     * @dev Credit the requester the unspent ETH for a settled round and emit the refund
-     *      event. The same expression is used on every exit path (success, commit/reveal
-     *      timeout): refund = ethReceived - baseCredited - bonusCredited. The B*P*effMaxFee
-     *      reserve guarantees bonusCredited <= reserve, so this subtraction never underflows
-     *      (docs section 4.5). Pure credit - the requester pulls it via withdrawEth(), or
-     *      recycles it into a later request via fund-from-credit.
-     */
-    function _refundRequester(bytes32 aggId, AggregatedEvaluation storage agg) internal {
-        uint256 refund = agg.ethReceived - agg.baseCredited - agg.bonusCredited;
-        if (refund > 0) {
-            ethOwed[agg.requester] += refund;
-            emit RequesterRefunded(aggId, agg.requester, refund);
+    function _payBonus(
+        address requester,
+        uint256 amount,
+        address operator
+    ) internal {
+        if (amount > 0) {
+            LinkTokenInterface link = LinkTokenInterface(_chainlinkTokenAddress());
+            // All requests are user-funded: pull the bonus from the requester.
+            if (!link.transferFrom(requester, operator, amount)) revert BonusTransferFailed();
+            emit BonusPayment(operator, amount);
         }
     }
 
@@ -1126,72 +977,6 @@ function _ensureAggArrayExists(
     }
 
     /**
-     * @notice Phase / lifecycle status for an aggregation (replaces the old public mapping
-     *         getter, split out to stay under the ABI-encoder stack limit).
-     * @param aggId The aggregator request ID
-     */
-    function getAggregationStatus(bytes32 aggId)
-        external view
-        returns (
-            bool isComplete,
-            bool failed,
-            bool commitPhaseComplete,
-            uint256 commitExpected,
-            uint256 commitReceived,
-            uint256 responseCount,
-            uint256 requiredN,
-            uint256 clusterP,
-            address requester,
-            uint256 startTimestamp
-        )
-    {
-        AggregatedEvaluation storage agg = aggregatedEvaluations[aggId];
-        return (
-            agg.isComplete,
-            agg.failed,
-            agg.commitPhaseComplete,
-            agg.commitExpected,
-            agg.commitReceived,
-            agg.responseCount,
-            agg.requiredResponses,
-            agg.clusterSize,
-            agg.requester,
-            agg.startTimestamp
-        );
-    }
-
-    /**
-     * @notice ETH escrow accounting for an aggregation (docs section 4.5).
-     * @dev `reserved` is the ETH still held against this round and not yet assigned to any
-     *      payee. For an OPEN round that is ethReceived - baseCredited - bonusCredited (base
-     *      is credited at request; bonus/refund only at settlement). Once the round is
-     *      complete the bonus and the refund have both moved into ethOwed, so reserved is 0
-     *      (returning the raw difference would double-count the refund, which now lives in
-     *      ethOwed[requester]). The global solvency invariant is therefore
-     *      address(this).balance == sum(ethOwed) + sum over OPEN aggIds of reserved.
-     * @param aggId The aggregator request ID
-     */
-    function getEthAccounting(bytes32 aggId)
-        external view
-        returns (
-            uint256 ethReceived,
-            uint256 baseCredited,
-            uint256 bonusCredited,
-            uint256 bonusMultiplierSnap,
-            uint256 reserved
-        )
-    {
-        AggregatedEvaluation storage agg = aggregatedEvaluations[aggId];
-        return (
-            agg.ethReceived,
-            agg.baseCredited,
-            agg.bonusCredited,
-            agg.bonusMultiplierSnap,
-            agg.isComplete ? 0 : (agg.ethReceived - agg.baseCredited - agg.bonusCredited)
-        );
-    }
-
-    /**
      * @notice Get contract configuration (legacy interface)
      * @dev Returns basic contract configuration for backwards compatibility
      * @return oracleAddr Placeholder oracle address (always returns zero)
@@ -1217,61 +1002,14 @@ function _ensureAggArrayExists(
     }
 
     /**
-     * @notice Withdraw LINK tokens from the contract (stuck-token escape hatch)
-     * @dev Under 0-juel dispatch the contract holds no routine LINK, so this is vestigial
-     *      for normal operation; it is retained only to recover LINK sent here by mistake.
-     *      This is NOT the forbidden owner ETH-sweep (docs section 7 step 8) - that ban is
-     *      about ETH. A LINK escape hatch is explicitly allowed (docs section 7 step 15).
+     * @notice Withdraw LINK tokens from the contract
+     * @dev Only callable by contract owner for emergency recovery
      * @param _to Address to receive the LINK tokens
      * @param _amount Amount of LINK tokens to withdraw (in wei)
      */
     function withdrawLink(address payable _to, uint256 _amount) external onlyOwner {
         LinkTokenInterface link = LinkTokenInterface(_chainlinkTokenAddress());
         if (!link.transfer(_to, _amount)) revert LinkTransferFailed();
-    }
-
-    // ----------------------------------------------------------------------
-    //             ETH PULL-PAYMENT WITHDRAWALS (docs section 4.2)
-    // ----------------------------------------------------------------------
-
-    /**
-     * @dev Pay out a payee's entire ethOwed balance to the payee. Checks-effects-
-     *      interactions: read the balance, zero it, then send. Reverts (restoring the
-     *      balance) on send failure rather than burning it, so a reverting/non-payable
-     *      recipient only fails its OWN withdrawal in isolation - it cannot block anyone
-     *      else, and the funds stay safely credited until the recipient is fixed.
-     *      The destination is ALWAYS the credited payee, never a caller-chosen address.
-     */
-    function _withdrawTo(address payee) internal {
-        uint256 amount = ethOwed[payee];
-        if (amount == 0) revert NothingOwed();
-        ethOwed[payee] = 0;                       // effect before interaction
-        (bool ok, ) = payable(payee).call{value: amount}("");
-        if (!ok) revert EthTransferFailed();      // revert restores ethOwed[payee]
-        emit EthWithdrawn(payee, amount);
-    }
-
-    /**
-     * @notice Withdraw your own accumulated ETH balance (base/bonus earnings or refunds).
-     * @dev Pulls the entire ethOwed[msg.sender] to msg.sender.
-     */
-    function withdrawEth() external nonReentrant {
-        _withdrawTo(msg.sender);
-    }
-
-    /**
-     * @notice Trigger a payout of `payee`'s balance TO `payee`.
-     * @dev Restricted trigger (docs section 4.2): only the payee themselves or the contract
-     *      owner may call this, and it always pays the credited payee - never the caller -
-     *      so neither can divert funds (the owner can only accelerate a payout to its
-     *      rightful owner). After renounceOwnership() owner() is address(0), so only the
-     *      payee can trigger. There is deliberately no third-party trigger, so a griefer
-     *      cannot force a requester's recyclable credit out of the contract.
-     * @param payee The credited address to pay out (also the destination).
-     */
-    function withdrawEthFor(address payee) external nonReentrant {
-        if (msg.sender != payee && msg.sender != owner()) revert NotAuthorized();
-        _withdrawTo(payee);
     }
 
     /**

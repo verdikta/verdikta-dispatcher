@@ -90,7 +90,11 @@ if (!TARGET) {
   }
   
   try {
-    const txReq = await demo.request({ gasLimit: 3_000_000n });
+    // ETH-funded: attach the worst-case ETH (the aggregator refunds any unspent remainder
+    // as a credit it holds for the DemoClient). No LINK approval is needed any more.
+    const value = await demo.quote();
+    console.log("attaching value (wei):", value.toString());
+    const txReq = await demo.request({ value, gasLimit: 3_000_000n });
     console.log("request tx:", txReq.hash);
     const rcpt = await txReq.wait(1);
     

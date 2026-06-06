@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.21;
 
-interface IERC20 {
-    function approve(address spender, uint256 amount) 
-        external returns (bool);
-    function transferFrom(address from, address to, uint256 amount) 
-        external returns (bool);
-    function balanceOf(address account) 
-        external view returns (uint256);
-}
-
 interface IReputationAggregator {
     function requestAIEvaluationWithApproval(
         string[] calldata cids,
@@ -19,47 +10,49 @@ interface IReputationAggregator {
         uint256 estimatedBaseFee,
         uint256 maxFeeScaling,
         uint64 jobClass
-    ) external returns (bytes32);
-    function getEvaluation(bytes32) 
+    ) external payable returns (bytes32);
+    function getEvaluation(bytes32)
        external view returns (uint256[] memory, string memory, bool);
     function isFailed(bytes32) external view returns (bool);
+    function maxTotalFee(uint256) external view returns (uint256);
+    function withdrawEth() external;
 }
 
+/**
+ * @title DemoClient (ETH-funded)
+ * @notice Example consumer for the ETH-funded ReputationAggregator. Native ETH rides with
+ *         the request as msg.value — there is no LINK token, no approve(), and nothing to
+ *         pre-fund (users already hold ETH for gas). The aggregator refunds any unspent ETH
+ *         as a credit it holds for this contract; that credit auto-funds the next request
+ *         (so a follow-up can attach msg.value = 0) or can be pulled back via reclaim().
+ */
 contract DemoClient {
     IReputationAggregator public immutable agg;
-    IERC20 public immutable link;
     string[] private cids;
     bytes32 public currentAggId;
-    bool internal linkApproved;
 
     event Requested(bytes32 id);
-    event Result(bytes32 id, uint64[] scores, string justif);
+    event Result(bytes32 id, uint256[] scores, string justif);
 
-    constructor(address aggregator, address linkToken) {
+    constructor(address aggregator) {
         agg = IReputationAggregator(aggregator);
-        link = IERC20(linkToken);
         cids.push("QmSnynnZVufbeb9GVNLBjxBJ45FyHgjPYUHTvMK5VmQZcS");
     }
 
-    // Function to approve aggregator (call this once before using request)
-    function approveAggregator() external {
-        link.approve(address(agg), type(uint256).max);
-        linkApproved = true;
-    }
-
-    function request() external {
+    /// @notice Start an evaluation, funding it with the attached ETH (and/or this contract's
+    ///         accumulated refund credit inside the aggregator). Fee params are ETH-wei,
+    ///         /125-scaled from the old LINK values (8e13 ceiling, 8e9 base cost).
+    function request() external payable {
         require(currentAggId == bytes32(0), "already pending");
-        
-        // one-time unlimited approval from this contract to aggregator
-        if (!linkApproved) {
-            link.approve(address(agg), type(uint256).max);
-            linkApproved = true;
-        }
-        
-        currentAggId = agg.requestAIEvaluationWithApproval(
-            cids, "", 500, 1e16, 1e12, 5, 128
+        currentAggId = agg.requestAIEvaluationWithApproval{value: msg.value}(
+            cids, "", 500, 8e13, 8e9, 5, 128
         );
         emit Requested(currentAggId);
+    }
+
+    /// @notice Convenience view: worst-case ETH to attach for one request.
+    function quote() external view returns (uint256) {
+        return agg.maxTotalFee(8e13);
     }
 
     function publish() external {
@@ -74,5 +67,12 @@ contract DemoClient {
             revert("not ready");
         }
     }
-}
 
+    /// @notice Pull this contract's accumulated refund credit back out of the aggregator.
+    function reclaim() external {
+        agg.withdrawEth();
+    }
+
+    /// @dev Accept ETH — the reclaimed refund lands here.
+    receive() external payable {}
+}

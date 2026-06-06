@@ -162,7 +162,8 @@ if (requestLogs.length === 0) {
 
   // Check aggregation status
   try {
-    const aggData = await agg.aggregatedEvaluations(aggId);
+    // ETH aggregator exposes curated views instead of the (removed) public struct getter.
+    const aggData = await agg.getAggregationStatus(aggId);
     console.log("Aggregation status:", {
       isComplete: aggData.isComplete,
       failed: aggData.failed,

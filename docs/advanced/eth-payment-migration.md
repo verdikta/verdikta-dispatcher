@@ -1,11 +1,53 @@
 # Migrating Arbiter Payment from LINK to ETH
 
-**Status:** Design note (not yet implemented)
+**Status:** Implemented (ETH aggregator + unit tests landed).
 **Scope:** `reputationBasedAggregator/contracts/ReputationAggregator.sol` only. `ReputationKeeper.sol` and `ArbiterOperator.sol` are **not** changed.
 
 This note captures the complete plan, the reasoning behind each decision, and the
 facts that were verified while designing it, so the approach can be reconstructed
 from this document alone.
+
+> ## Implementation notes — where the shipped code differs from the original design
+>
+> Three decisions were changed during implementation; this banner is authoritative
+> where it conflicts with the prose below (the prose is left intact for its reasoning).
+>
+> 1. **Pay base to ALL polled oracles at request time, not just responders.**
+>    The original §4.5 "pay only responders" rule was **reversed**. Base (1×) is now
+>    credited to every one of the K polled oracles' owners up front, in the request
+>    transaction (restoring the §2 "all polled paid 1× up front" semantic). Rationale:
+>    if base is conditional on committing, a weak arbiter has an incentive to submit a
+>    **fake/junk commit** purely to collect base; paying everyone removes that incentive.
+>    Freeloaders are still disciplined by the unchanged reputation penalties
+>    (`committed*Score`) applied to non-responders at finalize/timeout. Consequences:
+>    `baseCredited` is fixed at request (= Σ of all K fees), there is **no** per-slot
+>    "base paid" flag and **no** base logic in `fulfill`, and the requester's refund is
+>    correspondingly smaller (non-responders' base now flows to those oracles, not back
+>    to the requester). Solvency is unchanged: `baseCredited ≤ K·effMaxFee`,
+>    `bonusCredited ≤ B·P·effMaxFee`, so `refund = ethReceived − baseCredited −
+>    bonusCredited ≥ 0`.
+>
+> 2. **The optional `withdrawEth(address to)` self-redirect was NOT added.** Only
+>    `withdrawEth()` (pays `msg.sender`) and `withdrawEthFor(payee)` (payee/owner trigger,
+>    always pays `payee`) exist — minimal ETH-out surface. A payee whose `owner()` cannot
+>    receive ETH leaves funds safely credited until ownership is fixed.
+>
+> 3. **Naming: the surviving contract keeps the canonical name.** The new ETH-funded
+>    contract is `contracts/ReputationAggregator.sol` (`contract ReputationAggregator`);
+>    the legacy LINK contract was renamed to `contracts/ReputationAggregatorLINK.sol`
+>    (`contract ReputationAggregatorLINK`) and kept in-tree as a compiling archive only —
+>    it is no longer wired into the deploy scripts. The end state is ETH-only, so the
+>    unqualified name belongs to the contract that survives; the legacy one earns the
+>    qualifier. Deploy scripts (`01_aggregator.js`/`02_keeper.js`/`03_config.js`) now
+>    deploy/configure the ETH contract under the name `ReputationAggregator` unchanged
+>    (constructor still takes `linkAddr`; `03_config.js` sets `maxOracleFee = 0.0004 ETH`).
+>
+> One implementation detail worth recording: the per-aggregation state struct's
+> auto-generated public getter was dropped (it overflowed the ABI-encoder stack once the
+> ETH accounting fields were added). State is read via two curated views instead:
+> `getAggregationStatus(aggId)` and `getEthAccounting(aggId)`. The latter reports
+> `reserved` as `0` for a settled round (the refund has moved into `ethOwed`), matching
+> the "sum over OPEN aggIds" form of the solvency invariant.
 
 ---
 
@@ -340,7 +382,9 @@ snapshotted; `bonusMultiplier` is a live state var today and **must** be snapsho
 (a mid-round `setBonusMultiplier` raise would otherwise size the bonus above the reserve
 and break solvency).
 
-**Pay only responders.** Base is **not** credited at request time. It is credited per
+**Pay only responders.** *(SUPERSEDED — see Implementation note 1 at the top: the shipped
+code pays base to ALL K polled oracles at request time. The original rationale is kept
+below for context.)* Base is **not** credited at request time. It is credited per
 oracle **when that oracle's commit is recorded** in `fulfill` (the LINK-equivalent moment —
 the base fee rode the commit request, whose fulfillment released the operator's escrow),
 guarded by a per-slot "base paid" flag so it cannot double-credit. An oracle that commits
@@ -782,9 +826,11 @@ Minor sweep-ups (decisions, with rationale):
   later requests and the claimable balance stays bounded; the `balance == Σ ethOwed +
   Σ reserved` invariant is preserved and no separate deposit mapping is needed (§4.5).
   Callers size `msg.value` from the `maxTotalFee(_maxOracleFee)` view, net of credit.
-- **Pay only responders** — base is credited at commit-recording time, not at request;
-  non-responders' fee refunds to the requester (§4.5). Changes the old "all polled paid
-  1× up front" semantic.
+- **Pay all polled oracles** — *(REVISED from the original "pay only responders"; see
+  Implementation note 1 at the top.)* base (1×) is credited to every polled oracle's owner
+  at **request time**, responsive or not, restoring the old "all polled paid 1× up front"
+  semantic. This removes any incentive to submit a fake commit to collect base; freeloaders
+  are still curbed by the reputation penalties on non-responders.
 - **Single-stage settlement, refunds accumulate** — the requester prepays the worst case;
   one refund expression (`ethReceived − baseCredited − bonusCredited`) settles every path
   and accumulates in `ethOwed[requester]` for batch claiming (§4.5).

@@ -1,12 +1,16 @@
 // deploy/03_config.js
 // -----------------------------------------------------------------------------
 // Post‑deployment wiring & parameters
-//   • Set Verdikta token address inside ReputationKeeper (defensive)           
-//   • Configure ReputationAggregator (cluster, responses, fee, timeout)       
-//   • Set max oracle fee (0.05 LINK)                                          
-//                                                                             
-// Tags:    config                                                              
-// Depends: aggregator, keeper                                                  
+//   • Set Verdikta token address inside ReputationKeeper (defensive)
+//   • Configure ReputationAggregator (cluster, responses, fee, timeout)
+//   • Set max oracle fee (0.0004 ETH — the ETH-funded aggregator's hard ceiling)
+//
+// NOTE: `ReputationAggregator` now refers to the ETH-funded contract; maxOracleFee
+//       is denominated in ETH wei and is ENFORCED in selection (the clamp), so it
+//       must sit strictly below any LINK-scale arbiter fee. See docs section 4.6.
+//
+// Tags:    config
+// Depends: aggregator, keeper
 // -----------------------------------------------------------------------------
 
 require("dotenv").config();
@@ -78,7 +82,10 @@ if (keeper.target === aggregator.target) {
   console.log("Configuring aggregator parameters…");
   await (await aggregator.setConfig(6, 4, 3, 2, 300)).wait(CONFIRMATIONS);
 
-  const maxFee = ethers.parseEther("0.05"); // In LINK as maximum fee increment.
+  // ETH hard ceiling: 0.0004 ETH (4e14 wei) = the live 0.05 LINK ceiling scaled by
+  // /125 (docs section 4.6). This is below the prevailing 0.002-LINK arbiter band, so
+  // the clamp excludes every LINK-scale arbiter from the ETH aggregator's selection.
+  const maxFee = ethers.parseEther("0.0004");
   await (await aggregator.setMaxOracleFee(maxFee)).wait(CONFIRMATIONS);
 
   console.log("Aggregator configured.");
