@@ -1,4 +1,10 @@
 // hardhat.config.js
+const path = require("path");
+// Load shared deploy secrets (PRIVATE_KEY, PRIVATE_KEY_2, INFURA_API_KEY,
+// BASESCAN_API_KEY, ...) from the sibling secrets dir, then any local .env.
+// Secrets load first; dotenv never overrides values already in process.env, so
+// precedence is: real shell env  >  ../../secrets/.env.secrets  >  local .env.
+require("dotenv").config({ path: path.resolve(__dirname, "../../secrets/.env.secrets") });
 require("dotenv").config();
 const https = require("https");
 require("@nomicfoundation/hardhat-toolbox");
@@ -33,7 +39,9 @@ module.exports = {
       accounts: ACCOUNTS,
     },
     base_sepolia: {
-      url: `https://base-sepolia.infura.io/v3/${process.env.INFURA_API_KEY}`,
+      // Override with BASE_SEPOLIA_RPC_URL (e.g. https://sepolia.base.org, no API key);
+      // falls back to Infura when that env var is unset.
+      url: process.env.BASE_SEPOLIA_RPC_URL || `https://base-sepolia.infura.io/v3/${process.env.INFURA_API_KEY}`,
       httpAgent: keepAliveAgent,
       httpsAgent: keepAliveAgent,
       chainId: 84532,
@@ -42,8 +50,9 @@ module.exports = {
       accounts: ACCOUNTS,
     },
     base: {
-      url: `https://base-mainnet.infura.io/v3/${process.env.INFURA_API_KEY}`,
-      // url: "https://mainnet.base.org",
+      // Override with BASE_RPC_URL (e.g. https://mainnet.base.org, no API key);
+      // falls back to Infura when that env var is unset.
+      url: process.env.BASE_RPC_URL || `https://base-mainnet.infura.io/v3/${process.env.INFURA_API_KEY}`,
       httpAgent: keepAliveAgent,
       httpsAgent: keepAliveAgent,
       chainId: 8453,
