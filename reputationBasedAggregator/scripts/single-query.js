@@ -4,8 +4,10 @@ const hre = require('hardhat');
 const { ethers } = hre;
 
 /* ─── config ─────────────────────────────────────────────────────────── */
-// AGG must point at the ETH-funded ReputationAggregator.
-const AGG   = '0x65863e5e0B2c2968dBbD1c95BDC2e0EA598E5e02';          // <-- set to ETH aggregator
+// ETH-funded ReputationAggregator, per network (override with AGG env var).
+const AGG   = process.env.AGG || (hre.network.name === 'base'
+  ? '0x8d0627CCd3E1747EFaC3b7fc600e4697747be447'      // Base mainnet
+  : '0x01C0149854DA080d5fBD3c57FA40DDE5f2e10c64');    // Base Sepolia
 const CID   = 'QmZ2BgPsmnn4T4ShbdryoTWXFM4nHt7tM674fU4CLVHthH';      // <-- edit
 const JOB   = 128;
 const ALPHA = 500;
