@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# simultaneous-tests.sh – Hardhat version
-
+# simultaneous-tests.sh  — ./simultaneous-tests.sh [network]   (default base_sepolia)
+# Keys/RPC load from ../../secrets/.env.secrets via hardhat.config (no .env sourcing).
 set -euo pipefail
-set -a; [ -f .env ] && source .env; set +a
-
-npx hardhat run scripts/simultaneous-tests.js --network "${HARDHAT_NETWORK:-base_sepolia}"
+npx hardhat run scripts/simultaneous-tests.js --network "${1:-${HARDHAT_NETWORK:-base_sepolia}}"

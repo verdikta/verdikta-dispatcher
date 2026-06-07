@@ -19,8 +19,8 @@ const BETWEEN_QUERY_DELAY = 200;         // ms between tx submissions
 const NUM_INCREMENTS      = 12;
 const INCREMENT_DURATION  = 30_000;      // ms between polling rounds
 
-const JOB_CLASS           = 717;
-// const JOB_CLASS           = 128;
+const JOB_CLASS           = 128;   // must match a class your ETH arbiters registered for (128 is proven working)
+// const JOB_CLASS           = 717;
 // ETH-denominated (wei). Request ceiling must be >= the arbiters' fee (0.0001 ETH)
 // and <= the aggregator's maxOracleFee (0.0004 ETH); base cost must be < the ceiling.
 const MAX_ORACLE_FEE      = ethers.parseEther("0.00015");      // 0.00015 ETH
@@ -28,9 +28,8 @@ const ESTIMATE_BASE_FEE   = ethers.parseEther("0.000000008"); // 8e9 wei
 const MAX_FEE_SCALING     = 5;
 const ALPHA               = 500;
 
-const CIDS     = ["QmeY9cjdQJ1yvT5pcVmXfFwNwehEnLm12qpQZA2UiTmQ1D","QmXmMr5pTMRwb6nKeuF8UGwsmsDXXxfyMBfARzLyUzMSy2"];
-// const CIDS     = ["QmSHXfBcrfFf4pnuRYCbHA8rjKkDh1wjqas3Rpk3a2uAWH"];
-// const CIDS     = ["QmfDsqNzpwZnMy135JsFK5QTQW4yw3cUkrijT7gKZcrSag"];
+// Valid Verdikta query archive (same known-good CID as single-query.js). Override with CID env.
+const CIDS     = [process.env.CID || "Qma8vc6pEHEgFQkjS6qZbK4Ue8S7SkdhQ6eqLV2hcrDD53"];
 const ADDENDUM = "";
 const GAS_LIMIT = 3_000_000;
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
