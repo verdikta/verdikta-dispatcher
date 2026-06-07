@@ -9,7 +9,7 @@
 # Set HARDHAT_NETWORK to target a specific network (default: base_sepolia).
 
 set -euo pipefail
-set -a; source .env; set +a
+set -a; [ -f .env ] && source .env; set +a
 
 NETWORK="${HARDHAT_NETWORK:-base_sepolia}"
 DEPLOY_DIR="deployments/${NETWORK}"
