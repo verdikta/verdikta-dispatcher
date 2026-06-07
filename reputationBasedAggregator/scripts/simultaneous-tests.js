@@ -14,7 +14,7 @@ const AGGREGATOR = IS_BASE
   ? "0x8d0627CCd3E1747EFaC3b7fc600e4697747be447"
   : "0x01C0149854DA080d5fBD3c57FA40DDE5f2e10c64";
 
-const NUM_QUERIES         = 1;
+const NUM_QUERIES         = 3;
 const BETWEEN_QUERY_DELAY = 200;         // ms between tx submissions
 const NUM_INCREMENTS      = 12;
 const INCREMENT_DURATION  = 30_000;      // ms between polling rounds
@@ -23,7 +23,7 @@ const JOB_CLASS           = 128;   // must match a class your ETH arbiters regis
 // const JOB_CLASS           = 717;
 // ETH-denominated (wei). Request ceiling must be >= the arbiters' fee (0.0001 ETH)
 // and <= the aggregator's maxOracleFee (0.0004 ETH); base cost must be < the ceiling.
-const MAX_ORACLE_FEE      = ethers.parseEther("0.00015");      // 0.00015 ETH
+const MAX_ORACLE_FEE      = ethers.parseEther("0.0001");      // typical fee
 const ESTIMATE_BASE_FEE   = ethers.parseEther("0.000000008"); // 8e9 wei
 const MAX_FEE_SCALING     = 5;
 const ALPHA               = 500;
