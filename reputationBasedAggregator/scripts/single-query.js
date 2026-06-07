@@ -28,15 +28,18 @@ const DELAY = 20_000;   // poll every 20 s
   const abi = (await hre.artifacts.readArtifact('ReputationAggregator')).abi;
   const agg = new ethers.Contract(AGG, abi, signer);
 
-  /* Worst-case ETH to attach. The aggregator refunds any unspent remainder as an
-     ethOwed credit (claim with withdrawEth(), or it auto-funds your next request).
-     A caller with existing credit could send less; this script just prepays in full. */
-  const required = await agg.maxTotalFee(FEE);
-  console.log('attaching value (wei):', required.toString());
+  /* Fund-from-credit (docs section 4.5): draw on any existing ethOwed credit first and
+     only attach the shortfall as msg.value. If your credit already covers a full round,
+     value = 0 and the round is paid entirely from your reserve. */
+  const required   = await agg.maxTotalFee(FEE);
+  const credit     = await agg.ethOwed(signer.address);
+  const fromCredit = credit < required ? credit : required;
+  const value      = required - fromCredit;
+  console.log(`required ${required} wei | credit ${credit} wei | drawing ${fromCredit} from credit | attaching value ${value} wei`);
 
   /* send request — native ETH rides along as msg.value; no LINK approval needed */
   const tx = await agg.requestAIEvaluationWithApproval(
-    [CID], '', ALPHA, FEE, BASE, SCALE, JOB, { value: required, gasLimit: GAS }
+    [CID], '', ALPHA, FEE, BASE, SCALE, JOB, { value, gasLimit: GAS }
   );
   console.log('tx:', tx.hash);
   const rcpt   = await tx.wait();
