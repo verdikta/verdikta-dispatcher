@@ -39,6 +39,7 @@ const AGG_BY_NET = {
   console.log(`Network: ${hre.network.name}  aggregator: ${aggAddr}  caller: ${me}`);
 
   /* 1) Optional: finalize a timed-out round to release its reserve into ethOwed. */
+  let finalized = false;
   const aggId = process.env.AGG_ID;
   if (aggId) {
     if (!/^0x[0-9a-fA-F]{64}$/.test(aggId)) throw new Error(`AGG_ID must be a bytes32 hex string: ${aggId}`);
@@ -57,12 +58,19 @@ const AGG_BY_NET = {
         console.log("Finalizing timed-out round…");
         const r = await (await agg.finalizeEvaluationTimeout(aggId)).wait();
         console.log("finalizeEvaluationTimeout tx:", r.hash);
+        finalized = true;
       }
     }
   }
 
   /* 2) Withdraw the caller's entire ethOwed credit. */
-  const owed = await agg.ethOwed(me);
+  let owed = await agg.ethOwed(me);
+  // A finalize in step 1 credits ethOwed in the just-mined block; a load-balanced RPC
+  // can briefly return the stale (pre-finalize) value, so retry before giving up.
+  for (let i = 0; finalized && owed === 0n && i < 5; i++) {
+    await new Promise((r) => setTimeout(r, 2500));
+    owed = await agg.ethOwed(me);
+  }
   console.log("ethOwed credit:", ethers.formatEther(owed), "ETH");
   if (owed === 0n) { console.log("Nothing to withdraw."); return; }
 
