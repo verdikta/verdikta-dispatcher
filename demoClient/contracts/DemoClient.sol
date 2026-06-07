@@ -40,19 +40,20 @@ contract DemoClient {
     }
 
     /// @notice Start an evaluation, funding it with the attached ETH (and/or this contract's
-    ///         accumulated refund credit inside the aggregator). Fee params are ETH-wei,
-    ///         /125-scaled from the old LINK values (8e13 ceiling, 8e9 base cost).
+    ///         accumulated refund credit inside the aggregator). Fee params are ETH-wei:
+    ///         request ceiling 0.00015 ETH (>= the 0.0001 arbiter fee, <= the 0.0004 cap),
+    ///         base cost 8e9 wei.
     function request() external payable {
         require(currentAggId == bytes32(0), "already pending");
         currentAggId = agg.requestAIEvaluationWithApproval{value: msg.value}(
-            cids, "", 500, 8e13, 8e9, 5, 128
+            cids, "", 500, 15e13, 8e9, 5, 128
         );
         emit Requested(currentAggId);
     }
 
     /// @notice Convenience view: worst-case ETH to attach for one request.
     function quote() external view returns (uint256) {
-        return agg.maxTotalFee(8e13);
+        return agg.maxTotalFee(15e13);
     }
 
     function publish() external {

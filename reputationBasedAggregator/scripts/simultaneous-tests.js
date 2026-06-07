@@ -9,13 +9,10 @@ const IS_BASE = hre.network.name === "base";
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
    EDIT ONLY THESE CONSTANTS
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
+// ETH-funded ReputationAggregator (set to your deployed addresses).
 const AGGREGATOR = IS_BASE
-  ? "0x2f7a02298D4478213057edA5e5bEB07F20c4c054"
-  : "0xb2b724e4ee4Fa19Ccd355f12B4bB8A2F8C8D0089";
-
-const LINK_TOKEN = IS_BASE
-  ? "0x88Fb150BDc53A65fe94Dea0c9BA0a6dAf8C6e196"
-  : "0xE4aB69C077896252FAFBD49EFD26B5D171A32410";
+  ? "0x8d0627CCd3E1747EFaC3b7fc600e4697747be447"
+  : "0x01C0149854DA080d5fBD3c57FA40DDE5f2e10c64";
 
 const NUM_QUERIES         = 1;
 const BETWEEN_QUERY_DELAY = 200;         // ms between tx submissions
@@ -24,8 +21,10 @@ const INCREMENT_DURATION  = 30_000;      // ms between polling rounds
 
 const JOB_CLASS           = 717;
 // const JOB_CLASS           = 128;
-const MAX_ORACLE_FEE      = ethers.parseUnits("0.01", 18);
-const ESTIMATE_BASE_FEE   = ethers.parseUnits("0.000001", 18);
+// ETH-denominated (wei). Request ceiling must be >= the arbiters' fee (0.0001 ETH)
+// and <= the aggregator's maxOracleFee (0.0004 ETH); base cost must be < the ceiling.
+const MAX_ORACLE_FEE      = ethers.parseEther("0.00015");      // 0.00015 ETH
+const ESTIMATE_BASE_FEE   = ethers.parseEther("0.000000008"); // 8e9 wei
 const MAX_FEE_SCALING     = 5;
 const ALPHA               = 500;
 
@@ -123,61 +122,18 @@ async function diagnoseTimeout(agg, aggId) {
   console.log("RPC endpoint:", hre.network.config.url || "in-process Hardhat node");
 
   const aggAbi  = (await hre.artifacts.readArtifact("ReputationAggregator")).abi;
-  const linkAbi = (await hre.artifacts.readArtifact("LinkTokenInterface")).abi;
-
   const agg  = new hre.ethers.Contract(AGGREGATOR, aggAbi, signer);
-  const link = new hre.ethers.Contract(LINK_TOKEN,  linkAbi, signer);
 
   /* --- QUICK SANITY CHECKS ------------------------------------------------- */
   const me = await signer.getAddress();
-
-  // Introspect the LINK token you configured
-  let tName = "?", tSymbol = "?", tDec = "?";
-  try {
-    const dec = link.decimals ? await link.decimals() : 18;
-    [tName, tSymbol, tDec] = await Promise.all([link.name(), link.symbol(), Promise.resolve(dec)]);
-  } catch (e) {
-    console.error("LINK introspection failed (is LINK_TOKEN correct for this network?)", e.message);
-  }
-  console.log("LINK token:", LINK_TOKEN, `(${tName} / ${tSymbol} / ${tDec} decimals)`);
-
-  // Compare Aggregator’s configured LINK address (if exposed) with LINK_TOKEN
-  let aggLinkAddr = null;
-  try {
-    const cfg = await agg.getContractConfig?.();
-    aggLinkAddr = cfg?.linkAddr ?? null;
-  } catch {}
-  try {
-    if (!aggLinkAddr && agg.linkToken) aggLinkAddr = await agg.linkToken();
-  } catch {}
-  if (aggLinkAddr) {
-    console.log("Aggregator.linkAddr:", aggLinkAddr);
-    if (aggLinkAddr.toLowerCase() !== LINK_TOKEN.toLowerCase()) {
-      console.error(
-        "\nMISMATCH: Aggregator is wired to a DIFFERENT LINK token.\n" +
-        `  - LINK_TOKEN you passed:  ${LINK_TOKEN}\n` +
-        `  - Aggregator.linkAddr:    ${aggLinkAddr}\n` +
-        "Approve/fund the correct token or update the Aggregator config.\n"
-      );
-      process.exit(1);
-    }
-  } else {
-    console.warn("Could not read Aggregator.linkAddr (no getter found) – skipping LINK match check.");
-  }
-
-  // Balance + allowance
-  const [linkBal, allowance] = await Promise.all([
-    link.balanceOf(me),
-    link.allowance(me, AGGREGATOR),
-  ]);
-  console.log(`LINK balance:   ${ethers.formatEther(linkBal)} LINK`);
-  console.log(`LINK allowance: ${ethers.formatEther(allowance)} LINK`);
+  // ETH-funded: the requester pays in native ETH; there is no LINK token or allowance.
+  console.log(`ETH balance:    ${ethers.formatEther(await hre.ethers.provider.getBalance(me))} ETH`);
 
   // Aggregator parameter guards commonly checked in requestAIEvaluationWithApproval
   try {
     const maxFee = await agg.maxOracleFee?.();
     if (maxFee) {
-      console.log("Aggregator.maxOracleFee:", ethers.formatEther(maxFee), "LINK");
+      console.log("Aggregator.maxOracleFee:", ethers.formatEther(maxFee), "ETH");
       if (MAX_ORACLE_FEE > maxFee) {
         console.error(
           `\nMAX_ORACLE_FEE (${ethers.formatEther(MAX_ORACLE_FEE)}) exceeds Aggregator.maxOracleFee (${ethers.formatEther(maxFee)}).`
@@ -214,13 +170,10 @@ async function diagnoseTimeout(agg, aggId) {
     }
   } catch {}
 
-  /* ––––– optional LINK allowance ––––– */
-  if (process.env.LINK_ALLOWANCE) {
-    const allowanceAmt = ethers.parseUnits(process.env.LINK_ALLOWANCE, 18);
-    const tx = await link.approve(AGGREGATOR, allowanceAmt);
-    console.log("approve() →", tx.hash);
-    await tx.wait(1);
-  }
+  /* ––––– ETH funding per query ––––– */
+  // Worst-case ETH to attach to each request; unspent slack is refunded as ethOwed credit.
+  const REQUIRED = await agg.maxTotalFee(MAX_ORACLE_FEE);
+  console.log(`Per-query ETH value: ${ethers.formatEther(REQUIRED)} ETH  (x${NUM_QUERIES} queries)`);
 
   /* helper to submit a single query (unchanged output) */
   async function sendQuery(idx, nonce, delayMs) {
@@ -230,7 +183,8 @@ async function diagnoseTimeout(agg, aggId) {
     try {
       await agg.getFunction("requestAIEvaluationWithApproval").staticCall(
         CIDS, ADDENDUM, ALPHA,
-        MAX_ORACLE_FEE, ESTIMATE_BASE_FEE, MAX_FEE_SCALING, JOB_CLASS
+        MAX_ORACLE_FEE, ESTIMATE_BASE_FEE, MAX_FEE_SCALING, JOB_CLASS,
+        { value: REQUIRED }
       );
     } catch (e) {
       console.error(`[${idx}] dry-run revert → ${e.shortMessage || e.message || e}`);
@@ -254,7 +208,8 @@ async function diagnoseTimeout(agg, aggId) {
     try {
       const est = await agg.getFunction("requestAIEvaluationWithApproval").estimateGas(
         CIDS, ADDENDUM, ALPHA,
-        MAX_ORACLE_FEE, ESTIMATE_BASE_FEE, MAX_FEE_SCALING, JOB_CLASS
+        MAX_ORACLE_FEE, ESTIMATE_BASE_FEE, MAX_FEE_SCALING, JOB_CLASS,
+        { value: REQUIRED }
       );
       gasLimit = (est * 120n) / 100n;
     } catch {
@@ -281,7 +236,7 @@ async function diagnoseTimeout(agg, aggId) {
     const tx = await agg.requestAIEvaluationWithApproval(
       CIDS, ADDENDUM, ALPHA,
       MAX_ORACLE_FEE, ESTIMATE_BASE_FEE, MAX_FEE_SCALING, JOB_CLASS,
-      { nonce, gasLimit, ...overrides }
+      { nonce, gasLimit, value: REQUIRED, ...overrides }
     );
     console.log(`[${idx}] tx sent →`, tx.hash);
     const rcpt = await tx.wait(1);

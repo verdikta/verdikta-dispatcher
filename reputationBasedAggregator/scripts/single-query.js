@@ -9,10 +9,9 @@ const AGG   = '0x65863e5e0B2c2968dBbD1c95BDC2e0EA598E5e02';          // <-- set 
 const CID   = 'QmZ2BgPsmnn4T4ShbdryoTWXFM4nHt7tM674fU4CLVHthH';      // <-- edit
 const JOB   = 128;
 const ALPHA = 500;
-// ETH-denominated, /125-scaled from the old LINK values (docs section 4.6):
-//   _maxOracleFee   0.01 LINK   -> 8e13 wei  (0.00008 ETH)
-//   estimatedBaseCost 1e-6 LINK -> 8e9 wei   (0.000000008 ETH)
-const FEE   = 80_000_000_000_000n;    // 8e13 wei requested per-oracle ceiling
+// ETH-denominated (wei). Request ceiling must be >= the arbiters' fee (0.0001 ETH)
+// and <= the aggregator's maxOracleFee (0.0004 ETH); base cost must be < the ceiling.
+const FEE   = 150_000_000_000_000n;   // 1.5e14 wei = 0.00015 ETH requested ceiling
 const BASE  = 8_000_000_000n;         // 8e9 wei estimated base cost
 const SCALE = 5;
 const GAS   = 3_000_000n;
