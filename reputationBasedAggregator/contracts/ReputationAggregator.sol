@@ -65,6 +65,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
     error NotAuthorized();         // withdrawEthFor caller is neither payee nor owner
     error NothingOwed();           // withdrawal attempted with a zero ethOwed balance
     error EthTransferFailed();     // payee.call{value:} returned false on withdrawal
+    error OnlySelf();              // dispatch trampoline invoked by anyone other than this contract
 
     // ----------------------------------------------------------------------
     //                          CONFIGURATION
@@ -617,10 +618,15 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
      *      invariant instead of one that silently depends on the keeper's fee filter; in correct
      *      operation selection already bounds fee <= effMaxFee, so it never triggers.
      *
-     *      The owner() payee lookup is wrapped: a reverting owner() (malformed/malicious oracle)
-     *      must not brick the whole request. On failure the oracle's base credit and dispatch are
-     *      skipped and the slot becomes a non-participant, penalized at finalize/timeout like any
-     *      no-show. No funds are at risk - an uncredited slot just enlarges the requester's refund.
+     *      BOTH external calls to the (untrusted) oracle are individually wrapped so neither can
+     *      brick the request: (1) the owner() payee lookup, and (2) the 0-juel dispatch, whose
+     *      transferAndCall fires the operator's ERC-677 onTokenTransfer hook - a hook a malicious
+     *      operator can make revert. The dispatch goes through the dispatchOracleRequest self-call
+     *      trampoline precisely so that revert is caught here. On either failure the slot's base
+     *      credit and dispatch are skipped and it becomes a non-participant, penalized at
+     *      finalize/timeout like any no-show. Base is credited only AFTER a successful dispatch, so
+     *      an operator that refuses the job earns nothing. No funds are at risk - an uncredited slot
+     *      just enlarges the requester's refund.
      */
     function _pollOracle(
         bytes32 aggId,
@@ -640,28 +646,42 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         agg.polledOracles.push(sel);
         agg.pollFees.push(fee);
 
-        // pay-all base: credit the oracle owner now and SNAPSHOT that payee for the round.
-        // The same snapshot is reused for the bonus at finalize, so base and bonus always
-        // pay whoever owned the arbiter when it was selected - an ownership change mid-round
-        // can neither split the two payments nor redirect the bonus.
-        try IOracleOwner(sel.oracle).owner() returns (address payee) {
+        // STEP 1 - resolve the payee (oracle owner). A reverting owner() (malformed/malicious
+        // oracle) must not brick the request: on failure the slot becomes an uncredited,
+        // undispatched no-show. Push a zero payee to keep arrays aligned and bail out.
+        address payee;
+        try IOracleOwner(sel.oracle).owner() returns (address resolved) {
+            payee = resolved;
+        } catch {
+            agg.payees.push(address(0));
+            emit OracleScoreUpdateSkipped(sel.oracle, sel.jobId, "owner() reverted at base payment");
+            return;
+        }
+
+        // STEP 2 - 0-juel dispatch through the dispatchOracleRequest self-call trampoline. The
+        // transferAndCall inside fires the operator's ERC-677 onTokenTransfer hook, which a
+        // malicious operator can make revert; routing it through an external self-call lets us
+        // CATCH that revert here instead of unwinding the whole request. A reverted dispatch
+        // leaves no pending Chainlink request (its state rolls back), so the slot is simply a
+        // no-show. base is credited and the payee SNAPSHOTTED only on a SUCCESSFUL dispatch - the
+        // same snapshot is reused for the bonus at finalize, so base and bonus always pay whoever
+        // owned the arbiter when it was selected (an ownership change mid-round can neither split
+        // the two payments nor redirect the bonus), and an operator that refuses the job earns nothing.
+        try this.dispatchOracleRequest(aggId, sel.oracle, jobId, cidConcat) returns (bytes32 opReq) {
             agg.payees.push(payee);
             ethOwed[payee] += fee;
             agg.baseCredited += fee;
             emit BasePayment(aggId, slot, payee, fee);
 
-            // 0-juel dispatch: the Chainlink rail carries the request but no LINK
-            bytes32 opReq = _sendSingleOracleRequest(aggId, sel.oracle, jobId, 0, cidConcat);
             requestIdToAggregatorId[opReq] = aggId;
             requestIdToPollIndex[opReq] = slot;
-
             emit OracleSelected(aggId, slot, sel.oracle, sel.jobId);
         } catch {
-            // payee unresolvable: leave the slot uncredited and undispatched (a no-show).
-            // Push a zero payee to keep the array aligned; this slot never reveals, so it
-            // never clusters and its payee is never read for a bonus.
+            // dispatch reverted (e.g. operator onTokenTransfer hook reverted): no-show. Push a
+            // zero payee to keep arrays aligned; an undispatched slot never commits, so it never
+            // reveals, never clusters, and its payee is never read for a bonus.
             agg.payees.push(address(0));
-            emit OracleScoreUpdateSkipped(sel.oracle, sel.jobId, "owner() reverted at base payment");
+            emit OracleScoreUpdateSkipped(sel.oracle, sel.jobId, "dispatch reverted at request");
         }
     }
 
@@ -891,11 +911,18 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
             
             ReputationKeeper.OracleIdentity memory oid = agg.polledOracles[slot];
             string memory cid2 = string(abi.encodePacked("2:", AggregatorLib.bytes16ToHexLower(hash128)));
-            bytes32 opReq = _sendSingleOracleRequest(aggId, oid.oracle, oid.jobId, 0, cid2);
-            requestIdToAggregatorId[opReq] = aggId;
-            requestIdToPollIndex[opReq] = slot;
-
-            emit RevealRequestDispatched(aggId, slot, hash128);
+            // Trampoline dispatch (see dispatchOracleRequest): a committed operator that now
+            // reverts in its onTokenTransfer hook fails only its own reveal dispatch instead of
+            // aborting THIS fulfill (the M-th commit), which would otherwise roll back the commit
+            // count and wedge the round in commit phase until timeout. A skipped reveal dispatch
+            // just means that slot never reveals - a no-show at finalize/timeout.
+            try this.dispatchOracleRequest(aggId, oid.oracle, oid.jobId, cid2) returns (bytes32 opReq) {
+                requestIdToAggregatorId[opReq] = aggId;
+                requestIdToPollIndex[opReq] = slot;
+                emit RevealRequestDispatched(aggId, slot, hash128);
+            } catch {
+                emit OracleScoreUpdateSkipped(oid.oracle, oid.jobId, "dispatch reverted at reveal");
+            }
         }
     }
 
@@ -913,6 +940,33 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         req._add("cid", cidPayload);
         req._add("aggId", AggregatorLib.bytes32ToHex(aggId));
         return _sendOperatorRequestTo(operator, req, fee);
+    }
+
+    /**
+     * @notice External self-call trampoline performing a single 0-juel oracle dispatch.
+     * @dev Exists ONLY so callers (_pollOracle, _dispatchRevealRequests) can wrap the dispatch in
+     *      try/catch. _sendSingleOracleRequest's transferAndCall fires the operator's ERC-677
+     *      onTokenTransfer hook; a malicious/buggy operator can make that hook revert. As an
+     *      internal call such a revert would unwind the whole request (or the M-th committer's
+     *      fulfill, wedging the round); as an EXTERNAL self-call it is caught by the caller and the
+     *      slot is treated as a no-show. A reverted call rolls back its own state, including the
+     *      ChainlinkClient nonce bump and the s_pendingRequests write, so it leaves no orphan
+     *      request and the next dispatch reuses the nonce cleanly.
+     *
+     *      Access is restricted to internal self-calls (msg.sender == address(this)); no external
+     *      party can mint Chainlink requests through it. Deliberately NOT nonReentrant: it executes
+     *      inside the parent entrypoint's reentrancy lock, so the operator hook still cannot reenter
+     *      any guarded function - a reentrancy attempt just surfaces here as a caught dispatch failure.
+     * @return opReq The Chainlink request id created for this dispatch.
+     */
+    function dispatchOracleRequest(
+        bytes32 aggId,
+        address operator,
+        bytes32 jobId,
+        string calldata cidPayload
+    ) external returns (bytes32 opReq) {
+        if (msg.sender != address(this)) revert OnlySelf();
+        return _sendSingleOracleRequest(aggId, operator, jobId, 0, cidPayload);
     }
 
     // ----------------------------------------------------------------------

@@ -502,4 +502,138 @@ describe("ReputationAggregator (ETH-funded)", function () {
       }
     });
   });
+
+  // --------------------------------------------------------------------------
+  // 8. H-1 regression: a malicious operator whose ERC-677 onTokenTransfer hook reverts
+  //    (fired by the 0-juel transferAndCall dispatch) must only fail its OWN slot, never
+  //    abort the whole request or wedge the M-th committer's fulfill. Pre-fix, the dispatch
+  //    sat inside the `try owner()` body (whose catch does NOT cover body reverts), so any
+  //    such revert unwound the entire transaction.
+  // --------------------------------------------------------------------------
+  describe("8. H-1: malicious operator dispatch cannot brick rounds", function () {
+    const rand = () => ethers.Wallet.createRandom().address;
+
+    // Deploy a fresh stack with a mix of honest (MockArbiterOperator) and hostile
+    // (MockRevertingDispatchOperator) operators. `specs[i]` = { revert, from } chooses slot i.
+    async function setupMixed(specs, ownerList) {
+      [deployer, requester] = await ethers.getSigners();
+
+      const Lib = await ethers.getContractFactory("AggregatorLib");
+      lib = await Lib.deploy();
+      await lib.waitForDeployment();
+
+      const Link = await ethers.getContractFactory("MockLinkToken");
+      link = await Link.deploy(ethers.parseEther("1000000"));
+      await link.waitForDeployment();
+
+      const Keeper = await ethers.getContractFactory("MockReputationKeeper");
+      keeper = await Keeper.deploy();
+      await keeper.waitForDeployment();
+
+      const Agg = await ethers.getContractFactory("ReputationAggregator", {
+        libraries: { AggregatorLib: await lib.getAddress() },
+      });
+      agg = await Agg.deploy(await link.getAddress(), await keeper.getAddress());
+      await agg.waitForDeployment();
+
+      // K=3, M=2, N=2, P=2
+      await (await agg.setConfig(3, 2, 2, 2, 300)).wait();
+
+      const Good = await ethers.getContractFactory("MockArbiterOperator");
+      const Bad = await ethers.getContractFactory("MockRevertingDispatchOperator");
+      operators = [];
+      for (let i = 0; i < specs.length; i++) {
+        const op = specs[i].revert === 0
+          ? await Good.deploy(ownerList[i])
+          : await Bad.deploy(ownerList[i], specs[i].revert, specs[i].from || 0);
+        await op.waitForDeployment();
+        operators.push(op);
+      }
+      ownerAddrs = ownerList;
+      await (await keeper.setOracles(await Promise.all(operators.map((o) => o.getAddress())), FEE)).wait();
+    }
+
+    async function request() {
+      const required = await agg.maxTotalFee(REQ_MAX_FEE);
+      const rcpt = await (await agg.connect(requester).requestAIEvaluationWithApproval(
+        ["QmEvidence"], "", 500, REQ_MAX_FEE, BASE_COST, SCALING, 0, { value: required },
+      )).wait();
+      const aggId = agg.interface.parseLog(
+        rcpt.logs.find((l) => l.topics[0] === agg.interface.getEvent("RequestAIEvaluation").topicHash),
+      ).args.aggRequestId;
+      return { rcpt, aggId, required };
+    }
+
+    it("request-time: an always-reverting selected operator is skipped (not fatal), round still completes", async () => {
+      const owners = [rand(), rand(), rand()];
+      // slot 2 always reverts in onTokenTransfer
+      await setupMixed([{ revert: 0 }, { revert: 0 }, { revert: 1 }], owners);
+
+      // Pre-fix this call reverts entirely; post-fix it succeeds with slot 2 skipped.
+      const { rcpt, aggId } = await request();
+
+      // honest slots credited base; the bricked slot got NO base and was never dispatched
+      expect(await agg.ethOwed(owners[0])).to.equal(FEE);
+      expect(await agg.ethOwed(owners[1])).to.equal(FEE);
+      expect(await agg.ethOwed(owners[2])).to.equal(0n);
+      expect(reqIdsFrom(rcpt, agg).length).to.equal(2); // only 2 oracles dispatched
+
+      // the round proceeds to a normal finalize on the 2 honest oracles
+      const commitIds = await slotMap(rcpt);
+      await (await operators[0].callFulfill(
+        await agg.getAddress(), commitIds[0],
+        [commitResp0(await operators[0].getAddress(), REVEAL, BigInt("0x" + saltHexFor(0)))], "",
+      )).wait();
+      const commit1Rcpt = await (await operators[1].callFulfill(
+        await agg.getAddress(), commitIds[1],
+        [commitResp0(await operators[1].getAddress(), REVEAL, BigInt("0x" + saltHexFor(1)))], "",
+      )).wait();
+
+      const revealIds = await slotMap(commit1Rcpt);
+      await (await operators[0].callFulfill(
+        await agg.getAddress(), revealIds[0], REVEAL, `QmJustif0:${saltHexFor(0)}`,
+      )).wait();
+      await (await operators[1].callFulfill(
+        await agg.getAddress(), revealIds[1], REVEAL, `QmJustif1:${saltHexFor(1)}`,
+      )).wait();
+
+      const [, , hasValidData] = await agg.getEvaluation(aggId);
+      expect(hasValidData).to.equal(true);
+      await assertSolvency(aggId);
+    });
+
+    it("reveal-dispatch: a committed operator reverting at reveal-dispatch does not wedge the M-th commit", async () => {
+      const owners = [rand(), rand(), rand()];
+      // slot 0 lets the commit-phase poll dispatch through (call 1) but reverts on the
+      // reveal-phase dispatch (call 2), which is triggered inside the 2nd committer's fulfill.
+      await setupMixed([{ revert: 2, from: 2 }, { revert: 0 }, { revert: 0 }], owners);
+
+      const { rcpt, aggId } = await request();
+      expect(reqIdsFrom(rcpt, agg).length).to.equal(3); // all 3 dispatched at request time
+
+      const commitIds = await slotMap(rcpt);
+      // op0 commits (slot 0), then op1 commits (slot 1) -> M=2 -> reveal dispatch fires;
+      // op0's reveal dispatch reverts in onTokenTransfer but is now caught.
+      await (await operators[0].callFulfill(
+        await agg.getAddress(), commitIds[0],
+        [commitResp0(await operators[0].getAddress(), REVEAL, BigInt("0x" + saltHexFor(0)))], "",
+      )).wait();
+
+      // Pre-fix, THIS fulfill reverts (op0's reveal-dispatch revert unwinds it); post-fix it
+      // succeeds and the commit phase completes.
+      const commit1Rcpt = await (await operators[1].callFulfill(
+        await agg.getAddress(), commitIds[1],
+        [commitResp0(await operators[1].getAddress(), REVEAL, BigInt("0x" + saltHexFor(1)))], "",
+      )).wait();
+
+      const status = await agg.getAggregationStatus(aggId);
+      expect(status.commitPhaseComplete).to.equal(true);
+      expect(status.commitReceived).to.equal(2n);
+
+      // a reveal request reached the honest slot 1 but not the bricked slot 0
+      const revealIds = await slotMap(commit1Rcpt);
+      expect(revealIds[1]).to.not.equal(undefined);
+      expect(revealIds[0]).to.equal(undefined);
+    });
+  });
 });
