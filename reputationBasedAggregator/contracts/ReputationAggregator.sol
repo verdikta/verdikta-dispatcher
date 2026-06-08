@@ -333,7 +333,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
 
         // accounting
         address requester;                      /// @dev address that requested the evaluation
-        uint256 startTimestamp;                 /// @dev when the evaluation was started
+        uint256 startTimestamp;                 /// @dev request time; anchors the single whole-round timeout (NOT reset at commit->reveal)
 
         // ETH escrow accounting (see docs/advanced/eth-payment-migration.md section 4.5)
         uint256 ethReceived;                    /// @dev ETH committed to this round (fromCredit + msg.value), set once at request
@@ -405,7 +405,10 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
     // ----------------------------------------------------------------------
     /**
      * @notice Set the response timeout in seconds
-     * @dev Timeout applies to both commit and reveal phases
+     * @dev A SINGLE window covering the whole round (commit and reveal phases combined),
+     *      measured from the request timestamp. Phase transitions do not reset it by
+     *      design, so commit and reveal share this one deadline rather than each getting
+     *      a fresh one.
      * @param _seconds Timeout duration in seconds
      */
     function setResponseTimeout(uint256 _seconds) external onlyOwner {
@@ -656,17 +659,14 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         if (block.timestamp < agg.startTimestamp + responseTimeoutSeconds) revert NotTimedOut();
 
         /* ----------------- commit phase timed out ----------------- */
+        // Reaching here means commit phase never completed, i.e. fewer than M
+        // (revealExpected) commits arrived. fulfill flips commitPhaseComplete the instant
+        // commitReceived == revealExpected (and stops counting late commits), so
+        // !commitPhaseComplete strictly implies commitReceived < revealExpected - there is
+        // no "enough commits but not yet promoted" state to handle here. Fail the round.
+        // Base was already credited to all K oracles at request time; no cluster formed
+        // (bonusCredited == 0), so the remainder refunds via the single uniform expression.
         if (!agg.commitPhaseComplete) {
-            if (agg.commitReceived >= agg.revealExpected) {
-                // enough commits → try to progress to reveal
-                agg.commitPhaseComplete = true;
-                emit CommitPhaseComplete(aggId);
-                _dispatchRevealRequests(aggId, agg);
-                return;   // give them another timeout window
-            }
-            // < M commits → fail job. Base was already credited to all K oracles at
-            // request time; no cluster formed (bonusCredited == 0), so the remainder
-            // refunds to the requester via the single uniform expression.
             _applyTimeoutPenalties(agg, true);  // penalise non-committing oracles only
             _refundRequester(aggId, agg);
             agg.failed = true;
@@ -745,7 +745,9 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
             agg.commitReceived += 1;
             emit CommitReceived(aggId, slot, msg.sender, hash128);
 
-            // when we have M commits → start reveal phase
+            // when we have M commits → start reveal phase. startTimestamp is intentionally
+            // not reset here: the reveal phase continues under the original whole-round
+            // timeout deadline rather than starting a new window.
             if (agg.commitReceived == agg.revealExpected) {
                 agg.commitPhaseComplete = true;
                 emit CommitPhaseComplete(aggId);
