@@ -730,6 +730,14 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
 
             bytes16 hash128 = bytes16(bytes32(uint256(response[0]) << 128));
 
+            // Reject a degenerate zero commit. commitHashPerSlot uses bytes16(0) as the
+            // "no commit" sentinel (the duplicate guard below and the reveal-dispatch skip
+            // both key on it), so a zero hash would count toward commitReceived yet store
+            // as 0 and never receive a reveal request - diverging the commit count from the
+            // dispatchable set. An honest commit is bytes16(sha256(...)), zero with
+            // probability 2^-128, so this rejects only degenerate/malicious payloads.
+            if (hash128 == bytes16(0)) return;
+
             // (a) commit arrived after we already switched to reveal → just log it
             if (agg.commitPhaseComplete) {
                 emit CommitReceived(aggId, slot, msg.sender, hash128);
