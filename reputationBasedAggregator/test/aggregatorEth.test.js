@@ -11,6 +11,7 @@
 //   3. Fund-from-credit (recycle refund; revert when value + credit < required)
 //   4. Restricted withdraw trigger (payee / owner only; always pays payee; renounce)
 //   5. Accounting invariants on every exit path
+//   6. getEvaluation validity flag (a failed round is never reported as valid data)
 // ----------------------------------------------------------------------------
 
 const { expect } = require("chai");
@@ -400,6 +401,69 @@ describe("ReputationAggregator (ETH-funded)", function () {
       const refund = await agg.ethOwed(requester.address);
       expect(acc.ethReceived).to.equal(acc.baseCredited + acc.bonusCredited + refund);
       await assertSolvency(aggId);
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  describe("6. getEvaluation validity flag", function () {
+    let owners;
+    beforeEach(async () => {
+      owners = [ethers.Wallet.createRandom().address, ethers.Wallet.createRandom().address, ethers.Wallet.createRandom().address];
+      await setup(owners);
+    });
+
+    // A round that reaches reveal phase and gets ONE reveal (< N=2) allocates the
+    // aggregatedLikelihoods scratch array (via _ensureAggArrayExists) but never
+    // finalizes. On timeout it fails. getEvaluation must NOT report that zero-filled
+    // scratch as valid data — the regression guard is the `!failed` term.
+    it("reveal-phase timeout with one partial reveal reports hasValidData == false", async () => {
+      const required = await agg.maxTotalFee(REQ_MAX_FEE);
+      const reqRcpt = await (await agg.connect(requester).requestAIEvaluationWithApproval(
+        ["QmEvidence"], "", 500, REQ_MAX_FEE, BASE_COST, SCALING, 0, { value: required },
+      )).wait();
+      const aggId = agg.interface.parseLog(
+        reqRcpt.logs.find((l) => l.topics[0] === agg.interface.getEvent("RequestAIEvaluation").topicHash),
+      ).args.aggRequestId;
+
+      // 2 commits -> reveal phase
+      const commitIds = await slotMap(reqRcpt);
+      await (await operators[0].callFulfill(
+        await agg.getAddress(), commitIds[0],
+        [commitResp0(await operators[0].getAddress(), REVEAL, BigInt("0x" + saltHexFor(0)))], "",
+      )).wait();
+      const commit1Rcpt = await (await operators[1].callFulfill(
+        await agg.getAddress(), commitIds[1],
+        [commitResp0(await operators[1].getAddress(), REVEAL, BigInt("0x" + saltHexFor(1)))], "",
+      )).wait();
+
+      // exactly ONE reveal (< N=2): allocates the scratch array, does not finalize
+      const revealIds = await slotMap(commit1Rcpt);
+      await (await operators[0].callFulfill(
+        await agg.getAddress(), revealIds[0], REVEAL, `QmJustif0:${saltHexFor(0)}`,
+      )).wait();
+
+      // time out in reveal phase -> failed
+      await ethers.provider.send("evm_increaseTime", [301]);
+      await ethers.provider.send("evm_mine", []);
+      await (await agg.finalizeEvaluationTimeout(aggId)).wait();
+
+      expect(await agg.isFailed(aggId)).to.equal(true);
+
+      const [likelihoods, , hasValidData] = await agg.getEvaluation(aggId);
+      // the scratch array exists (length == the one reveal's vector) and is zero-filled,
+      // so the pre-fix code (isComplete && length > 0) would have returned true here...
+      expect(likelihoods.length).to.equal(REVEAL.length);
+      expect([...likelihoods].every((x) => x === 0n)).to.equal(true);
+      // ...the `!failed` guard makes it correctly report invalid
+      expect(hasValidData).to.equal(false);
+    });
+
+    // Sanity: a successful round still reports valid.
+    it("successful round reports hasValidData == true", async () => {
+      const { aggId } = await happyRound();
+      expect(await agg.isFailed(aggId)).to.equal(false);
+      const [, , hasValidData] = await agg.getEvaluation(aggId);
+      expect(hasValidData).to.equal(true);
     });
   });
 });

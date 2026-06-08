@@ -1176,7 +1176,10 @@ function _ensureAggArrayExists(
      */
     function getEvaluation(bytes32 reqId) public view returns (uint256[] memory, string memory, bool) {
         AggregatedEvaluation storage agg = aggregatedEvaluations[reqId];
-        bool hasValidData = agg.isComplete && agg.aggregatedLikelihoods.length > 0;
+        // !failed excludes a round that timed out in reveal phase: its aggregatedLikelihoods
+        // is the zero-filled scratch array allocated on the first reveal and never populated
+        // (population happens only in _finalizeAggregation, which a failed round never runs).
+        bool hasValidData = agg.isComplete && !agg.failed && agg.aggregatedLikelihoods.length > 0;
         return (agg.aggregatedLikelihoods, agg.combinedJustificationCIDs, hasValidData);
     }
 
