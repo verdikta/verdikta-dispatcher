@@ -1361,7 +1361,11 @@ function _ensureAggArrayExists(
         if (_k < _m) revert InvalidConfig();
         if (_m < _n) revert InvalidConfig();
         if (_n < _p) revert InvalidConfig();
-        if (_p < 1)  revert InvalidConfig();
+        // P must be >= 2: AggregatorLib.findBestCluster always seeds a cluster with the
+        // closest PAIR, so it returns at least two winners. Allowing P == 1 would reserve
+        // bonus for one oracle while two get marked, underflowing the refund (finalize DoS)
+        // or paying an extra bonus out of the requester's refund.
+        if (_p < 2)  revert InvalidConfig();
 
         commitOraclesToPoll   = _k;
         oraclesToPoll         = _m;
