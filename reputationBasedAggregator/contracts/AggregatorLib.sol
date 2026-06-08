@@ -132,13 +132,15 @@ library AggregatorLib {
         while (i > 0 && b[i-1] != ":") { unchecked { --i; } }
         if (i == 0 || (b.length - i) != 20) return (false, 0);
 
-        // check all 20 chars are hex
+        // check all 20 chars are hex. Each branch bounds BOTH ends of its ASCII range:
+        // the digit branch's upper bound matters because c-48 for ':' .. '?' (58..63)
+        // would otherwise land in 10..15 and be wrongly accepted as a hex nibble.
         unchecked {
             for (uint256 j = i; j < b.length; ++j) {
                 uint8 c = uint8(b[j]);
-                uint8 v = (c >= 97) ? c - 87
-                       : (c >= 65) ? c - 55
-                       : (c >= 48) ? c - 48
+                uint8 v = (c >= 97 && c <= 102) ? c - 87   // a-f
+                       : (c >= 65 && c <= 70)  ? c - 55     // A-F
+                       : (c >= 48 && c <= 57)  ? c - 48     // 0-9
                        : 255;
                 if (v >= 16) return (false, 0);
             }
@@ -157,14 +159,15 @@ library AggregatorLib {
         bytes memory cidBytes = new bytes(colonPos - 1);
         for (uint256 j; j < cidBytes.length; ++j) cidBytes[j] = b[j];
 
-        // parse 20-char hex salt
+        // parse 20-char hex salt. Bounds mirror isValidCidSalt (which has already accepted
+        // this input); kept identical so the two never diverge if called independently.
         unchecked {
             for (uint256 j = colonPos; j < b.length; ++j) {
                 uint8 c = uint8(b[j]);
-                uint8 v = (c >= 97) ? c - 87
-                       : (c >= 65) ? c - 55
-                       : (c >= 48) ? c - 48
-                       : 0;           // cannot overflow; already validated
+                uint8 v = (c >= 97 && c <= 102) ? c - 87   // a-f
+                       : (c >= 65 && c <= 70)  ? c - 55     // A-F
+                       : (c >= 48 && c <= 57)  ? c - 48     // 0-9
+                       : 0;           // unreachable post-validation; safe default
                 salt = (salt << 4) | v;
             }
         }

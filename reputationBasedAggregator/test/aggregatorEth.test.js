@@ -466,4 +466,40 @@ describe("ReputationAggregator (ETH-funded)", function () {
       expect(hasValidData).to.equal(true);
     });
   });
+
+  // --------------------------------------------------------------------------
+  describe("7. AggregatorLib.isValidCidSalt hex validation", function () {
+    let libC;
+    before(async () => {
+      const Lib = await ethers.getContractFactory("AggregatorLib");
+      libC = await Lib.deploy();
+      await libC.waitForDeployment();
+    });
+
+    // helper: "<cid>:<19 zeros><ch>" — the trailing char occupies the 20-char salt region
+    const withSaltChar = (ch) => `QmCid:${"0".repeat(19)}${ch}`;
+
+    it("rejects punctuation ;<=>? that the old lower-bound-only parser accepted as hex", async () => {
+      // ASCII 59..63: c-48 lands in 11..15, so the old code wrongly accepted these as hex.
+      for (const ch of [";", "<", "=", ">", "?"]) {
+        const [ok] = await libC.isValidCidSalt(withSaltChar(ch));
+        expect(ok, `salt char "${ch}" must be rejected`).to.equal(false);
+      }
+    });
+
+    it("still accepts the real hex boundary chars", async () => {
+      for (const ch of ["0", "9", "a", "f", "A", "F"]) {
+        const [ok] = await libC.isValidCidSalt(withSaltChar(ch));
+        expect(ok, `hex char "${ch}" must be accepted`).to.equal(true);
+      }
+    });
+
+    it("still rejects clearly out-of-range chars", async () => {
+      // '/'=47 (below '0'), '@'=64 (above '9', already rejected pre-fix), 'g'=103, 'G'=71
+      for (const ch of ["/", "@", "g", "G"]) {
+        const [ok] = await libC.isValidCidSalt(withSaltChar(ch));
+        expect(ok, `non-hex char "${ch}" must be rejected`).to.equal(false);
+      }
+    });
+  });
 });
