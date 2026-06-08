@@ -51,3 +51,37 @@ gas optimization of how the existing per-oracle score updates are dispatched.
 - A smaller, aggregator-only partial win (dropping the redundant per-slot
   `getOracleInfo` active-recheck) was considered and deferred — it carries a minor
   behavior change for oracles deactivated mid-round, so it was left out for now.
+
+---
+
+## 2. Make oracle selection cost independent of registry size
+
+**Status:** not started
+**Scope:** `ReputationKeeper.sol` (selection indexing) — keeper change
+
+### Problem
+`ReputationKeeper.selectOracles` scans the whole `registeredOracles` array twice on
+every request (once to count eligible oracles, once to fill the eligible array) before
+shortlisting, so per-request selection gas is O(registeredOracles) and grows linearly
+as more oracles register.
+
+### Idea
+Avoid the full-array scan per request:
+
+- Maintain a per-class index of registered oracles (e.g. `mapping(uint64 => bytes32[])`)
+  updated on register/deregister/setActive, so `selectOracles` iterates only candidates
+  for the requested class.
+- Or paginate/sample over a bounded window instead of the whole registry.
+- Either way, keep the eligibility predicate (active, fee <= maxFee, not blocked,
+  hasClass) and the weighted-selection semantics unchanged.
+
+### Why it's deferred
+Lives entirely in the keeper, out of scope for the current aggregator-only edits, and
+would need its own redeploy + migration of the index state.
+
+### Expected payoff
+Keeps per-request selection gas roughly constant regardless of registry size.
+
+### Notes / related
+- `resetAllReputations` does the same full-registry walk and would benefit from the
+  same indexing.
