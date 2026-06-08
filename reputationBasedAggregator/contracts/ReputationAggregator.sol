@@ -330,6 +330,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         // oracle selection
         ReputationKeeper.OracleIdentity[] polledOracles;  /// @dev selected oracles (length == K)
         uint256[] pollFees;                               /// @dev fees paid to each oracle
+        address[] payees;                                 /// @dev owner() snapshotted per slot at request (base AND bonus payee)
 
         // accounting
         address requester;                      /// @dev address that requested the evaluation
@@ -614,12 +615,17 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         if (fee > effMaxFee) revert InsufficientPayment();
 
         // Record the slot up front so polledOracles/pollFees stay index-aligned with `slot`
-        // on EVERY exit path, including the owner()-reverted catch branch below.
+        // on EVERY exit path; payees is pushed once in each try/catch branch below, so it
+        // stays aligned too.
         agg.polledOracles.push(sel);
         agg.pollFees.push(fee);
 
-        // pay-all base: credit the oracle owner now, snapshotting the payee at credit time
+        // pay-all base: credit the oracle owner now and SNAPSHOT that payee for the round.
+        // The same snapshot is reused for the bonus at finalize, so base and bonus always
+        // pay whoever owned the arbiter when it was selected - an ownership change mid-round
+        // can neither split the two payments nor redirect the bonus.
         try IOracleOwner(sel.oracle).owner() returns (address payee) {
+            agg.payees.push(payee);
             ethOwed[payee] += fee;
             agg.baseCredited += fee;
             emit BasePayment(aggId, slot, payee, fee);
@@ -631,7 +637,10 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
 
             emit OracleSelected(aggId, slot, sel.oracle, sel.jobId);
         } catch {
-            // payee unresolvable: leave the slot uncredited and undispatched (a no-show)
+            // payee unresolvable: leave the slot uncredited and undispatched (a no-show).
+            // Push a zero payee to keep the array aligned; this slot never reveals, so it
+            // never clusters and its payee is never read for a bonus.
+            agg.payees.push(address(0));
             emit OracleScoreUpdateSkipped(sel.oracle, sel.jobId, "owner() reverted at base payment");
         }
     }
@@ -991,21 +1000,17 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
                         try reputationKeeper.updateScores(id.oracle, resp.jobId, clusteredQualityScore, clusteredTimelinessScore) {} catch {
                             emit OracleScoreUpdateSkipped(resp.operator, resp.jobId, "updateScores failed for clustered selected response");
                         }
-                        // Bonus credited as ETH to the clustered oracle's owner, using the
+                        // Bonus credited as ETH to the slot's SNAPSHOTTED payee (the owner
+                        // resolved at request time, same recipient as base), using the
                         // SNAPSHOT multiplier (not the live var) so a mid-round change cannot
-                        // size the bonus above the reserve. No external send - pure credit.
-                        // A reverting owner() only forfeits THIS oracle's bonus (the unspent
-                        // amount refunds to the requester); the response still counts toward
-                        // the aggregated result via the return value below.
+                        // size the bonus above the reserve. No external call - pure credit.
+                        // A clustered slot always resolved its owner at base time, so
+                        // payees[slot] is the real, non-zero owner.
                         uint256 bonus = agg.pollFees[slot] * agg.bonusMultiplierSnap;
                         if (bonus > 0) {
-                            try IOracleOwner(resp.operator).owner() returns (address payee) {
-                                ethOwed[payee] += bonus;
-                                agg.bonusCredited += bonus;
-                                emit BonusPayment(resp.operator, bonus);
-                            } catch {
-                                emit OracleScoreUpdateSkipped(resp.operator, resp.jobId, "owner() reverted at bonus payment");
-                            }
+                            ethOwed[agg.payees[slot]] += bonus;
+                            agg.bonusCredited += bonus;
+                            emit BonusPayment(resp.operator, bonus);
                         }
                         return (true, 1);
                     } else {
