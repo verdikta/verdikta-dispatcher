@@ -105,6 +105,11 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
 
     // limits for arbiter behavior
     uint256 private constant MAX_ARBITER_RETURN_SCORE = 1e34;
+    // Max length of an oracle's reveal "cid" string = "<cleanCid>:<20-hex-salt>". Caps the
+    // justification CID at MAX_CID_LENGTH (same as requester CIDs); the +21 is the fixed
+    // ":" + 20-hex-salt suffix. Bounds per-reveal storage and the combinedJustificationCIDs
+    // concatenation at finalize against an oracle returning a huge CID.
+    uint256 public constant MAX_REVEAL_CID_LENGTH = MAX_CID_LENGTH + 21;
 
     // running call counter
     uint256 private requestCounter;
@@ -287,6 +292,21 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         uint256 indexed pollIndex,
         address operator,
         uint256 responseLength
+    );
+
+    /// @notice Emitted when a reveal is rejected because its "cid:salt" string exceeds
+    ///         MAX_REVEAL_CID_LENGTH. Logs only the length, never the oversized content.
+    /// @param aggRequestId Aggregator request identifier
+    /// @param pollIndex Oracle's slot index
+    /// @param operator Oracle operator address
+    /// @param cidLength Length (bytes) of the rejected cid string
+    /// @param maxAllowed Maximum allowed length (MAX_REVEAL_CID_LENGTH)
+    event RevealCidTooLong(
+        bytes32 indexed aggRequestId,
+        uint256 indexed pollIndex,
+        address operator,
+        uint256 cidLength,
+        uint256 maxAllowed
     );
 
     // ----------------------------------------------------------------------
@@ -787,7 +807,15 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         // Check for too many scores
         if (response.length > maxLikelihoodLength) {
             emit RevealTooManyScores(aggId, slot, msg.sender, response.length, maxLikelihoodLength);
-            return; // treat as not revealed  
+            return; // treat as not revealed
+        }
+
+        // Bound the oracle-supplied cid (checked before parsing/copying). Unbounded, a
+        // malicious oracle could store a huge justificationCID and blow up the finalize
+        // combinedJustificationCIDs concatenation / storage. Log only the length.
+        if (bytes(cid).length > MAX_REVEAL_CID_LENGTH) {
+            emit RevealCidTooLong(aggId, slot, msg.sender, bytes(cid).length, MAX_REVEAL_CID_LENGTH);
+            return; // treat as not revealed
         }
 
         // ─── DUPLICATE-REVEAL GUARD ──────────────────
