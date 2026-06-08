@@ -636,4 +636,75 @@ describe("ReputationAggregator (ETH-funded)", function () {
       expect(revealIds[0]).to.equal(undefined);
     });
   });
+
+  // --------------------------------------------------------------------------
+  // 9. M-3 regression: the round's escrow `required` is sized for EXACTLY K base credits.
+  //    A keeper that returns a selection set whose size != commitOraclesToPoll must be rejected
+  //    (BadSelectionCount) before any state is touched. An over-sized set is the dangerous case:
+  //    without the guard it would over-credit base past `required` (past ethReceived), underflow
+  //    _refundRequester at settlement, and credit ethOwed beyond the contract's backing ETH.
+  // --------------------------------------------------------------------------
+  describe("9. M-3: keeper selection-count backstop", function () {
+    let badKeeper, anOperator;
+
+    // Fresh stack pointed at the hostile MockBadCountKeeper, configured to return `returnCount`.
+    async function setupBadCount(returnCount) {
+      [deployer, requester] = await ethers.getSigners();
+
+      const Lib = await ethers.getContractFactory("AggregatorLib");
+      lib = await Lib.deploy();
+      await lib.waitForDeployment();
+
+      const Link = await ethers.getContractFactory("MockLinkToken");
+      link = await Link.deploy(ethers.parseEther("1000000"));
+      await link.waitForDeployment();
+
+      const BadKeeper = await ethers.getContractFactory("MockBadCountKeeper");
+      badKeeper = await BadKeeper.deploy();
+      await badKeeper.waitForDeployment();
+
+      const Agg = await ethers.getContractFactory("ReputationAggregator", {
+        libraries: { AggregatorLib: await lib.getAddress() },
+      });
+      agg = await Agg.deploy(await link.getAddress(), await badKeeper.getAddress());
+      await agg.waitForDeployment();
+
+      // K = commitOraclesToPoll = 3
+      await (await agg.setConfig(3, 2, 2, 2, 300)).wait();
+
+      const Op = await ethers.getContractFactory("MockArbiterOperator");
+      anOperator = await Op.deploy(ethers.Wallet.createRandom().address);
+      await anOperator.waitForDeployment();
+
+      await (await badKeeper.configure(await anOperator.getAddress(), FEE, returnCount)).wait();
+    }
+
+    async function expectRejected(returnCount) {
+      await setupBadCount(returnCount);
+      const required = await agg.maxTotalFee(REQ_MAX_FEE);
+      await expect(agg.connect(requester).requestAIEvaluationWithApproval(
+        ["QmEvidence"], "", 500, REQ_MAX_FEE, BASE_COST, SCALING, 0, { value: required },
+      )).to.be.revertedWithCustomError(agg, "BadSelectionCount");
+    }
+
+    it("rejects an over-sized selection set (more than K) — the solvency-break case", async () => {
+      await expectRejected(5); // K=3, keeper returns 5
+    });
+
+    it("rejects an under-sized selection set (fewer than K)", async () => {
+      await expectRejected(2); // K=3, keeper returns 2
+    });
+
+    it("does not leak state on rejection (no base credited, no ETH retained)", async () => {
+      await setupBadCount(5);
+      const required = await agg.maxTotalFee(REQ_MAX_FEE);
+      await expect(agg.connect(requester).requestAIEvaluationWithApproval(
+        ["QmEvidence"], "", 500, REQ_MAX_FEE, BASE_COST, SCALING, 0, { value: required },
+      )).to.be.revertedWithCustomError(agg, "BadSelectionCount");
+      // the whole tx reverted: the operator owner accrued nothing and the contract holds no ETH
+      const ownerAddr = await anOperator.owner();
+      expect(await agg.ethOwed(ownerAddr)).to.equal(0n);
+      expect(await ethers.provider.getBalance(await agg.getAddress())).to.equal(0n);
+    });
+  });
 });

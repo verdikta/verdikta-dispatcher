@@ -66,6 +66,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
     error NothingOwed();           // withdrawal attempted with a zero ethOwed balance
     error EthTransferFailed();     // payee.call{value:} returned false on withdrawal
     error OnlySelf();              // dispatch trampoline invoked by anyone other than this contract
+    error BadSelectionCount();     // keeper returned a selection set whose size != commitOraclesToPoll
 
     // ----------------------------------------------------------------------
     //                          CONFIGURATION
@@ -579,6 +580,18 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
             _maxFeeBasedScalingFactor,
             _requestedClass
         );
+
+        // Keeper-trust backstop (defense-in-depth, docs section 5.3). The round's escrow `required`
+        // was sized for EXACTLY commitOraclesToPoll (K) base credits: required = effMaxFee*(K + B*P).
+        // _pollOracle already bounds each base credit to effMaxFee (the fee dimension), but nothing
+        // else bounds the COUNT the keeper returns. A keeper that returned more than K identities
+        // would push baseCredited past `required` (hence past ethReceived), underflowing
+        // _refundRequester at settlement - stranding the round - and crediting ethOwed beyond the
+        // contract's backing ETH (a solvency break). The honest keeper always returns exactly the
+        // requested count, so we require that here instead of silently depending on it; this also
+        // keeps the agg.commitExpected == K snapshot consistent with the slots actually polled.
+        if (sel.length != commitOraclesToPoll) revert BadSelectionCount();
+
         reputationKeeper.recordUsedOracles(sel);
 
         // dispatch Mode 1 requests (per-oracle work extracted to keep this frame shallow).
