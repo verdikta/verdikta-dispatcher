@@ -707,4 +707,76 @@ describe("ReputationAggregator (ETH-funded)", function () {
       expect(await ethers.provider.getBalance(await agg.getAddress())).to.equal(0n);
     });
   });
+
+  // --------------------------------------------------------------------------
+  // 10. L-1 regression: the keeper getOracleInfo reads (poll path and finalize/timeout path) are
+  //     wrapped so a reverting keeper cannot brick a request nor wedge settlement of an
+  //     already-funded round. The MockReputationKeeper.setRevertGetInfo toggle models the revert.
+  // --------------------------------------------------------------------------
+  describe("10. L-1: keeper getOracleInfo read is wrapped", function () {
+    let owners;
+    beforeEach(async () => {
+      owners = [
+        ethers.Wallet.createRandom().address,
+        ethers.Wallet.createRandom().address,
+        ethers.Wallet.createRandom().address,
+      ];
+      await setup(owners);
+    });
+
+    it("poll path: a reverting getOracleInfo skips the slot, the request does not revert", async () => {
+      await (await keeper.setRevertGetInfo(true)).wait();
+      const required = await agg.maxTotalFee(REQ_MAX_FEE);
+
+      // Pre-fix this reverts the whole request; post-fix it succeeds with every slot a no-show.
+      const reqRcpt = await (await agg.connect(requester).requestAIEvaluationWithApproval(
+        ["QmEvidence"], "", 500, REQ_MAX_FEE, BASE_COST, SCALING, 0, { value: required },
+      )).wait();
+
+      // nothing dispatched, no base credited (the keeper read failed for every slot)
+      expect(reqIdsFrom(reqRcpt, agg).length).to.equal(0);
+      for (const o of owners) expect(await agg.ethOwed(o)).to.equal(0n);
+    });
+
+    it("finalize path: a reverting getOracleInfo at finalization still settles the round", async () => {
+      const required = await agg.maxTotalFee(REQ_MAX_FEE);
+      const reqRcpt = await (await agg.connect(requester).requestAIEvaluationWithApproval(
+        ["QmEvidence"], "", 500, REQ_MAX_FEE, BASE_COST, SCALING, 0, { value: required },
+      )).wait();
+      const aggId = agg.interface.parseLog(
+        reqRcpt.logs.find((l) => l.topics[0] === agg.interface.getEvent("RequestAIEvaluation").topicHash),
+      ).args.aggRequestId;
+
+      const commitIds = await slotMap(reqRcpt);
+      await (await operators[0].callFulfill(
+        await agg.getAddress(), commitIds[0],
+        [commitResp0(await operators[0].getAddress(), REVEAL, BigInt("0x" + saltHexFor(0)))], "",
+      )).wait();
+      const commit1Rcpt = await (await operators[1].callFulfill(
+        await agg.getAddress(), commitIds[1],
+        [commitResp0(await operators[1].getAddress(), REVEAL, BigInt("0x" + saltHexFor(1)))], "",
+      )).wait();
+      const revealIds = await slotMap(commit1Rcpt);
+      await (await operators[0].callFulfill(
+        await agg.getAddress(), revealIds[0], REVEAL, `QmJustif0:${saltHexFor(0)}`,
+      )).wait();
+
+      // make every keeper read revert, then the 2nd reveal triggers _finalizeAggregation
+      await (await keeper.setRevertGetInfo(true)).wait();
+
+      // Pre-fix the Nth reveal's fulfill reverts (finalize bricked); post-fix it settles.
+      await expect(operators[1].callFulfill(
+        await agg.getAddress(), revealIds[1], REVEAL, `QmJustif1:${saltHexFor(1)}`,
+      )).to.not.be.reverted;
+
+      const status = await agg.getAggregationStatus(aggId);
+      expect(status.isComplete).to.equal(true);
+      // base was credited at request time to all 3; finalize skipped scoring/bonus (reads reverted),
+      // so the requester is refunded the rest and the solvency invariant still holds.
+      const acc = await agg.getEthAccounting(aggId);
+      expect(acc.bonusCredited).to.equal(0n);
+      expect(acc.ethReceived).to.equal(acc.baseCredited + acc.bonusCredited + (await agg.ethOwed(requester.address)));
+      await assertSolvency(aggId);
+    });
+  });
 });

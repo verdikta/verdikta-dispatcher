@@ -23,6 +23,10 @@ contract MockReputationKeeper {
     bytes32 public jobId = bytes32(uint256(0x1234));
 
     bytes16 public lastEntropy;
+    bool public revertGetInfo;   // when true, getOracleInfo reverts (exercises the L-1 read wrap)
+
+    /// @notice Toggle getOracleInfo to revert, modeling a hostile/unavailable keeper read.
+    function setRevertGetInfo(bool v) external { revertGetInfo = v; }
 
     /// @notice Configure the oracle set returned by selectOracles. Each oracle gets `fee`.
     function setOracles(address[] calldata oracles, uint256 fee) external {
@@ -84,6 +88,7 @@ contract MockReputationKeeper {
             bool blocked
         )
     {
+        require(!revertGetInfo, "getOracleInfo reverted");
         return (activeOf[_oracle], 0, 0, 0, _jobId, feeOf[_oracle], 0, 0, false);
     }
 

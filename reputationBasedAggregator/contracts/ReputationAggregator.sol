@@ -649,7 +649,29 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         string memory cidConcat,
         uint256 effMaxFee
     ) internal {
-        (bool active, , , , bytes32 jobId, uint256 fee, , , ) = reputationKeeper.getOracleInfo(sel.oracle, sel.jobId);
+        // Read the oracle's keeper record. The read is wrapped (defense-in-depth, L-1): a
+        // reverting keeper (hostile/misconfigured) must not brick the whole request. On revert the
+        // slot becomes an aligned no-show - polledOracles/pollFees/payees each get one placeholder
+        // push (fee 0, payee 0), no dispatch, no base credit - exactly like the owner()/dispatch
+        // failures below. The active / fee-ceiling checks below stay as hard invariant guards on
+        // the keeper's DATA (selection already filters both, so they only trip on a keeper
+        // inconsistency), distinct from the keeper being UNAVAILABLE for the read.
+        bool active;
+        bytes32 jobId;
+        uint256 fee;
+        try reputationKeeper.getOracleInfo(sel.oracle, sel.jobId) returns (
+            bool _active, int256, int256, uint256, bytes32 _jobId, uint256 _fee, uint256, uint256, bool
+        ) {
+            active = _active;
+            jobId = _jobId;
+            fee = _fee;
+        } catch {
+            agg.polledOracles.push(sel);
+            agg.pollFees.push(0);
+            agg.payees.push(address(0));
+            emit OracleScoreUpdateSkipped(sel.oracle, sel.jobId, "getOracleInfo reverted at request");
+            return;
+        }
         if (!active) revert InactiveOracle();
         if (fee > effMaxFee) revert InsufficientPayment();
 
@@ -1079,7 +1101,20 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         // storage pointers: read only the scalar fields touched below, never copying the
         // identity's classes[] array or the response's likelihoods[]/justificationCID.
         ReputationKeeper.OracleIdentity storage id = agg.polledOracles[slot];
-        (bool active, , , , , , , , ) = reputationKeeper.getOracleInfo(id.oracle, id.jobId);
+        // Wrapped read (defense-in-depth, L-1). This runs on the finalize AND timeout settlement
+        // paths, which a round must always be able to complete - it has escrowed ETH and may hold
+        // reveals. A reverting keeper read here would otherwise brick BOTH paths and strand the
+        // round permanently. On revert, treat the slot exactly like an inactive oracle: skip its
+        // scoring/bonus and let the round settle (the requester is still refunded the remainder).
+        bool active;
+        try reputationKeeper.getOracleInfo(id.oracle, id.jobId) returns (
+            bool _active, int256, int256, uint256, bytes32, uint256, uint256, uint256, bool
+        ) {
+            active = _active;
+        } catch {
+            emit OracleScoreUpdateSkipped(id.oracle, id.jobId, "getOracleInfo reverted at finalization");
+            return (false, 0);
+        }
         if (!active) {
             emit OracleScoreUpdateSkipped(id.oracle, id.jobId, "Inactive at finalization");
             return (false, 0);
