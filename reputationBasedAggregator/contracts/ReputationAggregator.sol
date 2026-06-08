@@ -313,6 +313,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         // phase bookkeeping
         bool commitPhaseComplete;           /// @dev true → we are in reveal phase
         uint256 commitExpected;             /// @dev K - number of oracles polled in commit phase
+        uint256 revealExpected;             /// @dev M - first M commits promoted to reveal (snapshot of oraclesToPoll)
         uint256 commitReceived;             /// @dev number of commits received so far
 
         // commit hashes per poll slot
@@ -510,6 +511,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         bytes32 aggId = keccak256(abi.encodePacked(block.timestamp, msg.sender, cidConcat, requestCounter));
         AggregatedEvaluation storage agg = aggregatedEvaluations[aggId];
         agg.commitExpected = commitOraclesToPoll;
+        agg.revealExpected = oraclesToPoll;
         agg.requiredResponses = requiredResponses;
         agg.clusterSize = clusterSize;
         agg.requester = msg.sender;
@@ -533,9 +535,11 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         );
         reputationKeeper.recordUsedOracles(sel);
 
-        // dispatch Mode 1 requests (per-oracle work extracted to keep this frame shallow)
+        // dispatch Mode 1 requests (per-oracle work extracted to keep this frame shallow).
+        // Pass effMaxFee (the clamped ceiling the escrow `required` was sized on) so the
+        // per-oracle charge guard enforces the same bound the reserve assumes.
         for (uint256 i = 0; i < sel.length; i++) {
-            _pollOracle(aggId, agg, sel[i], i, cidConcat);
+            _pollOracle(aggId, agg, sel[i], i, cidConcat, effMaxFee);
         }
 
         emit RequestAIEvaluation(aggId, cids);
@@ -561,35 +565,51 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
      *      owner (pay-all decision, docs section 4.5), and dispatch the Mode-1 request with
      *      0 juel (docs section 3). Extracted from the request loop both to keep that frame
      *      under the stack limit and as the per-oracle transport/payment seam (docs section 6).
-     *      The charge-time guard (fee <= maxOracleFee) is layer 2 of the fee ceiling defense
-     *      (docs section 5.3); in correct operation selection already bounds fee <= effMaxFee.
+     *
+     *      The charge-time guard checks fee <= effMaxFee - the SAME clamped ceiling the round's
+     *      escrow `required` was sized on (docs section 5.3), NOT the looser global maxOracleFee.
+     *      This makes `baseCredited + bonusCredited <= ethReceived` a locally-enforced solvency
+     *      invariant instead of one that silently depends on the keeper's fee filter; in correct
+     *      operation selection already bounds fee <= effMaxFee, so it never triggers.
+     *
+     *      The owner() payee lookup is wrapped: a reverting owner() (malformed/malicious oracle)
+     *      must not brick the whole request. On failure the oracle's base credit and dispatch are
+     *      skipped and the slot becomes a non-participant, penalized at finalize/timeout like any
+     *      no-show. No funds are at risk - an uncredited slot just enlarges the requester's refund.
      */
     function _pollOracle(
         bytes32 aggId,
         AggregatedEvaluation storage agg,
         ReputationKeeper.OracleIdentity memory sel,
         uint256 slot,
-        string memory cidConcat
+        string memory cidConcat,
+        uint256 effMaxFee
     ) internal {
-        agg.polledOracles.push(sel);
-
         (bool active, , , , bytes32 jobId, uint256 fee, , , ) = reputationKeeper.getOracleInfo(sel.oracle, sel.jobId);
         if (!active) revert InactiveOracle();
-        if (fee > maxOracleFee) revert InsufficientPayment();
+        if (fee > effMaxFee) revert InsufficientPayment();
 
-        // pay-all base: credit the oracle owner now, snapshotting the payee at credit time
-        address payee = _payeeFor(sel.oracle);
-        ethOwed[payee] += fee;
-        agg.baseCredited += fee;
-        emit BasePayment(aggId, slot, payee, fee);
-
-        // 0-juel dispatch: the Chainlink rail carries the request but no LINK
-        bytes32 opReq = _sendSingleOracleRequest(aggId, sel.oracle, jobId, 0, cidConcat);
-        requestIdToAggregatorId[opReq] = aggId;
-        requestIdToPollIndex[opReq] = slot;
+        // Record the slot up front so polledOracles/pollFees stay index-aligned with `slot`
+        // on EVERY exit path, including the owner()-reverted catch branch below.
+        agg.polledOracles.push(sel);
         agg.pollFees.push(fee);
 
-        emit OracleSelected(aggId, slot, sel.oracle, sel.jobId);
+        // pay-all base: credit the oracle owner now, snapshotting the payee at credit time
+        try IOracleOwner(sel.oracle).owner() returns (address payee) {
+            ethOwed[payee] += fee;
+            agg.baseCredited += fee;
+            emit BasePayment(aggId, slot, payee, fee);
+
+            // 0-juel dispatch: the Chainlink rail carries the request but no LINK
+            bytes32 opReq = _sendSingleOracleRequest(aggId, sel.oracle, jobId, 0, cidConcat);
+            requestIdToAggregatorId[opReq] = aggId;
+            requestIdToPollIndex[opReq] = slot;
+
+            emit OracleSelected(aggId, slot, sel.oracle, sel.jobId);
+        } catch {
+            // payee unresolvable: leave the slot uncredited and undispatched (a no-show)
+            emit OracleScoreUpdateSkipped(sel.oracle, sel.jobId, "owner() reverted at base payment");
+        }
     }
 
     // ----------------------------------------------------------------------
@@ -609,7 +629,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
 
         /* ----------------- commit phase timed out ----------------- */
         if (!agg.commitPhaseComplete) {
-            if (agg.commitReceived >= oraclesToPoll) {
+            if (agg.commitReceived >= agg.revealExpected) {
                 // enough commits → try to progress to reveal
                 agg.commitPhaseComplete = true;
                 emit CommitPhaseComplete(aggId);
@@ -699,7 +719,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
             emit CommitReceived(aggId, slot, msg.sender, hash128);
 
             // when we have M commits → start reveal phase
-            if (agg.commitReceived == oraclesToPoll) {
+            if (agg.commitReceived == agg.revealExpected) {
                 agg.commitPhaseComplete = true;
                 emit CommitPhaseComplete(aggId);
                 _dispatchRevealRequests(aggId, agg);
@@ -930,11 +950,18 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
                         // Bonus credited as ETH to the clustered oracle's owner, using the
                         // SNAPSHOT multiplier (not the live var) so a mid-round change cannot
                         // size the bonus above the reserve. No external send - pure credit.
+                        // A reverting owner() only forfeits THIS oracle's bonus (the unspent
+                        // amount refunds to the requester); the response still counts toward
+                        // the aggregated result via the return value below.
                         uint256 bonus = agg.pollFees[slot] * agg.bonusMultiplierSnap;
                         if (bonus > 0) {
-                            ethOwed[_payeeFor(resp.operator)] += bonus;
-                            agg.bonusCredited += bonus;
-                            emit BonusPayment(resp.operator, bonus);
+                            try IOracleOwner(resp.operator).owner() returns (address payee) {
+                                ethOwed[payee] += bonus;
+                                agg.bonusCredited += bonus;
+                                emit BonusPayment(resp.operator, bonus);
+                            } catch {
+                                emit OracleScoreUpdateSkipped(resp.operator, resp.jobId, "owner() reverted at bonus payment");
+                            }
                         }
                         return (true, 1);
                     } else {
@@ -985,18 +1012,6 @@ function _ensureAggArrayExists(
      */
     function getCurrentRequestCounter() external view returns (uint256) {
         return requestCounter;
-    }
-
-    /**
-     * @dev Resolve the payee for an oracle: its owner() (docs section 4.3). This is the
-     *      single swappable seam between the operator/transport layer and the payment
-     *      ledger - ethOwed keys on a plain address, so when the Chainlink operator is
-     *      eventually removed only this helper changes. The result is snapshotted into
-     *      ethOwed at credit time, so earnings belong to whoever owned the arbiter when
-     *      the work was credited even if ownership later transfers.
-     */
-    function _payeeFor(address oracle) internal view returns (address) {
-        return IOracleOwner(oracle).owner();
     }
 
     /**
