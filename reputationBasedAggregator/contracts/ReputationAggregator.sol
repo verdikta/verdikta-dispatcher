@@ -645,6 +645,13 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
      */
     function finalizeEvaluationTimeout(bytes32 aggId) external nonReentrant {
         AggregatedEvaluation storage agg = aggregatedEvaluations[aggId];
+        // Reject ids that were never opened by a real request. A live request always
+        // stamps a non-zero startTimestamp, so startTimestamp == 0 uniquely identifies
+        // an uninitialized slot. Without this, anyone could drive an unused slot to
+        // isComplete via the timeout path (startTimestamp 0 trivially satisfies the
+        // timeout check); harmless on its own, but it would leave isComplete set on a
+        // slot a future request could reuse, and it clutters storage with phantom rounds.
+        if (agg.startTimestamp == 0) revert UnknownRequest();
         if (agg.isComplete) revert AggregationComplete();
         if (block.timestamp < agg.startTimestamp + responseTimeoutSeconds) revert NotTimedOut();
 
