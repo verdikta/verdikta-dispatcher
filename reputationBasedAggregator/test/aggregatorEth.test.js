@@ -779,4 +779,70 @@ describe("ReputationAggregator (ETH-funded)", function () {
       await assertSolvency(aggId);
     });
   });
+
+  // --------------------------------------------------------------------------
+  // 11. M-2 regression (Minimal C, coercion): reveals are accepted at any valid length and
+  //     coerced to the MODAL length at finalize. A lone off-length reveal can no longer fix the
+  //     canonical length nor get honest reveals rejected — it is coerced and rejected by distance
+  //     during clustering, the honest majority wins, and the round still completes.
+  // --------------------------------------------------------------------------
+  describe("11. M-2: deviant reveal length is coerced, not fatal", function () {
+    const rand = () => ethers.Wallet.createRandom().address;
+    const HONEST = [60n, 40n];
+    const DEVIANT = [99n, 1n, 50n]; // length 3; truncated to [99,1] it sits far from [60,40]
+    let owners;
+
+    beforeEach(async () => {
+      owners = [rand(), rand(), rand()];
+      await setup(owners);
+      // K=3, M=3, N=3, P=2 — all three commit + reveal; cluster the best 2 of 3.
+      await (await agg.setConfig(3, 3, 3, 2, 300)).wait();
+    });
+
+    it("a lone off-length first reveal is excluded by clustering; the honest majority wins", async () => {
+      const aggAddr = await agg.getAddress();
+      const required = await agg.maxTotalFee(REQ_MAX_FEE);
+      const reqRcpt = await (await agg.connect(requester).requestAIEvaluationWithApproval(
+        ["QmEvidence"], "", 500, REQ_MAX_FEE, BASE_COST, SCALING, 0, { value: required },
+      )).wait();
+      const aggId = agg.interface.parseLog(
+        reqRcpt.logs.find((l) => l.topics[0] === agg.interface.getEvent("RequestAIEvaluation").topicHash),
+      ).args.aggRequestId;
+
+      const commitIds = await slotMap(reqRcpt);
+      const op0 = await operators[0].getAddress();
+      const op1 = await operators[1].getAddress();
+      const op2 = await operators[2].getAddress();
+
+      // op0 commits a length-3 (deviant) response; op1/op2 commit length-2. 3rd commit dispatches reveals.
+      await (await operators[0].callFulfill(aggAddr, commitIds[0],
+        [commitResp0(op0, DEVIANT, BigInt("0x" + saltHexFor(0)))], "")).wait();
+      await (await operators[1].callFulfill(aggAddr, commitIds[1],
+        [commitResp0(op1, HONEST, BigInt("0x" + saltHexFor(1)))], "")).wait();
+      const commit2Rcpt = await (await operators[2].callFulfill(aggAddr, commitIds[2],
+        [commitResp0(op2, HONEST, BigInt("0x" + saltHexFor(2)))], "")).wait();
+      const revealIds = await slotMap(commit2Rcpt);
+
+      // op0 reveals the deviant length FIRST. Pre-fix this fixes the canonical length to 3 and the
+      // honest length-2 reveals are rejected -> N never reached -> round dies. Post-fix all are
+      // stored and coerced to the modal length (2) at finalize.
+      await (await operators[0].callFulfill(aggAddr, revealIds[0], DEVIANT, `QmDev:${saltHexFor(0)}`)).wait();
+      await (await operators[1].callFulfill(aggAddr, revealIds[1], HONEST, `QmJ1:${saltHexFor(1)}`)).wait();
+      await (await operators[2].callFulfill(aggAddr, revealIds[2], HONEST, `QmJ2:${saltHexFor(2)}`)).wait(); // finalizes
+
+      // round succeeded at the modal width (2) with the honest answer; deviant excluded from cluster
+      expect(await agg.isFailed(aggId)).to.equal(false);
+      const [likelihoods, , hasValidData] = await agg.getEvaluation(aggId);
+      expect(hasValidData).to.equal(true);
+      expect(likelihoods.length).to.equal(2);
+      expect([...likelihoods]).to.deep.equal(HONEST);
+
+      // honest pair clustered (base + bonus); the deviant got base only (selected, not clustered)
+      const bonus = FEE * 3n;
+      expect(await agg.ethOwed(owners[0])).to.equal(FEE);
+      expect(await agg.ethOwed(owners[1])).to.equal(FEE + bonus);
+      expect(await agg.ethOwed(owners[2])).to.equal(FEE + bonus);
+      await assertSolvency(aggId);
+    });
+  });
 });

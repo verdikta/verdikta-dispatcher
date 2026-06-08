@@ -879,12 +879,15 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
             return;                                    // ignore retry
         }
 
-        // first reveal fixes array length; every later reveal must match
-        uint256[] storage totals = _ensureAggArrayExists(agg, response.length);
-        if (response.length != totals.length) {
-            emit RevealWrongScoreCount(aggId, slot, msg.sender, response.length, totals.length);
-            return; // treat as not revealed
-        }
+        // Allocate the per-round scratch array on the first reveal (a placeholder until finalize).
+        // Minimal-C: the first reveal NO LONGER fixes the canonical length. Reveals of any valid
+        // length [2, maxLikelihoodLength] are accepted and stored; _finalizeAggregation later
+        // coerces every reveal to the MODAL length (truncate / zero-fill, via
+        // AggregatorLib.normalizeToModal) so a deviant-length reveal can neither be rejected nor
+        // dictate the width - it is instead rejected by distance during clustering. (Was: reject
+        // any reveal whose length != the first reveal's, which let a single deviant first-reveal
+        // brick the round and mis-penalize the honest majority.)
+        _ensureAggArrayExists(agg, response.length);
 
         // Split "cleanCid:20hexSalt" -> (cid, saltUint)
         (bool ok, uint256 colonPos) = AggregatorLib.isValidCidSalt(cid);
@@ -1026,23 +1029,32 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
             if (agg.responses[i].selected) selIdx[k++] = i;
         }
 
+        // Copy the likelihood vectors into memory, then coerce them all to the MODAL length
+        // (Minimal-C, AggregatorLib.normalizeToModal): truncate overlong, zero-fill short. This
+        // makes the cluster pool a uniform width - so calculateDistance can't hit a length
+        // mismatch and an off-length (deviant) reveal is rejected by DISTANCE rather than by the
+        // old first-reveal length gate. `ll` is reused for aggregation below, so the summed
+        // vectors are the coerced, modal-width ones (never the raw, possibly-longer storage ones).
+        uint256[][] memory ll = new uint256[][](rlen);
+        for (uint256 i = 0; i < rlen; i++) {
+            ll[i] = agg.responses[i].likelihoods;
+        }
+        uint256 modalLen = 0;
+        if (rlen > 0) {
+            (ll, modalLen) = AggregatorLib.normalizeToModal(ll);
+        }
+
         uint256[] memory cluster;
         if (selectedCount >= 2) {
-            // Copy only the likelihood vectors into memory for the clustering
-            // library (avoids passing the whole Response[] across the call).
-            uint256[][] memory ll = new uint256[][](rlen);
-            for (uint256 i = 0; i < rlen; i++) {
-                ll[i] = agg.responses[i].likelihoods;
-            }
             cluster = AggregatorLib.findBestCluster(ll, selIdx, agg.clusterSize);
         } else {
             cluster = new uint256[](selectedCount);
         }
 
         if (rlen > 0) {
-            agg.aggregatedLikelihoods = new uint256[](agg.responses[0].likelihoods.length);
+            agg.aggregatedLikelihoods = new uint256[](modalLen);
         }
-        
+
         uint256 clusterCount = 0;
         uint256 m = agg.polledOracles.length;
         for (uint256 slot = 0; slot < m; slot++) {
@@ -1050,7 +1062,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
             if (processed && addCluster > 0) {
                 uint256 respIndex = _findResponseIndexForSlot(agg.responses, slot);
                 if (respIndex < rlen) {
-                    uint256[] memory curr = agg.responses[respIndex].likelihoods;
+                    uint256[] memory curr = ll[respIndex];   // coerced to modalLen
                     for (uint256 j = 0; j < curr.length; j++) {
                         agg.aggregatedLikelihoods[j] += curr[j];
                     }

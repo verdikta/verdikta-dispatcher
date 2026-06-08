@@ -112,6 +112,59 @@ library AggregatorLib {
     }
 
     // ----------------------------------------------------------------------
+    //                       MODAL-LENGTH NORMALIZATION
+    // ----------------------------------------------------------------------
+
+    /**
+     * @dev Reveal-length normalization for the aggregator's finalize step. Reveals are accepted
+     *      at ANY valid length; here we pick the MODAL (plurality) length among the response
+     *      vectors and coerce every vector to it - truncating the overlong tail, zero-filling the
+     *      short ones. Handing the clusterer a uniform width means calculateDistance can never hit
+     *      a length mismatch, and an off-length (deviant) reveal is rejected by DISTANCE like any
+     *      other outlier instead of the first reveal dictating the canonical length (which let a
+     *      single deviant first-reveal exclude the honest majority and brick the round).
+     *
+     *      Mode is the plurality by pairwise count (O(n^2); n is the small reveal fan-out, so no
+     *      sort is needed). Ties break toward the SMALLER length so the result is deterministic.
+     * @param vectors Per-response likelihood vectors (same indexing as the aggregator's responses).
+     * @return normalized The vectors, each resized to `modalLen` (input indexing preserved).
+     * @return modalLen The chosen canonical width (0 iff `vectors` is empty).
+     */
+    function normalizeToModal(uint256[][] memory vectors)
+        public pure
+        returns (uint256[][] memory normalized, uint256 modalLen)
+    {
+        uint256 n = vectors.length;
+
+        // modal length: for each vector's length, count how many vectors share it. A strictly
+        // greater count wins; an equal count prefers the smaller length (deterministic tie-break).
+        uint256 bestCount = 0;
+        for (uint256 i = 0; i < n; i++) {
+            uint256 li = vectors[i].length;
+            uint256 c = 0;
+            for (uint256 j = 0; j < n; j++) {
+                if (vectors[j].length == li) c++;
+            }
+            if (c > bestCount || (c == bestCount && li < modalLen)) {
+                bestCount = c;
+                modalLen = li;
+            }
+        }
+
+        // coerce each vector to modalLen (truncate if longer, zero-fill if shorter).
+        normalized = new uint256[][](n);
+        for (uint256 i = 0; i < n; i++) {
+            uint256[] memory src = vectors[i];
+            uint256[] memory dst = new uint256[](modalLen);
+            uint256 copyLen = src.length < modalLen ? src.length : modalLen;
+            for (uint256 j = 0; j < copyLen; j++) {
+                dst[j] = src[j];
+            }
+            normalized[i] = dst;
+        }
+    }
+
+    // ----------------------------------------------------------------------
     //                              CID : SALT
     // ----------------------------------------------------------------------
 
