@@ -4,6 +4,7 @@ pragma solidity ^0.8.23;
 import "@chainlink/contracts/src/v0.8/operatorforwarder/ChainlinkClient.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
 import "./ReputationKeeper.sol";
 import "./AggregatorLib.sol";
 
@@ -38,7 +39,7 @@ import "./AggregatorLib.sol";
  *        clustered oracle at finalize. Unspent ETH is refunded to the requester
  *        as an ethOwed credit. Invariant: balance == sum(ethOwed) + sum(reserved).
  */
-contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
+contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Pausable {
     using Chainlink for Chainlink.Request;
 
     // ----------------------------------------------------------------------
@@ -431,6 +432,26 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
     }
 
     /**
+     * @notice Pause the contract, blocking NEW evaluation requests.
+     * @dev Circuit breaker for incident response. Scope is deliberately narrow: only
+     *      requestAIEvaluationWithApproval is gated (whenNotPaused). fulfill, the timeout
+     *      finalizer, and both withdrawal paths stay enabled while paused, so pausing can
+     *      never strand in-flight rounds or trap already-escrowed funds - it only stops
+     *      fresh ETH from entering. Emits Paused(account) (from OZ Pausable).
+     */
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    /**
+     * @notice Resume the contract, re-enabling new evaluation requests.
+     * @dev Emits Unpaused(account) (from OZ Pausable).
+     */
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    /**
      * @notice Estimate the maximum ETH needed for a complete evaluation with bonuses
      * @dev Calculates: effFee × (K + bonus_multiplier × P) for the worst-case scenario,
      *      where effFee = min(requestedMaxOracleFee, maxOracleFee) is the clamped per-oracle
@@ -474,7 +495,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         uint256 _estimatedBaseCost,
         uint256 _maxFeeBasedScalingFactor,
         uint64 _requestedClass
-    ) public payable nonReentrant returns (bytes32) {
+    ) public payable nonReentrant whenNotPaused returns (bytes32) {
         if (address(reputationKeeper) == address(0)) revert KeeperNotSet();
         if (cids.length == 0) revert EmptyCIDList();
         if (cids.length > MAX_CID_COUNT) revert TooManyCIDs();
@@ -689,7 +710,6 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         if (agg.isComplete) revert AggregationComplete();
 
         uint256 slot = requestIdToPollIndex[requestId];
-        ReputationKeeper.OracleIdentity memory id = agg.polledOracles[slot];
 
         // ---------- decide phase from *payload shape* ----------
         bool looksLikeCommit = (response.length == 1) && (bytes(cid).length == 0);
@@ -792,7 +812,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
             selected:         selected,
             operator:         msg.sender,
             pollIndex:        slot,
-            jobId:            id.jobId
+            jobId:            agg.polledOracles[slot].jobId
         });
 
         agg.responses.push(resp);
@@ -848,23 +868,27 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         AggregatedEvaluation storage agg = aggregatedEvaluations[aggId];
         if (agg.isComplete) revert AggregationComplete();
 
+        // responses is not mutated anywhere in finalize, so read its length once
+        // instead of re-SLOADing it in every loop condition below.
+        uint256 rlen = agg.responses.length;
+
         uint256 selectedCount = 0;
-        for (uint256 i = 0; i < agg.responses.length; i++) {
+        for (uint256 i = 0; i < rlen; i++) {
             if (agg.responses[i].selected) selectedCount++;
         }
-        
+
         uint256[] memory selIdx = new uint256[](selectedCount);
         uint256 k = 0;
-        for (uint256 i = 0; i < agg.responses.length; i++) {
+        for (uint256 i = 0; i < rlen; i++) {
             if (agg.responses[i].selected) selIdx[k++] = i;
         }
-        
+
         uint256[] memory cluster;
         if (selectedCount >= 2) {
             // Copy only the likelihood vectors into memory for the clustering
             // library (avoids passing the whole Response[] across the call).
-            uint256[][] memory ll = new uint256[][](agg.responses.length);
-            for (uint256 i = 0; i < agg.responses.length; i++) {
+            uint256[][] memory ll = new uint256[][](rlen);
+            for (uint256 i = 0; i < rlen; i++) {
                 ll[i] = agg.responses[i].likelihoods;
             }
             cluster = AggregatorLib.findBestCluster(ll, selIdx, agg.clusterSize);
@@ -872,7 +896,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
             cluster = new uint256[](selectedCount);
         }
 
-        if (agg.responses.length > 0) {
+        if (rlen > 0) {
             agg.aggregatedLikelihoods = new uint256[](agg.responses[0].likelihoods.length);
         }
         
@@ -882,7 +906,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
             (bool processed, uint256 addCluster) = _processPollSlot(agg, slot, selIdx, cluster);
             if (processed && addCluster > 0) {
                 uint256 respIndex = _findResponseIndexForSlot(agg.responses, slot);
-                if (respIndex < agg.responses.length) {
+                if (respIndex < rlen) {
                     uint256[] memory curr = agg.responses[respIndex].likelihoods;
                     for (uint256 j = 0; j < curr.length; j++) {
                         agg.aggregatedLikelihoods[j] += curr[j];
@@ -893,7 +917,8 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         }
         
         if (clusterCount > 0) {
-            for (uint256 j = 0; j < agg.aggregatedLikelihoods.length; j++) {
+            uint256 aggLen = agg.aggregatedLikelihoods.length;
+            for (uint256 j = 0; j < aggLen; j++) {
                 agg.aggregatedLikelihoods[j] /= clusterCount;
             }
         }
@@ -930,16 +955,18 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard {
         uint256[] memory selIdx,
         uint256[] memory cluster
     ) internal returns (bool, uint256) {
-        ReputationKeeper.OracleIdentity memory id = agg.polledOracles[slot];
+        // storage pointers: read only the scalar fields touched below, never copying the
+        // identity's classes[] array or the response's likelihoods[]/justificationCID.
+        ReputationKeeper.OracleIdentity storage id = agg.polledOracles[slot];
         (bool active, , , , , , , , ) = reputationKeeper.getOracleInfo(id.oracle, id.jobId);
         if (!active) {
             emit OracleScoreUpdateSkipped(id.oracle, id.jobId, "Inactive at finalization");
             return (false, 0);
         }
-        
+
         (bool responded, uint256 respIndex) = _getResponseForSlot(agg.responses, slot);
         if (responded) {
-            Response memory resp = agg.responses[respIndex];
+            Response storage resp = agg.responses[respIndex];
             if (resp.selected) {
                 (bool found, uint256 sIdx) = _findIndexInArray(selIdx, respIndex);
                 if (found) {
@@ -1033,10 +1060,15 @@ function _ensureAggArrayExists(
     /**
      * @dev Get the response for a given poll slot
      */
-    function _getResponseForSlot(Response[] memory responses, uint256 slot) 
-        internal pure returns (bool, uint256) 
+    // Scans storage by reference (reading only each element's pollIndex slot) rather than
+    // deep-copying the whole responses array - including every nested likelihoods[] and
+    // justificationCID string - into memory. Called on every reveal and every slot at
+    // finalize/timeout, so the storage scan matters.
+    function _getResponseForSlot(Response[] storage responses, uint256 slot)
+        internal view returns (bool, uint256)
     {
-        for (uint256 i = 0; i < responses.length; i++) {
+        uint256 len = responses.length;
+        for (uint256 i = 0; i < len; i++) {
             if (responses[i].pollIndex == slot) {
                 return (true, i);
             }
@@ -1115,7 +1147,8 @@ function _ensureAggArrayExists(
             }
 
             if (shouldPenalise) {
-                ReputationKeeper.OracleIdentity memory id = agg.polledOracles[slot];
+                // storage pointer: reads only oracle/jobId, not the classes[] array
+                ReputationKeeper.OracleIdentity storage id = agg.polledOracles[slot];
                 try reputationKeeper.updateScores(id.oracle, id.jobId, committedQualityScore, committedTimelinessScore) { }
                 catch { emit OracleScoreUpdateSkipped(id.oracle, id.jobId, "timeout penalty"); }
             }
