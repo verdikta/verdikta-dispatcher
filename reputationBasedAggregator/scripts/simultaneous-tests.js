@@ -11,8 +11,8 @@ const IS_BASE = hre.network.name === "base";
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
 // ETH-funded ReputationAggregator (set to your deployed addresses).
 const AGGREGATOR = IS_BASE
-  ? "0x8d0627CCd3E1747EFaC3b7fc600e4697747be447"
-  : "0x01C0149854DA080d5fBD3c57FA40DDE5f2e10c64";
+  ? "0xd8F38bCBEE43bE3bd31655a563f20c9B3e67142a"
+  : "0xe8a385E473EA710c5a88Cc72681a16a26fe380e4";
 
 const NUM_QUERIES         = 3;
 const BETWEEN_QUERY_DELAY = 200;         // ms between tx submissions

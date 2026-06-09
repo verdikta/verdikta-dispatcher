@@ -22,8 +22,8 @@ const hre = require("hardhat");
 const { ethers } = hre;
 
 const AGG_BY_NET = {
-  base:         "0x8d0627CCd3E1747EFaC3b7fc600e4697747be447",
-  base_sepolia: "0x01C0149854DA080d5fBD3c57FA40DDE5f2e10c64",
+  base:         "0xd8F38bCBEE43bE3bd31655a563f20c9B3e67142a",
+  base_sepolia: "0xe8a385E473EA710c5a88Cc72681a16a26fe380e4",
 };
 
 (async () => {

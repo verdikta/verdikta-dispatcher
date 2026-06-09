@@ -6,8 +6,8 @@ const { ethers } = hre;
 /* ─── config ─────────────────────────────────────────────────────────── */
 // ETH-funded ReputationAggregator, per network (override with AGG env var).
 const AGG   = process.env.AGG || (hre.network.name === 'base'
-  ? '0x8d0627CCd3E1747EFaC3b7fc600e4697747be447'      // Base mainnet
-  : '0x01C0149854DA080d5fBD3c57FA40DDE5f2e10c64');    // Base Sepolia
+  ? '0xd8F38bCBEE43bE3bd31655a563f20c9B3e67142a'      // Base mainnet
+  : '0xe8a385E473EA710c5a88Cc72681a16a26fe380e4');    // Base Sepolia
 // Must resolve to a REAL Verdikta query archive (zip with manifest.json + primary file,
 // "query" >= 10 chars), else the arbiter's AI backend returns HTTP 500 and the round never
 // commits. Default below is a known-good test query ("The sky is blue." -> True/False).
