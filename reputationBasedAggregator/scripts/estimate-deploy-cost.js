@@ -12,9 +12,11 @@ const ORACLE_ABI = [
 ];
 const ORACLE_ADDR = "0x420000000000000000000000000000000000000F";
 
-async function estimate(factoryName, constructorArgs = []) {
+async function estimate(factoryName, constructorArgs = [], libraries = undefined) {
   const [deployer] = await ethers.getSigners();
-  const Factory = await ethers.getContractFactory(factoryName, deployer);
+  const Factory = libraries
+    ? await ethers.getContractFactory(factoryName, { signer: deployer, libraries })
+    : await ethers.getContractFactory(factoryName, deployer);
 
   // Prepare the deploy tx
   const unsigned = await Factory.getDeployTransaction(...constructorArgs);
@@ -55,27 +57,46 @@ async function main() {
   const linkAddr = LINK_MAP[net];
   if (!linkAddr) throw new Error(`No LINK token address for ${net}`);
 
-  const tokenAddr = process.env.WRAPPED_VERDIKTA_TOKEN_BASE && net === "base"
+  const tokenAddr = (net === "base"
     ? process.env.WRAPPED_VERDIKTA_TOKEN_BASE
-    : process.env.WRAPPED_VERDIKTA_TOKEN_BASE_SEPOLIA;
+    : process.env.WRAPPED_VERDIKTA_TOKEN_BASE_SEPOLIA) || null;
 
-  if (!tokenAddr) throw new Error(`Missing WRAPPED_VERDIKTA_TOKEN for ${net}`);
+  // 0. AggregatorLib (no constructor args) — the aggregator links against it.
+  const lib = await estimate("AggregatorLib", []);
 
-  // 1. Aggregator (LINK + placeholder keeper)
-  const agg = await estimate("ReputationAggregator", [linkAddr, ethers.ZeroAddress]);
-
-  // 2. Keeper (wrapped Verdikta token)
-  const kep = await estimate("ReputationKeeper", [tokenAddr]);
-
-  const sum = (a, b) => (parseFloat(a) + parseFloat(b)).toFixed(6);
-
-  console.log("Aggregator:", agg);
-  console.log("Keeper    :", kep);
-  console.log("TOTAL     :", {
-    totalEthBoth: sum(agg.totalEth, kep.totalEth),
-    l1EthBoth:    sum(agg.l1FeeEth, kep.l1FeeEth),
-    l2EthBoth:    sum(agg.l2FeeEth, kep.l2FeeEth),
+  // 1. Aggregator (LINK + placeholder keeper), linked to a placeholder library address.
+  //    The constructor never calls the library, so the linked address does not affect
+  //    deploy gas — any valid 20-byte address works for the estimate.
+  const LIB_PLACEHOLDER = "0x" + "11".repeat(20);
+  const agg = await estimate("ReputationAggregator", [linkAddr, ethers.ZeroAddress], {
+    "contracts/AggregatorLib.sol:AggregatorLib": LIB_PLACEHOLDER,
   });
+
+  // 2. Keeper (wrapped Verdikta token) — only needed if you also redeploy the keeper.
+  //    The reuse-keeper deploy (deploy_just_aggregator.js) does NOT redeploy it, so this
+  //    is skipped when WRAPPED_VERDIKTA_TOKEN isn't set.
+  const kep = tokenAddr ? await estimate("ReputationKeeper", [tokenAddr]) : null;
+
+  const sum = (...xs) => xs.reduce((a, b) => a + parseFloat(b), 0).toFixed(6);
+
+  console.log("AggregatorLib:", lib);
+  console.log("Aggregator   :", agg);
+  console.log("TOTAL (this deploy: lib + aggregator):", {
+    totalEth: sum(lib.totalEth, agg.totalEth),
+    l1Eth:    sum(lib.l1FeeEth, agg.l1FeeEth),
+    l2Eth:    sum(lib.l2FeeEth, agg.l2FeeEth),
+  });
+
+  if (kep) {
+    console.log("Keeper       :", kep);
+    console.log("TOTAL (full: lib + aggregator + keeper):", {
+      totalEth: sum(lib.totalEth, agg.totalEth, kep.totalEth),
+      l1Eth:    sum(lib.l1FeeEth, agg.l1FeeEth, kep.l1FeeEth),
+      l2Eth:    sum(lib.l2FeeEth, agg.l2FeeEth, kep.l2FeeEth),
+    });
+  } else {
+    console.log("Keeper       : skipped (WRAPPED_VERDIKTA_TOKEN not set; reuse-keeper deploy doesn't redeploy it)");
+  }
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });
