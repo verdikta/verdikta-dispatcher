@@ -19,7 +19,7 @@ const ALPHA = 500;
 const FEE   = 150_000_000_000_000n;   // 1.5e14 wei = 0.00015 ETH requested ceiling
 const BASE  = 8_000_000_000n;         // 8e9 wei estimated base cost
 const SCALE = 5;
-const GAS   = 3_000_000n;
+const GAS   = 6_000_000n;     // fallback gasLimit if estimation fails (request is ~3.1M and grows with the registry)
 const DELAY = 20_000;   // poll every 20 s
 /* ────────────────────────────────────────────────────────────────────── */
 
@@ -37,9 +37,22 @@ const DELAY = 20_000;   // poll every 20 s
   const value      = required - fromCredit;
   console.log(`required ${required} wei | credit ${credit} wei | drawing ${fromCredit} from credit | attaching value ${value} wei`);
 
-  /* send request — native ETH rides along as msg.value; no LINK approval needed */
+  /* send request — native ETH rides along as msg.value; no LINK approval needed.
+     Estimate gas per-call (+50% headroom): the request cost scales with the oracle-registry
+     size and the randomized selection, so a fixed cap goes stale. Fall back to GAS if the
+     estimate call itself fails. */
+  let gasLimit;
+  try {
+    const est = await agg.requestAIEvaluationWithApproval.estimateGas(
+      [CID], '', ALPHA, FEE, BASE, SCALE, JOB, { value }
+    );
+    gasLimit = (est * 150n) / 100n;
+  } catch {
+    gasLimit = GAS;
+  }
+  console.log(`gasLimit ${gasLimit}`);
   const tx = await agg.requestAIEvaluationWithApproval(
-    [CID], '', ALPHA, FEE, BASE, SCALE, JOB, { value, gasLimit: GAS }
+    [CID], '', ALPHA, FEE, BASE, SCALE, JOB, { value, gasLimit }
   );
   console.log('tx:', tx.hash);
   const rcpt   = await tx.wait();

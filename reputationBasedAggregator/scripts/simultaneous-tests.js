@@ -31,7 +31,7 @@ const ALPHA               = 500;
 // Valid Verdikta query archive (same known-good CID as single-query.js). Override with CID env.
 const CIDS     = [process.env.CID || "Qma8vc6pEHEgFQkjS6qZbK4Ue8S7SkdhQ6eqLV2hcrDD53"];
 const ADDENDUM = "";
-const GAS_LIMIT = 3_000_000;
+const GAS_LIMIT = 6_000_000;   // fallback only; the per-call estimate (+20%) below is the normal path
 /* ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
 
 async function getSigner () {
