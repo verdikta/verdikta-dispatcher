@@ -72,10 +72,14 @@ async function main() {
     "contracts/AggregatorLib.sol:AggregatorLib": LIB_PLACEHOLDER,
   });
 
-  // 2. Keeper (wrapped Verdikta token) — only needed if you also redeploy the keeper.
-  //    The reuse-keeper deploy (deploy_just_aggregator.js) does NOT redeploy it, so this
-  //    is skipped when WRAPPED_VERDIKTA_TOKEN isn't set.
-  const kep = tokenAddr ? await estimate("ReputationKeeper", [tokenAddr]) : null;
+  // 2. Keeper (wrapped Verdikta token) — OPT-IN only. The reuse-keeper deploy
+  //    (deploy_just_aggregator.js) does NOT redeploy the keeper, so by default we estimate
+  //    just the lib + aggregator. Set ESTIMATE_KEEPER=1 to also estimate a fresh keeper.
+  const estimateKeeper = !!process.env.ESTIMATE_KEEPER;
+  if (estimateKeeper && !tokenAddr) {
+    throw new Error(`ESTIMATE_KEEPER set but no WRAPPED_VERDIKTA_TOKEN for ${net}`);
+  }
+  const kep = estimateKeeper ? await estimate("ReputationKeeper", [tokenAddr]) : null;
 
   const sum = (...xs) => xs.reduce((a, b) => a + parseFloat(b), 0).toFixed(6);
 
@@ -95,7 +99,7 @@ async function main() {
       l2Eth:    sum(lib.l2FeeEth, agg.l2FeeEth, kep.l2FeeEth),
     });
   } else {
-    console.log("Keeper       : skipped (WRAPPED_VERDIKTA_TOKEN not set; reuse-keeper deploy doesn't redeploy it)");
+    console.log("Keeper       : skipped (reuse-keeper deploy doesn't redeploy it; set ESTIMATE_KEEPER=1 to include)");
   }
 }
 
