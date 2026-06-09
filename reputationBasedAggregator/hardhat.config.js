@@ -46,7 +46,7 @@ module.exports = {
       httpsAgent: keepAliveAgent,
       chainId: 84532,
       gas: 10_000_000,
-      gasPrice: 300_000_000, // increase this if needed
+      gasPrice: 1_000_000_000, // 1 gwei. Must exceed any stuck tx to replace it; base fee is ~0.005 gwei so this is cheap.
       accounts: ACCOUNTS,
     },
     base: {
