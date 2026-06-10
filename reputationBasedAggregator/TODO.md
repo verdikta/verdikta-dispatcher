@@ -85,3 +85,59 @@ Keeps per-request selection gas roughly constant regardless of registry size.
 ### Notes / related
 - `resetAllReputations` does the same full-registry walk and would benefit from the
   same indexing.
+
+---
+
+## 3. Let a requester direct the unspent-prepay refund to a third party
+
+**Status:** not started
+**Scope:** `ReputationAggregator.sol` (request entrypoint + `_refundRequester`)
+
+### Problem
+`requestAIEvaluationWithApproval` keys the `ethOwed` refund of any unspent prepay to the
+**caller** (`msg.sender`). That's correct when the caller is the end user, but wrong when a
+contract requests **on behalf of** someone else — the refund strands on the intermediary.
+
+The Verdikta bounty program (`example-bounty-program`) hits this directly. Because refunds go
+to the caller, BountyEscrow can't be the requester (all submissions' refunds would pool into
+one `ethOwed[BountyEscrow]` with no on-chain way to attribute each refund to the right hunter
+— the per-request refund is only emitted as the `RequesterRefunded` event, not exposed as a
+getter). To work around it, BountyEscrow deploys a **throwaway `EvaluationWallet` contract per
+submission** purely so each submission's refund lands in its own isolated `ethOwed[wallet]`
+bucket. That wallet costs a full deploy per submission, is single-use (so the "credit
+auto-applies to your next request" path is dead weight), and can't be withdrawn by the hunter
+(only the wallet is `msg.sender`) — so BountyEscrow must pull the credit out and forward it, a
+hand-off that had to be made revert-proof to avoid a DoS (a hunter contract that rejects ETH
+could otherwise brick submission resolution and lock the creator's escrow).
+
+### Idea
+Add an optional **refund beneficiary** to the request, e.g. an overload:
+
+    requestAIEvaluationWithApproval(..., address refundTo)
+
+Store it per aggregation (default `refundTo = msg.sender` for the existing signature) and have
+`_refundRequester` credit `ethOwed[refundTo]` instead of `ethOwed[requester]`. Keep the
+fund-from-credit path (`_fundFromCredit`) keyed to the actual `msg.sender` — only the
+settlement-refund destination changes. Safe: `refundTo` only ever *receives* a credit (can't be
+harmed), and the caller spends its own `msg.value`, so there's no new griefing surface.
+
+### Expected payoff
+The bounty program could make **BountyEscrow the direct requester** with `refundTo = hunter`,
+so each hunter's unspent prepay lands in their own `ethOwed[hunter]` account — withdrawable
+directly by the hunter (the normal playground/arbiter model). That lets the bounty program
+**delete the per-submission `EvaluationWallet` entirely**: no per-submission deploy gas, no
+pull-and-forward hand-off, and the close-out DoS vanishes at the source (close-out no longer
+needs to move ETH to the hunter — the refund just sits as the hunter's own aggregator credit).
+
+### Why it's deferred
+Aggregator-side change needing its own redeploy. The bounty program already ships a
+contract-side workaround (per-submission wallets + a pull-payment ledger in BountyEscrow,
+deployed 2026-06-10) that closes the correctness/DoS gap without touching the aggregator, so
+this is a simplification/efficiency win, not a blocker.
+
+### Notes / related
+- The per-request refund is currently observable only via `RequesterRefunded(aggId, requester,
+  amount)`; if `refundTo` is added, emit it there too.
+- Alternative that avoids changing the request signature: expose the per-aggId refund as a view
+  (e.g. a settled-refund getter) so an intermediary could attribute pooled refunds on-chain —
+  but `refundTo` is cleaner and removes the intermediary entirely.
