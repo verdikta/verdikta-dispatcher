@@ -4,6 +4,14 @@
 
 Decentralized oracle infrastructure for AI-powered evaluation and dispute resolution on EVM chains. The dispatcher coordinates requests between client applications and an oracle network that performs off-chain AI evaluation, returning cryptographically committed results on-chain.
 
+## Backlog and contribution workflow
+
+Verdikta coordinates work across repositories through the
+[Verdikta Master Backlog](https://github.com/orgs/verdikta/projects/1).
+Humans and automated agents contributing here must read [AGENTS.md](AGENTS.md)
+and the canonical [backlog and issue workflow](https://github.com/verdikta/verdikta-docs/blob/main/docs/backlog-workflow.md)
+before creating, selecting, or changing work items.
+
 ## Architecture
 
 ```
