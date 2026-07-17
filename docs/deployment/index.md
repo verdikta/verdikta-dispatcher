@@ -60,6 +60,7 @@ Create a `.env` file in each subproject directory.
 
 | Contract/Token | Address |
 |----------------|---------|
+| ReputationAggregator (ETH-funded) | `0xe8a385E473EA710c5a88Cc72681a16a26fe380e4` |
 | LINK Token | `0xE4aB69C077896252FAFBD49EFD26B5D171A32410` |
 | Verdikta Token | `0xe46F6b494F111d958CDBB52536AD78c4eEeB0149` |
 | Wrapped Verdikta Token (Aggregator) | `0x2F1d1aF9d5C25A48C29f56f57c7BAFFa7cc910a3` |
@@ -70,6 +71,7 @@ Create a `.env` file in each subproject directory.
 
 | Contract/Token | Address |
 |----------------|---------|
+| ReputationAggregator (ETH-funded) | `0xd8F38bCBEE43bE3bd31655a563f20c9B3e67142a` |
 | LINK Token | `0x88Fb150BDc53A65fe94Dea0c9BA0a6dAf8C6e196` |
 | Wrapped Verdikta Token | `0x1EA68D018a11236E07D5647175DAA8ca1C3D0280` |
 

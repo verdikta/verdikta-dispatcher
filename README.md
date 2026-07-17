@@ -4,6 +4,8 @@
 
 Decentralized oracle infrastructure for AI-powered evaluation and dispute resolution on EVM chains. The dispatcher coordinates requests between client applications and an oracle network that performs off-chain AI evaluation, returning cryptographically committed results on-chain.
 
+**Status: Live in production.** The dispatcher contracts are deployed and operating on **Base Mainnet** and **Base Sepolia**, powering live applications such as [Verdikta Bounties](https://bounties.verdikta.org) (see [live network metrics](https://bounties.verdikta.org/analytics)). Deployed addresses are listed [below](#deployed-contract-addresses).
+
 ## Architecture
 
 ```
@@ -65,6 +67,7 @@ Each subdirectory is a standalone Hardhat project with its own `contracts/`, `de
 
 | Contract | Address |
 |----------|---------|
+| ReputationAggregator (ETH-funded) | `0xd8F38bCBEE43bE3bd31655a563f20c9B3e67142a` |
 | LINK Token | `0x88Fb150BDc53A65fe94Dea0c9BA0a6dAf8C6e196` |
 | Wrapped Verdikta Token | `0x1EA68D018a11236E07D5647175DAA8ca1C3D0280` |
 
@@ -72,6 +75,7 @@ Each subdirectory is a standalone Hardhat project with its own `contracts/`, `de
 
 | Contract | Address |
 |----------|---------|
+| ReputationAggregator (ETH-funded) | `0xe8a385E473EA710c5a88Cc72681a16a26fe380e4` |
 | LINK Token | `0xE4aB69C077896252FAFBD49EFD26B5D171A32410` |
 | Verdikta Token | `0x50f0C663931A5F9caDF36EFd0BE4E4D18196200e` |
 | Wrapped Verdikta Token (Aggregator) | `0x2F1d1aF9d5C25A48C29f56f57c7BAFFa7cc910a3` |
