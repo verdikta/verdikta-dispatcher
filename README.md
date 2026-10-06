@@ -6,6 +6,8 @@ Decentralized oracle infrastructure for AI-powered evaluation and dispute resolu
 
 **Status: Live in production.** The dispatcher contracts are deployed and operating on **Base Mainnet** and **Base Sepolia**, powering live applications such as [Verdikta Bounties](https://bounties.verdikta.org) (see [live network metrics](https://bounties.verdikta.org/analytics)). Deployed addresses are listed [below](#deployed-contract-addresses).
 
+**Query funding:** The production `ReputationAggregator` uses **native ETH on Base** for evaluation fees. Requesters do not need to buy LINK or approve LINK spending. ETH for network gas is still required.
+
 ## Architecture
 
 ```
@@ -13,16 +15,12 @@ Decentralized oracle infrastructure for AI-powered evaluation and dispute resolu
                         │  Client Application  │
                         │  (or DemoClient)     │
                         └──────────┬──────────┘
-                                   │ requestAIEvaluationWithApproval()
+                                   │ requestAIEvaluationWithApproval{value: ...}()
                                    ▼
               ┌────────────────────────────────────────┐
               │          Aggregation Layer              │
               │                                        │
               │  ReputationAggregator (commit-reveal)  │
-              │        — or —                          │
-              │  ReputationSingleton  (single-oracle)  │
-              │        — or —                          │
-              │  SimpleContract       (fixed oracle)   │
               └──────────┬─────────────────────────────┘
                          │ selectOracles()    ▲ updateScores()
                          ▼                    │
@@ -46,29 +44,41 @@ Decentralized oracle infrastructure for AI-powered evaluation and dispute resolu
               └──────────────────────┘
 ```
 
-**Data flow:** A client submits IPFS evidence CIDs and LINK payment to an aggregation contract. The aggregator selects oracles via the ReputationKeeper, dispatches Chainlink requests through ArbiterOperators, collects responses, and returns aggregated results on-chain.
+**Data flow:** A client submits IPFS evidence CIDs to the ETH-funded `ReputationAggregator`, attaching the required ETH prepayment or using its existing `ethOwed` credit. The aggregator selects oracles via the ReputationKeeper, dispatches zero-LINK Chainlink requests through ArbiterOperators, collects responses, and returns aggregated results on-chain. Oracle fees and any unspent prepayment are credited to the aggregator's ETH withdrawal ledger.
+
+### Funding an evaluation
+
+- Read `maxTotalFee(maxOracleFee)` for the worst-case evaluation budget in **ETH wei**. The aggregator applies the requester's existing `ethOwed` credit first; attach the remaining amount as `msg.value`. Keep enough additional ETH for gas.
+- `requestAIEvaluationWithApproval` retains its historical name, but the current aggregator needs **no LINK approval or LINK balance** from the requester. Chainlink request/response transport remains in use with a zero-LINK payment.
+- After settlement, any unspent prepayment becomes `ethOwed` credit. It can fund another request or be claimed with `withdrawEth()`; oracle owners also withdraw their credited ETH from the aggregator. The worst-case prepayment is a budget, not a promise that part of it will be refunded.
+
+See the [ETH payment implementation notes](docs/advanced/eth-payment-migration.md), [current query script](reputationBasedAggregator/scripts/single-query.js), and [refund script](reputationBasedAggregator/scripts/refund.js). For Verdikta Bounties, use its [current agent/API guide](https://bounties.verdikta.org/agents.txt): bounty rewards, evaluation prepayment, and network gas are separate ETH costs.
+
+`ReputationAggregatorLINK.sol`, `ReputationSingleton`, and `SimpleContract` retain legacy LINK-based implementations. They are not the ETH-funded production flow described above.
 
 ## Repository Structure
 
 | Directory | Description |
 |-----------|-------------|
 | **arbiterOperator/** | Chainlink-compatible operator with access-control restrictions, ensuring only approved contracts can request oracle services |
-| **reputationBasedAggregator/** | Multi-oracle commit-reveal aggregation contract with K/M/N/P phased polling (default 6/4/3/2) |
-| **reputationBasedSingleton/** | Single-oracle fast-resolution contract for simpler disputes needing quick turnaround |
-| **demoClient/** | Demo client contract showing the minimal integration pattern |
-| **simpleContract/** | Minimal fixed-oracle contract for development and testing |
+| **reputationBasedAggregator/** | Production ETH-funded commit-reveal aggregator with K/M/N/P phased polling (default 6/4/3/2); archived LINK implementation also retained |
+| **reputationBasedSingleton/** | Legacy LINK-funded single-oracle implementation |
+| **demoClient/** | ETH-funded demo client showing the current integration pattern |
+| **simpleContract/** | Legacy LINK-funded fixed-oracle contract for development and testing |
 | **docs/** | MkDocs documentation site source |
 
 Each subdirectory is a standalone Hardhat project with its own `contracts/`, `deploy/`, `scripts/`, `test/`, and `.env.example`.
 
 ## Deployed Contract Addresses
 
+LINK addresses below are retained for Chainlink transport and legacy deployments; they do not mean requesters must fund or approve LINK for the ETH aggregator. Verdikta token addresses serve separate staking/reputation roles.
+
 ### Base (Mainnet)
 
 | Contract | Address |
 |----------|---------|
 | ReputationAggregator (ETH-funded) | `0xd8F38bCBEE43bE3bd31655a563f20c9B3e67142a` |
-| LINK Token | `0x88Fb150BDc53A65fe94Dea0c9BA0a6dAf8C6e196` |
+| LINK Token (transport / legacy) | `0x88Fb150BDc53A65fe94Dea0c9BA0a6dAf8C6e196` |
 | Wrapped Verdikta Token | `0x1EA68D018a11236E07D5647175DAA8ca1C3D0280` |
 
 ### Base Sepolia (Testnet)
@@ -76,7 +86,7 @@ Each subdirectory is a standalone Hardhat project with its own `contracts/`, `de
 | Contract | Address |
 |----------|---------|
 | ReputationAggregator (ETH-funded) | `0xe8a385E473EA710c5a88Cc72681a16a26fe380e4` |
-| LINK Token | `0xE4aB69C077896252FAFBD49EFD26B5D171A32410` |
+| LINK Token (transport / legacy) | `0xE4aB69C077896252FAFBD49EFD26B5D171A32410` |
 | Verdikta Token | `0x50f0C663931A5F9caDF36EFd0BE4E4D18196200e` |
 | Wrapped Verdikta Token (Aggregator) | `0x2F1d1aF9d5C25A48C29f56f57c7BAFFa7cc910a3` |
 | Wrapped Verdikta Token (Singleton) | `0x94e3c031fe9403c80E14DaFbCb73f191C683c2B1` |
@@ -86,7 +96,7 @@ Each subdirectory is a standalone Hardhat project with its own `contracts/`, `de
 
 | Contract | Address |
 |----------|---------|
-| LINK Token | `0x779877A7B0D9E8603169DdbD7836e478b4624789` |
+| LINK Token (transport / legacy) | `0x779877A7B0D9E8603169DdbD7836e478b4624789` |
 | Verdikta Token | `0xbb7079F45367ce928789cc40d8C9D4E3A19b0a49` |
 
 ## Prerequisites
@@ -99,8 +109,8 @@ Each subdirectory is a standalone Hardhat project with its own `contracts/`, `de
 ## Quick Start
 
 ```bash
-# Pick a subproject, e.g. reputationBasedSingleton
-cd reputationBasedSingleton
+# Use the current ETH-funded aggregator
+cd reputationBasedAggregator
 
 # Install dependencies
 npm install
@@ -129,8 +139,10 @@ Key pages:
 - [Events Reference](docs/api/events.md) — every event with parameters and lifecycle
 - [Reputation System](docs/advanced/reputation.md) — oracle scoring and penalty mechanics
 - [Oracle Selection](docs/advanced/oracle-selection.md) — weighted selection algorithm
-- [Fee Mechanisms](docs/advanced/fees.md) — LINK and VDKA token flows
-- [Integration Walkthrough](docs/examples/integration.md) — calling the dispatcher from a client contract
+- [ETH Payment Implementation](docs/advanced/eth-payment-migration.md) — current aggregator funding, credits, settlement, and withdrawals; read the implementation notes before the historical design sections
+- [Current Query Example](reputationBasedAggregator/scripts/single-query.js) — attach ETH after accounting for existing credit
+- [Legacy Fee Mechanisms](docs/advanced/fees.md) — historical LINK-payment and VDKA-staking reference; LINK payment instructions do not apply to the current ETH aggregator
+- [Legacy Integration Walkthrough](docs/examples/integration.md) — historical LINK-based client example; use the ETH implementation notes and current query script for new integrations
 
 ## Contributing
 
