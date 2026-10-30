@@ -36,7 +36,10 @@ from this document alone.
 >    contract is `contracts/ReputationAggregator.sol` (`contract ReputationAggregator`);
 >    the legacy LINK contract was renamed to `contracts/ReputationAggregatorLINK.sol`
 >    (`contract ReputationAggregatorLINK`) and kept in-tree as a compiling archive only —
->    it is no longer wired into the deploy scripts. The end state is ETH-only, so the
+>    it is no longer wired into the deploy scripts. (It has since been removed from the
+>    tree; its source is preserved at the `aggregator-v0.1.0` tag:
+>    `git show aggregator-v0.1.0:reputationBasedAggregator/contracts/ReputationAggregatorLINK.sol`.)
+>    The end state is ETH-only, so the
 >    unqualified name belongs to the contract that survives; the legacy one earns the
 >    qualifier. Deploy scripts (`01_aggregator.js`/`02_keeper.js`/`03_config.js`) now
 >    deploy/configure the ETH contract under the name `ReputationAggregator` unchanged

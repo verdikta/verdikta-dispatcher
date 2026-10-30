@@ -172,7 +172,8 @@ contract, and new-format reveals would fail against the old one.
   node release instead of two.
 - Update `test/aggregatorEth.test.js` and the commit/reveal descriptions in
   `docs/contracts/arbiter-operator.md`, `docs/advanced/security.md`, `docs/api/events.md`.
-- `ReputationAggregatorLINK.sol` is a legacy archive and does not need to change.
+- The legacy LINK aggregator (`ReputationAggregatorLINK.sol`) has been removed from the
+  tree, so only `ReputationAggregator.sol` needs to change.
 
 ---
 

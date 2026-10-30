@@ -54,7 +54,7 @@ Decentralized oracle infrastructure for AI-powered evaluation and dispute resolu
 
 See the [ETH payment implementation notes](docs/advanced/eth-payment-migration.md), [current query script](reputationBasedAggregator/scripts/single-query.js), and [refund script](reputationBasedAggregator/scripts/refund.js). For Verdikta Bounties, use its [current agent/API guide](https://bounties.verdikta.org/agents.txt): bounty rewards, evaluation prepayment, and network gas are separate ETH costs.
 
-`ReputationAggregatorLINK.sol`, `ReputationSingleton`, and `SimpleContract` retain legacy LINK-based implementations. They are not the ETH-funded production flow described above.
+`ReputationSingleton` and `SimpleContract` retain legacy LINK-based implementations. They are not the ETH-funded production flow described above. The legacy LINK-funded aggregator (`ReputationAggregatorLINK.sol`) has been removed from the tree; its source is preserved at the `aggregator-v0.1.0` tag.
 
 ## Repository Structure
 
