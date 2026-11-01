@@ -334,3 +334,90 @@ redeploy.
   `setConfig(7, 4, 3, 2, 300)`, no redeploy) gives in-flight rounds slack in the meantime.
 - **Related reputation tweaks:** give no-shows a small quality penalty, or block after
   ~3 consecutive misses. These are owner-settable or small keeper changes.
+
+---
+
+## 8. Requester-set minimum arbiter fee, to make repeated attempts uneconomic
+
+**Status:** not started (design discussed 2026-11-01)
+**Scope:** `ReputationAggregator.sol` + `ReputationKeeper.sol` (selection scoring) + bounty program
+(`BountyEscrow.sol`, `EvaluationWallet.sol`). Breaking change to the request signature and
+`maxTotalFee`; that is acceptable, since the next aggregator release is breaking anyway.
+
+### Problem
+When a lot is at stake, a query that is too cheap invites spam. An attacker can submit
+low-effort entries over and over, hoping the arbiters return a false positive. An attempt
+pays whenever p × stake > cost per attempt. Example: a $5,000 bounty with a 1% chance of a
+false pass is worth $50 per attempt. At $0.50 per query the attacker profits from
+resubmitting endlessly; at $60 they lose money. Today the requester can only set a ceiling
+(`_maxOracleFee`). Cheap arbiters are always paid their posted fee, so the cost per attempt
+cannot be raised.
+
+### Idea
+Add a per-request floor `_minOracleFee`. An arbiter whose fee is above the ceiling is still
+rejected, as now. An arbiter whose fee is below the floor is paid the floor.
+- **Keep eligibility and payment separate.** Eligibility stays `fee <= effMaxFee`, where
+  `effMaxFee = min(_maxOracleFee, maxOracleFee)`. The amount paid is `max(fee, minFee)`.
+  `minFee` may **exceed** `effMaxFee` and the global `maxOracleFee`. The global ceiling
+  exists to keep LINK-scale arbiters out of selection, not to cap what a requester chooses
+  to pay. This matters: at 0.0004 ETH × K = 6 the most anyone can be charged today is
+  ~0.0024 ETH (a few dollars), far short of the $60 example.
+- **Escrow.** `required = max(effMaxFee, minFee) * (K + B*P)`, and
+  `maxTotalFee(maxOracleFee, minOracleFee)` returns the same value. Solvency holds the same
+  way as now: the charge-time guard in `_pollOracle` checks against the same bound the escrow
+  was sized on.
+- **Payment.** In `_pollOracle`, keep `if (fee > effMaxFee) revert`, then store the paid
+  amount in `pollFees` and credit it to `ethOwed` / `baseCredited`. The bonus at finalize is
+  `pollFees[slot] * bonusMultiplierSnap`, so it scales off the paid amount automatically.
+  That is intended. Consider emitting both the posted fee and the paid amount in
+  `BasePayment`.
+- **Keeper scoring (required).** `getSelectionScore` boosts cheaper arbiters. Below the
+  floor every arbiter costs the requester the same, so score on `max(fee, minFee)`.
+  Otherwise the cheapest arbiters win selection weight for no saving, and arbiters have a
+  reason to post near-zero fees just to win selection while still collecting the floor,
+  which makes posted fees meaningless. Pass `minFee` through `SelectionParams`.
+- **Fix the existing boost discontinuity at the same time.** The boost applies only when
+  `fee > estimatedBaseCost`. An arbiter priced at or below `estimatedBaseCost` gets a factor
+  of 1 (no boost), while one priced just above it gets close to
+  `maxFeeBasedScalingFactor`. Fees at or below the base cost should get the maximum boost.
+- **Who sets the floor.** It only deters an attacker if the attacker cannot choose it. In
+  the bounty case the attacker *is* the requester, so the **bounty creator** must set it:
+  add `minOracleFee` to BountyEscrow's per-bounty oracle params (alongside `maxOracleFee`,
+  `alpha`, `estimatedBaseCost`) and pass it through `EvaluationWallet`. Any application where
+  submitters call the aggregator directly gets no protection from this; document that.
+
+### Sizing guidance (for docs / bounty UI)
+- The cost of an attempt that cannot be avoided is the base fee, credited to all K arbiters
+  up front and never refunded: **K × minFee** (6 × minFee with the defaults). When a cluster
+  forms, the bonus usually adds up to **B × P × minFee** more (another 6 ×). The leftover
+  escrow is refunded.
+- So a $60 deterrent means minFee ≈ $10, not $60. The bounty UI should ask the creator for a
+  target cost per attempt and divide by K, rather than asking for a per-arbiter figure.
+- Leave a margin above p × stake. p is the creator's guess, and each failed attempt returns
+  arbiter justifications that help the attacker improve the next try, so p can rise.
+- The floor is in wei, so a dollar-sized deterrent drifts with the ETH price over a
+  long-lived bounty.
+
+### Why it's deferred
+It changes the request signature, `maxTotalFee`, and keeper selection scoring, so it needs a
+coordinated redeploy of the aggregator and keeper plus a bounty-program release.
+
+### Notes / related
+- **Leakage when the floor goes to arbiters.** An attacker who also runs arbiters gets back
+  the share paid to their own arbiters whenever they are selected (and an attacker-run
+  arbiter that refuses dispatch is simply not credited), so their real cost is lower than
+  K × minFee. Honest submitters also pay the full floor on every attempt.
+- **Planned complement: payback to the bounty creator.** We may ultimately want both. In
+  addition to the arbiter floor, the bounty contract can take a submission deposit that is
+  **forfeited to the bounty creator on failure** and returned on success. An honest
+  submitter with good work pays nothing extra, the attacker still pays ~(1 − p) × deposit per
+  attempt, and running arbiters recovers none of it. That part lives entirely in
+  BountyEscrow and needs no aggregator change. A likely split: a moderate floor so arbiters
+  are paid properly for high-stakes work, plus a deposit for most of the deterrent.
+- `maxTotalFee` also changes in item 6 (`triggerGasReserveWei`). If both land in the same
+  release, change its signature once.
+- With item 3 (`refundTo`), BountyEscrow becomes the direct requester. That is also the
+  natural place to hold and settle the creator-payback deposit.
+- Update `test/aggregatorEth.test.js`, `docs/advanced/fees.md`,
+  `docs/contracts/reputation-aggregator.md`, `docs/advanced/eth-payment-migration.md`, the
+  `maxTotalFee` examples under `docs/examples/`, and `README.md`.
