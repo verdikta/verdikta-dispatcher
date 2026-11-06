@@ -139,8 +139,10 @@ flags still override it).
 #       them, sigma_within = the residual sd, which also contains g.
 #
 # C. COLLUDING ARBITERS (X)
-#   C1. n_c = round(x_colluding_oracles * eligible_oracles), clipped to [0, eligible]. With 30
-#       eligible, X = 5% gives 2 colluders and X = 3% gives 1. Colluders are indices < n_c.
+#   C1. n_c = round(x_colluding_oracles * eligible_oracles), clipped to [0, eligible]. Colluders
+#       are indices < n_c. With the default 300 eligible, X = 3% gives 9 colluders. The rounding
+#       matters for small pools: with 30 eligible, X = 3% gives 1 colluder and X = 5% gives 2,
+#       and one colluder is far weaker than two (C2).
 #   C2. Every colluder reports the same score, min(100, threshold + colluder_report_margin),
 #       fixed in advance (a commit binds it; RA.fulfill checks sha256(sender, response, salt)).
 #       Two or more colluders in the counted reveals are at distance 0 and always form the
@@ -172,7 +174,11 @@ flags still override it).
 #       timestamp, selectionCounter, entropyBuf, beacon value, blockhash perturbation) yields
 #       an independent selection (keccak behaves as a random oracle).
 #   D5. eligible_oracles means arbiters that are active, unblocked, fee-eligible and serve the
-#       requested class. Other classes are irrelevant.
+#       requested class. Other classes are irrelevant. The default, 300, is a PLANNING value for
+#       a grown network (set 2026-11-06), not a measurement: the mainnet registry had 32
+#       arbiters on 2026-11-03 (N6). Set it with --eligible. Above shortlist_size, each poll
+#       slot draws from a uniform shortlist of 20, so a colluder's chance per slot is about X
+#       regardless of the pool size; the pool size matters through the rounding in C1.
 #
 # E. COMMIT / REVEAL RACE AND CLUSTERING (mirrors RA)
 #   E1. K arbiters are polled. Each honest arbiter no-shows independently with
@@ -325,7 +331,16 @@ flags still override it).
 #       their peers: implied lean sd 0.00 points, 0 arbiters beyond 3 standard errors (0.1
 #       expected by chance). This is consistent with every arbiter running the same code. Revisit
 #       if arbiters diverge (different models, prompts or versions).
-#   N3. sigma_within = 7.1 for nominal 80 / threshold 90. The 64 rounds whose MEDIAN accept share
+#   N3. sigma_within = 3.0 is a TARGET, not a measurement (set 2026-11-06): Verdikta's goal for
+#       per-arbiter noise is round SD <= 4, and the planning default is 3. Over the 30 days to 2026-11-06 the bounty site's
+#       "Pooled SD, outliers excluded" (the clustered pair plus the third counted reveal unless
+#       it is more than 15 points from the pair's mean; example-bounty-program
+#       server/utils/scoreSpread.js clusteredSpread) was 2.8, so 3 is within reach. That figure
+#       is not the same quantity as this model's normal sd: real noise is heavy-tailed, which is
+#       why the calibrated normal-sd equivalent below is 7.1. A target of 3 assumes the tail is
+#       gone, i.e. the network behaves like normal noise with sd 3. With
+#       --sigma-within 7.1 the script reproduces the calibrated measurement below.
+#       Measured value (2026-11-03): sigma_within = 7.1 for nominal 80 / threshold 90. The 64 rounds whose MEDIAN accept share
 #       was within 80 +/- 5 were re-centered on 80 and run through the aggregator's closest-pair
 #       rule, giving an empirical honest pass rate of 3.9% (95% interval 1.2-11.8%). Normal
 #       noise reproduces 3.9% at sd 7.1 (the interval maps to sd ~5.7-10.2). 7.1 is therefore a
@@ -385,7 +400,7 @@ from itertools import combinations
 @dataclass
 class Params:
     # ---------------- Headline knobs ----------------
-    x_colluding_oracles: float = 0.10     # X: fraction of ELIGIBLE arbiters in the cartel
+    x_colluding_oracles: float = 0.03     # X: fraction of ELIGIBLE arbiters in the cartel (300 x 3% = 9, C1)
     y_colluding_builders: float = 0.05    # Y: fraction of builders / sequencers that take bribes
     z_builder_bribe_usd: float = 1_000.0  # Z: bribe per manipulated block
 
@@ -394,12 +409,12 @@ class Params:
     true_score: float = 80.0              # nominal: typical honest "accept" answer for this submission
     threshold: float = 90.0               # pass if final >= threshold (90 is the common bounty bar)
     sigma_between: float = 0.0            # sd of persistent per-arbiter lean b_j. MEASURED: 0.00 (N2)
-    sigma_within: float = 7.1             # sd of run-to-run noise. MEASURED, calibrated at 80/90 (N3)
+    sigma_within: float = 3.0             # sd of run-to-run noise. TARGET (N3); calibrated measurement was 7.1
     sigma_estimate: float = 3.0           # attacker's error estimating each b_j (moot while sigma_between = 0)
     colluder_report_margin: float = 5.0   # colluders report threshold + this
 
     # ---------------- Arbiter pool ----------------
-    eligible_oracles: int = 30            # active, unblocked, fee-eligible arbiters for the class
+    eligible_oracles: int = 300           # active, unblocked, fee-eligible arbiters for the class. PLANNING value (D5)
     colluder_weight_multiplier: float = 1.0
     min_score_for_selection: float = 60   # selection weight = reputation clamped to [min, max],
     max_score_for_selection: float = 6000  # drawn uniformly per arbiter
@@ -454,7 +469,7 @@ class Params:
     selection_pool: int = 800             # random K-selections pre-drawn per network
     evals_per_network: int = 40           # rounds simulated per network per strategy
     rng_seed: int = 12345
-    sweep_x: tuple = (0.0, 0.05, 0.10, 0.20)
+    sweep_x: tuple = (0.0, 0.03, 0.05, 0.10, 0.20)
     sweep_sigma_between: tuple = (0.0, 3.0, 7.0, 12.0)
     sweep_scale: float = 0.25
 
@@ -929,7 +944,7 @@ def main():
                     "(its 'params' object, keyed by Params field); CLI flags override it")
     ap.add_argument("--true", type=float, help="mean honest accept likelihood")
     ap.add_argument("--threshold", type=float, help="pass threshold")
-    ap.add_argument("--eligible", type=int, help="eligible arbiters for the class")
+    ap.add_argument("--eligible", type=int, help="eligible arbiters for the class (default 300, a planning value)")
     ap.add_argument("--request-block-seed", action="store_true", help="beacon mixes REQUEST-block entropy")
     ap.add_argument("--scale", type=float, default=1.0, help="scale Monte Carlo sizes")
     ap.add_argument("--no-sweep", action="store_true")
