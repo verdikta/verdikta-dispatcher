@@ -264,6 +264,10 @@ aggregator round stage, a new arbiter request mode and node-side chain managemen
 redeploy of both contracts.
 
 ### Notes / related
+- **Superseded as the near-term fix by item 9** (two-phase request, seed from
+  `blockhash(B+1)`). A colluding first-responder beacon knows its own draw before answering,
+  which in the risk model lowers the limit below item 9's. Keep beacons only as later
+  hardening against the sequencer, in a form where withholding is uninformed.
 - **Residual risk: racing.** A colluding beacon can choose to answer first or hang back,
   which lets it veto a draw but not choose one. Item 7's freeze rule makes withholding
   costly, and setting `slashAmountConfig` above 0 would add a stake cost.
@@ -414,10 +418,186 @@ coordinated redeploy of the aggregator and keeper plus a bounty-program release.
   attempt, and running arbiters recovers none of it. That part lives entirely in
   BountyEscrow and needs no aggregator change. A likely split: a moderate floor so arbiters
   are paid properly for high-stakes work, plus a deposit for most of the deterrent.
-- `maxTotalFee` also changes in item 6 (`triggerGasReserveWei`). If both land in the same
-  release, change its signature once.
+- `maxTotalFee` also changes in item 6 (`triggerGasReserveWei`) and item 9 (the 2 × fee
+  trigger reward). If they land in the same release, change its signature once.
 - With item 3 (`refundTo`), BountyEscrow becomes the direct requester. That is also the
   natural place to hold and settle the creator-payback deposit.
 - Update `test/aggregatorEth.test.js`, `docs/advanced/fees.md`,
   `docs/contracts/reputation-aggregator.md`, `docs/advanced/eth-payment-migration.md`, the
   `maxTotalFee` examples under `docs/examples/`, and `README.md`.
+
+---
+
+## 9. Two-phase request: commit first, draw the jury from a later block hash
+
+**Status:** not started (design discussed 2026-11-07)
+**Scope:** `ReputationAggregator.sol` + `ReputationKeeper.sol` (selection inputs, checkpoints) +
+bounty program (`BountyEscrow.sol`, `EvaluationWallet.sol`, site, agent skill and docs). Breaking
+change to the request flow and `maxTotalFee`.
+
+### Problem
+Every input to `selectOracles` is known before the request is sent (see item 6). A requester
+simulates the draw for each coming block and submits only when it polls two colluding arbiters.
+Two colluders that report the same score are always the closest pair, so they decide the round.
+Waiting costs nothing, so raising the fee barely helps. `scripts/selection_randomness_risk.py`
+at its planning defaults (300 eligible arbiters, 3% colluders, SD 3) with a $0.50 base fee puts
+the most value one decision should carry at **$4.57**. A 10× higher fee raises that only 2.8×.
+
+Item 6's first-responder beacon stops the requester from predicting the draw, but adds a
+colluding beacon that can. It knows its own next value, and `blockhash(requestBlock)` is public
+once the request is mined, so it answers only when its draw is good. In the model that limit is
+about $200 to $270.
+
+### Idea
+Split each request into two transactions in different blocks. The requester is committed before
+the randomness exists.
+- **Commit (block B).** The request escrows the prepay and records the query, `aggId`,
+  `requestBlock = B` and the requester. No selection or polling happens yet. The requester
+  cannot cancel the round.
+- **Seed.** `seed = keccak256(aggId, blockhash(B+1))`. Nobody knows it when B's transaction is
+  signed. Use B+1, not B: the requester's own transaction is in B, and Flashblocks show most of
+  B's contents before it closes. Do not use `prevrandao` or `timestamp`. On Base, the next
+  block's `prevrandao` is usually the same L1-origin value, and its timestamp is parent + 2 s.
+- **Enforcement.** `blockhash` returns 0 for the current and future blocks, so the draw must
+  require `blockhash(B+1) != 0`, which means `block.number >= B+2`. No wrapper contract, bundle
+  or batch can do both steps in one block.
+- **Seal.** Permissionless `sealSeed(aggId)` stores `blockhash(B+1)` (~30k gas) while it is
+  still within the 256-block window. The draw seals first if needed. Once sealed, the window no
+  longer matters.
+- **Draw.** Permissionless `drawJury(aggId)` from block B+2 on. It must be a pure function of
+  the seed and of state as of block B, so who draws, and when, cannot change the result:
+  - Remove `block.prevrandao`, `block.timestamp` and `selectionCounter` from selection
+    (`ReputationKeeper.sol` ~504 and ~561). Derive the shortlist and every weighted pick from
+    the seed. Otherwise the drawer's block re-rolls the draw, and other requests can shift
+    `selectionCounter` between the two steps.
+  - Checkpoint selection inputs by block number, the `ERC20Votes.getPastVotes` pattern:
+    selection score, registration and deregistration, and blocked, locked or frozen status. The
+    draw reads the values at B. Without this, whoever draws can wait until another round's
+    reputation update or a registry change shifts the weights, then draw on a good state.
+  - Then dispatch commit requests as today. Start `responseTimeoutSeconds` at the draw, not at
+    the request.
+- **Trigger reward: 2 × `eff`**, the per-arbiter fee the escrow is sized on. No separate gas
+  reimbursement.
+  - `maxTotalFee = eff * (K + B*P + 2)`, which is 14 × `eff` with the default 6/3/2.
+  - For the first **30 s** after the commit (by `block.timestamp`, not a block count; Base
+    Sepolia blocks are 0.2 s), only the requester's draw earns the reward, credited back to the
+    requester. After that, whoever draws is credited the reward in `ethOwed`. Anyone may draw
+    earlier without the reward; the result is the same.
+  - For now the hunter draws (bounty site, agent skill). Keepers, Chainlink Automation or
+    market bots can take over later with no contract change.
+- **No expiry before the draw.** A round cannot time out or refund until it is drawn. A
+  requester who abandons a bad draw leaves the prepay locked, and anyone can draw it after 30 s
+  for the reward, so abandoning buys no re-roll. An honest requester whose client died loses
+  nothing.
+- **The one exception.** If nobody sealed the seed within 256 blocks, the round can never be
+  drawn. A permissionless cancel then sends the prepay to the treasury. It must not refund the
+  requester: a refund would be a free re-roll.
+
+### Expected payoff
+At the risk model's defaults (300 eligible arbiters, 3% colluders, SD 3) with a $0.50 base fee:
+- Requester prediction is gone. The limit becomes the blind re-submit bound, **~$428** (the
+  ideal-RNG row), up from $4.57. At today's $0.05 fee: $1.61 → ~$42.
+- A bribed sequencer can still grind `blockhash(B+1)` by reordering or including transactions.
+  The builder rows are ~$1,100 to $1,200, above the re-submit bound, so the sequencer does not
+  bind at these parameters.
+
+### Why it's deferred
+It adds a new round stage to the aggregator, checkpointed keeper state, a selection rewrite and a
+new `maxTotalFee`. That means a redeploy of both contracts, plus bounty-program, site and agent
+updates for the second transaction.
+
+### Notes / related
+- **Bounty program.** The aggregator's requester is the submission's `EvaluationWallet` clone.
+  For the hunter to recoup the reward, the draw must go through BountyEscrow and the wallet, as
+  a passthrough like `startEvaluation`. The credit then returns with `refundLeftoverEth` to
+  `Submission.funder`. The submission stays `PendingVerdikta` until drawn, and
+  `failTimedOutSubmission` must not refund an undrawn round. Site: after the submit
+  transaction confirms, wait for block B+2 and prompt "Start evaluation". Agent skill, API docs
+  and `nextAction`: add the draw step.
+- **Reward economics.** At today's fee, 2 × 0.00002 ETH ≈ $0.09, against ~3.1M gas ≈ $0.04 at
+  0.006 gwei. If gas spikes more than about 2×, third parties stop drawing until it falls. That
+  is acceptable because rounds do not expire. Draw gas grows with the registry (item 2), so
+  measure it at 300 arbiters.
+- **Item 6.** This replaces item 6 as the near-term fix. Beacons remain a later hardening step
+  against the sequencer, but only where withholding is uninformed: every assigned beacon must
+  reveal, with values due before the deciding entropy exists. Alternatives are a pinned future
+  drand round or threshold BLS signatures from an arbiter committee. First-responder beacons as
+  written in item 6 lower the limit in the model.
+- **Item 7** gets its liveness calls from item 6's hash-chain requests. If item 6 waits, item 7
+  needs a different liveness call.
+- **Item 8.** With a fee floor, size the reward on the amount the escrow uses,
+  `max(effMaxFee, minFee)`. Change the `maxTotalFee` signature once if both land together.
+- **EIP-2935**, if Base has it, makes 8,191 past block hashes readable, which largely removes
+  the need for the seal.
+- **Risk model.** Add an explicit two-phase scenario to `scripts/selection_randomness_risk.py`
+  (sequencer can grind B+1), so the table shows this design directly.
+
+---
+
+## 10. True best-cluster selection instead of greedy closest-pair seeding
+
+**Status:** not started (design discussed 2026-11-07)
+**Scope:** `AggregatorLib.sol` (`findBestCluster`). The aggregator links the library, so it
+needs a redeploy.
+
+### Problem
+`findBestCluster` seeds the cluster with the closest pair, then repeatedly adds the response with
+the smallest summed distance to the current members until it has P. For P = 2 that is the exact
+best pair. For P >= 3 it is not. Two colluders that report identical vectors are always the
+closest pair (distance 0), so they always seed the cluster, and the members added are the honest
+responses nearest them. By reporting an extreme score they pull the cluster mean. Example: with
+P = 3, two colluders at 100 and honest scores near 80 give (100 + 100 + 80) / 3 = 93.3.
+
+So under greedy seeding, colluders need only about P/2 of the cluster, not P. At a 10-point gap
+below the threshold, k colluders at 100 pass when k·100 + (P − k)·80 >= 90·P. Raising P with
+greedy clustering can even make things worse. P = 3 or 4 still needs only 2 colluders, but polls
+more arbiters, so 2 colluders turn up more often.
+
+### Idea
+Pick the P-member subset of the counted responses with the smallest total pairwise distance (sum
+of squared distances over every pair in the subset).
+- **Distance matrix.** Compute the n × n distances once (n(n−1)/2 `calculateDistance` calls) and
+  score subsets from the matrix.
+- **Exact enumeration.** C(n, P) subsets, each summing P(P−1)/2 matrix entries. With the
+  recommended n = 2P − 1 that is 10 subsets for P = 3, 35 for P = 4, 126 for P = 5 and 462 for
+  P = 6.
+- **Cheaper alternative if gas matters at larger P.** For each response, take it plus its P − 1
+  nearest, score that group, and keep the best (O(n² log n)). It is not always the exact optimum.
+  But with an honest majority (at least P honest responses counted), a group centred on an honest
+  response contains only honest responses, so colluders still need P.
+- **Deterministic tie-break:** the first subset in reveal order, as the closest-pair scan does
+  today.
+- **P = 2 is unchanged.** The best pair is the closest pair, so the current 6/4/3/2 config
+  behaves exactly as now.
+- With true clustering, colluders need P of the 2P − 1 counted responses, whatever they report.
+
+### Recommended configs
+`setConfig(K, M, N, P, timeout)` with N = 2P − 1 counted, M = 2P reveal requests and K = 2P + 2
+commits polled, a buffer of 2. These are owner-settable with no redeploy, for example
+`setConfig(8, 6, 5, 3, 300)`. The existing checks (K >= M >= N >= P >= 2) already allow them.
+K must fit within the selection shortlist (`shortlist_size` 20), and the class needs at least K
+eligible arbiters.
+
+### Expected payoff
+Estimated from the risk model's assumptions (300 eligible arbiters, SD 3, the item 9 two-phase
+request, a $1,000 sequencer bribe):
+- P = 3, K = 8, first 2 of 4 beacons, $5 base fee: about **$90K** per decision at 3% colluders,
+  against about $4.3K with greedy clustering. At 5% colluders about $17K; at 10% about $2.1K.
+- P = 5, K = 12, today's $0.05 fee, no beacons: about $300K at 3% colluders.
+- A larger P also tightens the honest cluster (the mean of P values), so pure spam gets harder.
+
+### Why it's deferred
+It is a library change with an aggregator redeploy and new tests. A larger P also raises the
+per-round cost (`fee × (K + B×P)`) and latency: the round waits for the (2P)-th commit and the
+(2P − 1)-th reveal.
+
+### Notes / related
+- **Gas.** Measure exact enumeration for P = 3 to 6 with realistic likelihood-vector lengths. For
+  long vectors the distance matrix dominates.
+- **Tests.** For P = 3 to 5, two identical extreme reveals plus an honest majority must select the
+  honest group. For P = 2, results must match the current implementation on random inputs.
+- `setConfig`'s comment on P >= 2 refers to the closest-pair seed. Keep the bound, since bonus
+  accounting assumes at least two winners, and update the comment.
+- Bonus credits and reputation updates are per cluster member and do not change.
+- `scripts/selection_randomness_risk.py` models true clustering by default (`cluster_rule`), with
+  greedy available for comparison.
