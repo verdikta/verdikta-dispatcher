@@ -52,7 +52,20 @@ ATTACK LEVERS
                 grind the final seed outright;
               - a builder grinds stage 1 and, seeing pending beacon responses in the private
                 mempool, picks which h lands first (re-rolling each if response-block entropy).
-    L3  Ordering (builder only; identical in S1 and S2). The builder holds fulfill txs to choose
+          S3 (two-phase request, TODO item 9): the request commits in block B; anyone draws the
+              jury from block B+2 on, with seed = keccak(aggId, blockhash(B+1)) and selection
+              state checkpointed at B. Nobody knows the seed when the request is signed, and who
+              draws, or when, cannot change it. Only the sequencer, which builds B+1, can steer it.
+          S4 (two-phase + mandatory beacons): as S3, but blockhash(B+1) also assigns the beacons,
+              and every assigned beacon must reveal its next chain value after B+1. The jury seed
+              mixes all of them. A colluding beacon can only reveal or withhold (a public substitute
+              replaces a missing value at the deadline); the sequencer cannot target a seed that
+              still depends on honest beacons' unrevealed values.
+          S5 (two-phase + first two of 4 beacons): as S4, but the seed mixes only the first two
+              beacon values to land. Two colluding beacons can race in with a pair they computed in
+              advance; one can pair with the first honest value once it is on-chain; the sequencer
+              can pick which two of the pending reveals land first.
+    L3  Ordering (builder only; identical in S1, S2 and S3). The builder holds fulfill txs to choose
         which 4 commits get reveal requests (colluders first, then most lenient), then sees the
         PLAINTEXT reveals and chooses which 3 land first, i.e. which cluster forms.
     L4  Denial (builder only): censor fulfill txs past responseTimeoutSeconds, so the round fails
@@ -191,8 +204,11 @@ flags still override it).
 #       (RA "selected" = first N). Fewer than N reveals means failure.
 #   E4. One whole-round timeout (response_timeout_s) measured from the request; it is not
 #       reset at commit->reveal (RA.startTimestamp). Anything later is lost.
-#   E5. Clustering = AL.findBestCluster: the closest pair (the first pair found wins ties, in
-#       reveal order), then greedy addition up to P. Final = mean of the cluster. best_cluster().
+#   E5. Clustering (cluster_rule). Default "best_subset" = TRUE clustering (TODO item 10): the
+#       P-member subset of the counted reveals with the smallest total pairwise squared distance,
+#       first in reveal order on ties. "greedy" = today's AL.findBestCluster: the closest pair,
+#       then greedy addition up to P. For P = 2 the two are identical. Final = mean of the
+#       cluster. best_cluster().
 #   E6. Not modelled: modal-length normalization, invalid-format or hash-mismatch reveals,
 #       MAX_ARBITER_RETURN_SCORE clamping, and late commits after the M-th (they are ignored,
 #       as in RA).
@@ -255,6 +271,57 @@ flags still override it).
 #   H10. Beacon cost to a submitter-attacker = fee x multiplier x (1 - X) (expected share
 #       paid to an honest responder) + beacon_gas.
 #
+# H'. SCENARIO S3: TWO-PHASE REQUEST (TODO item 9)
+#   H'1. Commit in block B, draw from B+2 on, seed = keccak(aggId, blockhash(B+1)). The draw
+#       reads selection state checkpointed at B and no block.* values, so it is a pure function
+#       of the seed. The submitter therefore faces an unbiased seed: its rounds are the s1_free
+#       rounds (random selection, natural order).
+#   H'2. Abandoning a bad draw buys nothing: the round never expires before it is drawn, and
+#       anyone may draw it after 30 s for the 2 x fee reward. Not modelled as a row.
+#   H'3. The 2 x fee trigger reward is escrowed and credited back to the requester when it draws
+#       its own round (or when its colluders do), so it is not a cost to a submitter-attacker.
+#   H'4. The sequencer builds B+1 after seeing the commit and can grind blockhash(B+1)
+#       (reorder, include or exclude txs): builder_grind_options seeds for one bribe Z, the
+#       same as the S1 builder grind. Ordering (L3) and denial (L4) are unchanged.
+#   H'5. Extra cost per attempt: two_phase_extra_gas (second tx, seed seal, checkpoint lookups).
+#       The selection gas itself moves from the request to the draw tx.
+#
+# H''. SCENARIO S4: TWO-PHASE + MANDATORY HASH-CHAIN BEACONS
+#   H''1. Commit in block B. blockhash(B+1) assigns beacon_providers beacons (Network.prov, the
+#       same pool as S2). Each must reveal its next chain value after B+1 and before a deadline.
+#       seed = H(aggId, blockhash(B+1), v_1..v_b). A missing value is replaced at the deadline by a
+#       public substitute (e.g. H(lastRevealed, aggId)).
+#   H''2. Colluding beacons reveal last (honest values are on-chain by then), so each one makes an
+#       informed reveal-or-withhold choice: cp colluding beacons give 2^cp candidate seeds, and
+#       they pick the best by predicted pass (Network.best_of(2^cp)). Withholding is free here; a
+#       freeze or slash for missed reveals (item 7) would only lower attacker power.
+#   H''3. The submitter cannot grind the assignment (it comes from B+1). Its attack is L1 re-submit
+#       with whatever colluding beacons luck assigns.
+#   H''4. The sequencer grinds blockhash(B+1) to pull colluding beacons into the assignment
+#       (best of builder_grind_options draws by colluder count, as in S2's H9), then they play
+#       H''2. It cannot target the jury seed itself while any assigned beacon is honest, because
+#       honest values are unrevealed when B+1 is built. Holding honest reveals past the deadline is
+#       ruled out by builder_max_hold_s (keep the deadline above it). All-colluder assignments are
+#       treated like any other (2^cp options); they are rare (~1e-6 per draw at defaults).
+#   H''5. Cost per attempt = S3's + beacon_providers x beacon_usd (each beacon is paid like the
+#       S2 responder). Ordering (L3) and denial (L4) are unchanged.
+#
+# H'''. SCENARIO S5: TWO-PHASE + FIRST TWO OF beacon_providers BEACONS
+#   H'''1. As H''1, but seed = H(aggId, blockhash(B+1), v_first, v_second): the first two beacon
+#       values included. No deadline or substitute; fewer than two values means no round.
+#   H'''2. Honest beacons reveal as soon as they can (provider_blocks). Colluders reveal at will
+#       and win same-block ordering by priority fee (as H5). Their informed options
+#       (first_two_options): every colluder-only pair (known before anyone reveals, raced in
+#       first); a colluder paired with the first honest value, if that value lands at least one
+#       block before the second honest one (or is the only honest one); and abstaining, which
+#       leaves the first two honest values. The best option by predicted pass is used.
+#   H'''3. Not responding is indistinguishable from being slow, so no penalty is possible here.
+#   H'''4. Sequencer: grinds B+1 for colluding beacons (as H''4), sees pending honest reveals,
+#       and can hold them up to builder_max_hold_s. It picks any pair among the colluders and
+#       the honest reveals that arrive within the hold window of the first one, knowing every
+#       value: C(available, 2) options (first_two_builder_options).
+#   H'''5. Cost per attempt = S3's + 2 x beacon_usd (only the first two beacons are paid).
+#
 # I. BUILDER / ORDERING (L3) AND DENIAL (L4)
 #   I1. A bribed builder can delay any fulfill tx by up to builder_max_hold_s without being
 #       noticed, and never past the round timeout. It cannot drop txs permanently, except in
@@ -299,6 +366,10 @@ flags still override it).
 #       using arrival order; it does NOT implement a deadline-plus-random-subset protocol.
 #   K5. Ideal RNG (VRF) is the S1 no-manipulation row (s1_free). With a perfect seed, only
 #       re-submission and luck remain.
+#   K6. S3 reuses the S1 rounds: s1_free for the submitter, s1_seed / s1_order / s1_all for the
+#       builder. Its headline is min(ideal re-submit bound + extra gas, builder rows).
+#   K7. S4 and S5 draw their rounds from separate RNG streams (rng_seed + 4, + 5), so adding
+#       them leaves the S1-S3 numbers unchanged.
 #
 # L. MONTE CARLO
 #   L1. networks x evals_per_network rounds per strategy. A fixed rng_seed makes runs
@@ -316,6 +387,9 @@ flags still override it).
 #   - Seed construction / entropy sources                 -> sections G/H and the grind counts.
 #   - Reveal-set rule (e.g. deadline + random subset)     -> Sim.play ordering and builder logic.
 #   - Beacon design (penalties, all-provider XOR, VRF)    -> beacon_withhold(), beacon_builder().
+#   - Two-phase request (item 9)                          -> section H', S3 rows in build().
+#   - Two-phase + mandatory beacons                       -> section H'', S4 rounds in run(), rows in build().
+#   - Two-phase + first two beacons                       -> section H''', first_two_*options(), S5 rows.
 #   - Pass rule in an integrating contract                -> A4 and the final comparison in play().
 #   - Arbiter software / models change                    -> re-measure N2 and N3 (arbiter-noise.js).
 #
@@ -424,6 +498,7 @@ class Params:
     m_reveal: int = 4
     n_required: int = 3
     p_cluster: int = 2
+    cluster_rule: str = "best_subset"     # TRUE clustering (TODO item 10); "greedy" = current AggregatorLib
     bonus_multiplier: int = 3
     shortlist_size: int = 20
     response_timeout_s: float = 300.0
@@ -449,6 +524,7 @@ class Params:
     oracle_fee_eth: float = 0.00002       # registered fee of 31/32 arbiters = BasePayment amount actually credited
     gas_price_gwei: float = 0.006         # median effective gas price of recent request txs
     request_gas: int = 3_300_000          # median gasUsed of requestAIEvaluationWithApproval (L1 data fee ~0)
+    two_phase_extra_gas: int = 150_000    # S3 estimate: 2nd tx + seed seal + checkpoint lookups
     selection_check_gas: int = 400_000    # in-tx selection recompute by a wrapper (0 if simulated off-chain)
     beacon_gas: int = 250_000
 
@@ -512,9 +588,23 @@ def select_oracles(weights, k, shortlist_size, rng):
     return out
 
 
-def best_cluster(vals, P):
-    """AggregatorLib.findBestCluster on 1-D scores: closest pair (first found wins ties), then add
-    the point with the smallest summed distance until the cluster has P members. Returns indices."""
+def best_cluster(vals, P, rule="best_subset"):
+    """Cluster of P members among 1-D scores; returns indices.
+    best_subset (default, TODO item 10): the P-subset with the smallest total pairwise squared
+        distance; the first subset in reveal order wins ties.
+    greedy (AggregatorLib.findBestCluster today): closest pair (first found wins ties), then add the
+        point with the smallest summed distance until the cluster has P members.
+    For P = 2 both return the closest pair."""
+    P = min(P, len(vals))
+    if rule == "best_subset":
+        best, members = None, None
+        for sub in combinations(range(len(vals)), P):
+            d = sum((vals[i] - vals[j]) ** 2 for i, j in combinations(sub, 2))
+            if best is None or d < best:
+                best, members = d, list(sub)
+        return members
+    if rule != "greedy":
+        raise ValueError(f"unknown cluster_rule {rule!r}")
     best, pair = None, (0, 1)
     for i in range(len(vals) - 1):
         for j in range(i + 1, len(vals)):
@@ -522,7 +612,7 @@ def best_cluster(vals, P):
             if best is None or d < best:
                 best, pair = d, (i, j)
     members = list(pair)
-    while len(members) < min(P, len(vals)):
+    while len(members) < P:
         cand = min((i for i in range(len(vals)) if i not in members),
                    key=lambda i: sum((vals[i] - vals[k]) ** 2 for k in members))
         members.append(cand)
@@ -575,7 +665,7 @@ class Network:
         tot, cnt = 0.0, 0
         for combo in combinations(honest, need):
             vals = [rep] * c + list(combo)
-            mem = best_cluster(vals, p.p_cluster)
+            mem = best_cluster(vals, p.p_cluster, p.cluster_rule)
             m = sum(vals[i] for i in mem) / len(mem)
             tot += phi((m - p.threshold) / s.pred_sd)
             cnt += 1
@@ -605,6 +695,8 @@ class Sim:
     def __init__(self, p: Params, scale=1.0):
         self.p = p
         self.r = random.Random(p.rng_seed)
+        self.r4 = random.Random(p.rng_seed + 4)  # S4 stream, so S1-S3 results are unchanged
+        self.r5 = random.Random(p.rng_seed + 5)  # S5 stream
         n = p.eligible_oracles
         self.n_c = min(n, max(0, round(p.x_colluding_oracles * n)))
         self.networks = max(20, int(p.networks * scale))
@@ -617,6 +709,7 @@ class Sim:
         self.req_gas_usd = g(p.request_gas)
         self.check_usd = g(p.selection_check_gas)
         self.beacon_usd = self.fee * p.beacon_fee_multiplier * (1 - p.x_colluding_oracles) + g(p.beacon_gas)
+        self.two_phase_usd = g(p.two_phase_extra_gas)
         self.hold_blocks = max(1, int(p.builder_max_hold_s / p.block_time_s))
 
     # ---------- one aggregation round ----------
@@ -672,7 +765,7 @@ class Sim:
         best = None
         for sub in subsets:
             vals = [x[1] for x in sub]
-            mem = best_cluster(vals, p.p_cluster)
+            mem = best_cluster(vals, p.p_cluster, p.cluster_rule)
             m = sum(vals[i] for i in mem) / len(mem)
             honest_in = sum(1 for i in mem if not sub[i][2])
             if best is None or m > best[0]:
@@ -681,6 +774,26 @@ class Sim:
         return best[0] >= p.threshold, cost
 
     # ---------- beacon helpers ----------
+    def first_two_options(self, cp, blocks):
+        """S5: informed candidate seeds for cp colluding beacons when the first two values count."""
+        blocks = sorted(blocks)
+        n = cp * (cp - 1) // 2                      # colluder-only pairs, computed in advance
+        if cp and blocks and (len(blocks) == 1 or blocks[1] > blocks[0]):
+            n += cp                                 # pair with the first honest value once it lands
+        if len(blocks) >= 2:
+            n += 1                                  # abstain: the first two honest values decide
+        return n
+
+    def first_two_builder_options(self, cp, blocks):
+        """S5: a bribed sequencer picks any pair among colluders and the honest reveals pending
+        within its hold window, knowing every value."""
+        if not self.p.builder_sees_pending_txs:
+            return self.first_two_options(cp, blocks)
+        blocks = sorted(blocks)
+        vis = sum(1 for b in blocks if b <= blocks[0] + self.hold_blocks) if blocks else 0
+        avail = cp + vis
+        return avail * (avail - 1) // 2
+
     def provider_blocks(self, n_honest):
         p, r = self.p, self.r
         out = []
@@ -761,6 +874,29 @@ class Sim:
                 b = self.beacon_builder(net)
                 add("s2_seed", self.play(net, b))
                 add("s2_all", self.play(net, b, builder=True))
+                # ----- S4 (own RNG stream; play() reads self.r) -----
+                main_r, self.r = self.r, self.r4
+                r4 = self.r4
+                free = net.best_of(r4, 2 ** net.random_cp(r4))[1]
+                add("s4_free", self.play(net, free))
+                add("s4_order", self.play(net, free, builder=True))
+                ground = net.best_of(r4, 2 ** net.best_cp(r4, G))[1]
+                add("s4_seed", self.play(net, ground))
+                add("s4_all", self.play(net, ground, builder=True))
+                # ----- S5 (own RNG stream) -----
+                self.r = self.r5
+                r5 = self.r5
+                cp = net.random_cp(r5)
+                n = self.first_two_options(cp, self.provider_blocks(p.beacon_providers - cp))
+                free = net.best_of(r5, n)[1] if n else None
+                add("s5_free", self.play(net, free))
+                add("s5_order", self.play(net, free, builder=True))
+                cp = net.best_cp(r5, G)
+                n = self.first_two_builder_options(cp, self.provider_blocks(p.beacon_providers - cp))
+                ground = net.best_of(r5, n)[1] if n else None
+                add("s5_seed", self.play(net, ground))
+                add("s5_all", self.play(net, ground, builder=True))
+                self.r = main_r
         self.p_cp = {t: sum(v) / len(v) for t, v in self.p_cp.items()}
         return {k: (a[0] / a[2], a[1] / a[2]) for k, a in acc.items()}
 
@@ -842,7 +978,46 @@ def build(p: Params, scale=1.0):
         ("outsider", "L2+L3 bribe builder: beacon + ordering", R["s2_all"][0], bribe_s2,
          vstar("s2_all", "s2_free", bribe_s2)),
     ]
-    return sim, R, s1, s2, avail_s2
+
+    # S3: two-phase request (section H'). Same rounds as S1 without submitter prediction.
+    e = sim.two_phase_usd
+    pr, c = R["s1_free"]
+    s3 = [("submitter", "L1 re-submit (seed unknown at commit)", pr, c + e, ratio(c + e, pr))]
+    pr, c = R["s1_all"]
+    s3.append(("submitter", "L2+L3 submitter bribes builder", pr, c + e + Z, ratio(c + e + Z, pr)))
+    s3 += [
+        ("outsider", "L2 bribe builder: grind blockhash(B+1)", R["s1_seed"][0], Z, vstar("s1_seed", "s1_free", Z)),
+        ("outsider", "L3 bribe builder: ordering only", R["s1_order"][0], Z, vstar("s1_order", "s1_free", Z)),
+        ("outsider", "L2+L3 bribe builder: grind B+1 + ordering", R["s1_all"][0], Z, vstar("s1_all", "s1_free", Z)),
+    ]
+
+    # S4: two-phase + mandatory beacons (section H'').
+    e4 = e + p.beacon_providers * sim.beacon_usd
+    pr, c = R["s4_free"]
+    s4 = [("submitter", "L1 re-submit (colluding beacons reveal or withhold)", pr, c + e4, ratio(c + e4, pr))]
+    pr, c = R["s4_all"]
+    s4.append(("submitter", "L2+L3 submitter bribes builder", pr, c + e4 + Z, ratio(c + e4 + Z, pr)))
+    s4 += [
+        ("outsider", "L2 bribe builder: grind B+1 for colluding beacons", R["s4_seed"][0], Z,
+         vstar("s4_seed", "s4_free", Z)),
+        ("outsider", "L3 bribe builder: ordering only", R["s4_order"][0], Z, vstar("s4_order", "s4_free", Z)),
+        ("outsider", "L2+L3 bribe builder: beacon assignment + ordering", R["s4_all"][0], Z,
+         vstar("s4_all", "s4_free", Z)),
+    ]
+
+    # S5: two-phase + first two of the beacons (section H''').
+    e5 = e + 2 * sim.beacon_usd
+    pr, c = R["s5_free"]
+    s5 = [("submitter", "L1 re-submit (colluding beacons race / pair / abstain)", pr, c + e5, ratio(c + e5, pr))]
+    pr, c = R["s5_all"]
+    s5.append(("submitter", "L2+L3 submitter bribes builder", pr, c + e5 + Z, ratio(c + e5 + Z, pr)))
+    s5 += [
+        ("outsider", "L2 bribe builder: grind B+1 + pick first two reveals", R["s5_seed"][0], Z,
+         vstar("s5_seed", "s5_free", Z)),
+        ("outsider", "L3 bribe builder: ordering only", R["s5_order"][0], Z, vstar("s5_order", "s5_free", Z)),
+        ("outsider", "L2+L3 bribe builder: beacons + ordering", R["s5_all"][0], Z, vstar("s5_all", "s5_free", Z)),
+    ]
+    return sim, R, s1, s2, s3, s4, s5, avail_s2
 
 
 def headline(rows):
@@ -876,40 +1051,49 @@ def print_table(title, rows, free, fair, avail):
 
 
 def run(p: Params, scale=1.0):
-    sim, R, s1, s2, avail2 = build(p, scale)
+    sim, R, s1, s2, s3, s4, s5, avail2 = build(p, scale)
     print("=" * 120)
     print("Verdikta decision-manipulation risk (Monte Carlo): collusion + arbiter lean + selection + ordering")
     print("=" * 120)
     print(f"X = {p.x_colluding_oracles:.0%} of {p.eligible_oracles} eligible -> {sim.n_c} colluders | "
           f"Y = {p.y_colluding_builders:.0%} | Z = {usd(p.z_builder_bribe_usd)} | base fee {usd(sim.fee)} | "
-          f"K,M,N,P = {p.k_commit_poll},{p.m_reveal},{p.n_required},{p.p_cluster}")
+          f"K,M,N,P = {p.k_commit_poll},{p.m_reveal},{p.n_required},{p.p_cluster} ({p.cluster_rule} clustering)")
     print(f"true score {p.true_score:.0f}, threshold {p.threshold:.0f}, lean sd {p.sigma_between}, "
           f"noise sd {p.sigma_within}, estimate error sd {p.sigma_estimate}, colluders report {sim.report:.0f} | "
           f"beacon seed from response block: {p.beacon_seed_uses_response_block}")
     print(f"\nFair pass rate (everyone honest, unbiased seed): {pct(R['fair'][0])}")
     print_table("S1  CURRENT CODE", s1, R["s1_free"][0], R["fair"][0], p.y_colluding_builders)
     print_table("S2  HASH-CHAIN BEACON (first of 4 providers)", s2, R["s2_free"][0], R["fair"][0], avail2)
+    print_table("S3  TWO-PHASE REQUEST (TODO item 9: seed = blockhash(B+1), state checkpointed at B)", s3,
+                R["s1_free"][0], R["fair"][0], p.y_colluding_builders)
+    print_table(f"S4  TWO-PHASE + {p.beacon_providers} MANDATORY BEACONS (seed = H(aggId, blockhash(B+1), all beacon values))",
+                s4, R["s4_free"][0], R["fair"][0], p.y_colluding_builders)
+    print_table(f"S5  TWO-PHASE + FIRST 2 OF {p.beacon_providers} BEACONS (seed = H(aggId, blockhash(B+1), v_first, v_second))",
+                s5, R["s5_free"][0], R["fair"][0], p.y_colluding_builders)
     print("\nREFERENCE")
     pr, c = R["s1_free"]
     print(f"  ideal unbiasable RNG (VRF), submitter re-submits:     P(pass) {pct(pr)}   max safe V {usd(ratio(c, pr))}")
     pr, c = R["norace"]
     print(f"  ... and reveal set not chosen by arrival order:       P(pass) {pct(pr)}   max safe V {usd(ratio(c, pr))}")
-    print(f"  L4 denial (both scenarios): censor fulfill txs past {p.response_timeout_s:.0f}s -> round fails with "
+    print(f"  L4 denial (all scenarios): censor fulfill txs past {p.response_timeout_s:.0f}s -> round fails with "
           f"certainty for one bribe ({usd(p.z_builder_bribe_usd)}).")
 
 
 def sweep(p: Params):
-    print("\n" + "=" * 120)
-    print("SWEEP: max value that should hinge on one decision,  S1 current / S2 beacon / ideal RNG (re-submit bound)")
-    print("=" * 120)
-    print(f"{'X \\ lean sd':>12} | " + " | ".join(f"{s:^32.1f}" for s in p.sweep_sigma_between))
+    res = {}
     for x in p.sweep_x:
-        cells = []
         for sb in p.sweep_sigma_between:
-            _, R, s1, s2, _ = build(replace(p, x_colluding_oracles=x, sigma_between=sb), p.sweep_scale)
-            ideal = ratio(R["s1_free"][1], R["s1_free"][0])
-            cells.append(f"{usd(headline(s1)):>9} /{usd(headline(s2)):>9} /{usd(ideal):>9}")
-        print(f"{x:>12.0%} | " + " | ".join(f"{c:^32}" for c in cells))
+            _, _, *rows, _ = build(replace(p, x_colluding_oracles=x, sigma_between=sb), p.sweep_scale)
+            res[(x, sb)] = [headline(r) for r in rows]
+    for title, idx in (("S1 current / S2 beacon / S3 two-phase", (0, 1, 2)),
+                       ("S3 two-phase / S4 + all 4 beacons / S5 + first 2 of 4 beacons", (2, 3, 4))):
+        print("\n" + "=" * 120)
+        print(f"SWEEP: max value that should hinge on one decision,  {title}")
+        print("=" * 120)
+        print(f"{'X \\ lean sd':>12} | " + " | ".join(f"{s:^32.1f}" for s in p.sweep_sigma_between))
+        for x in p.sweep_x:
+            cells = [" /".join(f"{usd(res[(x, sb)][i]):>9}" for i in idx) for sb in p.sweep_sigma_between]
+            print(f"{x:>12.0%} | " + " | ".join(f"{c:^32}" for c in cells))
 
 
 def load_params_json(p: Params, path: str):
@@ -946,6 +1130,8 @@ def main():
     ap.add_argument("--threshold", type=float, help="pass threshold")
     ap.add_argument("--eligible", type=int, help="eligible arbiters for the class (default 300, a planning value)")
     ap.add_argument("--request-block-seed", action="store_true", help="beacon mixes REQUEST-block entropy")
+    ap.add_argument("--cluster-rule", choices=("best_subset", "greedy"),
+                    help="best_subset (default, TODO item 10) or greedy (current AggregatorLib)")
     ap.add_argument("--scale", type=float, default=1.0, help="scale Monte Carlo sizes")
     ap.add_argument("--no-sweep", action="store_true")
     a = ap.parse_args()
@@ -957,6 +1143,8 @@ def main():
                     ("true", "true_score"), ("threshold", "threshold"), ("eligible", "eligible_oracles")):
         if getattr(a, k) is not None:
             setattr(p, attr, getattr(a, k))
+    if a.cluster_rule:
+        p.cluster_rule = a.cluster_rule
     if a.request_block_seed:
         p.beacon_seed_uses_response_block = False
     run(p, a.scale)
