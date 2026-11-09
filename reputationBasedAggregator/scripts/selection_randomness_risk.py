@@ -17,7 +17,8 @@ DECISION MODEL
             eps  = per-evaluation noise,                ~ N(0, sigma_within)
         The attacker knows each lean only approximately, as b_j + N(0, sigma_estimate), estimated
         from the arbiter's public history of scores and justifications.
-      * Colluding arbiters (fraction X) report THRESHOLD + colluder_report_margin, identically.
+      * Colluding arbiters (fraction X) report one identical score just above THRESHOLD, chosen
+        for how many of them were drawn (C2).
         They need no LLM, so they commit and reveal within seconds.
     Final score = the mean of the best P-cluster (closest pair for P=2, squared distance as in
     AggregatorLib) among the first N=3 reveals. Those reveals come from the first M=4 commits among
@@ -152,10 +153,17 @@ flags still override it).
 #       are indices < n_c. With the default 300 eligible, X = 3% gives 9 colluders. The rounding
 #       matters for small pools: with 30 eligible, X = 3% gives 1 colluder and X = 5% gives 2,
 #       and one colluder is far weaker than two (C2).
-#   C2. Every colluder reports the same score, min(100, threshold + colluder_report_margin),
-#       fixed in advance (a commit binds it; RA.fulfill checks sha256(sender, response, salt)).
-#       Two or more colluders in the counted reveals are at distance 0 and always form the
-#       cluster. A lone colluder can still pair with a lenient honest arbiter.
+#   C2. Every colluder reports the same score, fixed at commit (RA.fulfill checks
+#       sha256(sender, response, salt)). The draw is on-chain before anyone commits, so the
+#       cartel knows how many of its members (c) were polled and picks the score by c.
+#       colluder_report_rule = "best" (default): for each c < P, the margin over threshold
+#       (0..10 in 0.5 steps) that maximises P(pass) against simulated honest scores
+#       (best_colluder_margins). With c >= P any score >= threshold wins, and
+#       threshold + colluder_report_margin is used. "fixed": always threshold +
+#       colluder_report_margin. A lower score sits closer to the honest scores, so c < P
+#       colluders plus the most lenient honest reveals can still form the best cluster and pass:
+#       with P = 4, 3 colluders win when the 4 honest counted reveals happen to be spread out.
+#       P colluders in the counted reveals are at distance 0 and always form the cluster.
 #   C3. Colluders never no-show, always pass the hash check, and respond with the
 #       colluder_* latencies (seconds), which are much faster than honest arbiters' because they
 #       skip the LLM.
@@ -293,11 +301,13 @@ flags still override it).
 #       block before the second honest one (or is the only honest one); and abstaining, which
 #       leaves the first two honest values. The best option by predicted pass is used.
 #   H''3. Not responding is indistinguishable from being slow, so no penalty is possible here.
-#   H''4. Sequencer: grinds blockhash(B+1) to pull colluding beacons into the assignment (best of
-#       builder_grind_options draws by colluder count, as in S2's H9), sees pending honest reveals,
-#       and can hold them up to builder_max_hold_s. It picks any pair among the colluders and
-#       the honest reveals that arrive within the hold window of the first one, knowing every
-#       value: C(available, 2) options (first_two_builder_options).
+#   H''4. Sequencer: tries builder_grind_options versions of B+1. Every version that assigns
+#       cp >= 2 colluding beacons gives C(cp, 2) seeds it can compute before building (colluder-
+#       only pairs, which it then orders first). If none of those passes, it builds the version
+#       with the most colluding beacons (as in S2's H9), sees the pending honest reveals, and can
+#       hold them up to builder_max_hold_s. It then picks any pair among the colluders and the
+#       honest reveals that arrive within the hold window of the first one, knowing every value:
+#       C(available, 2) more options (first_two_builder_options). Total options = the sum of both.
 #   H''5. Cost per attempt = S3's + 2 x beacon_usd (only the first two beacons are paid).
 #       Ordering (L3) and denial (L4) are unchanged.
 #
@@ -463,7 +473,8 @@ class Params:
     sigma_between: float = 0.0            # sd of persistent per-arbiter lean b_j. MEASURED: 0.00 (N2)
     sigma_within: float = 3.0             # sd of run-to-run noise. TARGET (N3); calibrated measurement was 7.1
     sigma_estimate: float = 3.0           # attacker's error estimating each b_j (moot while sigma_between = 0)
-    colluder_report_margin: float = 5.0   # colluders report threshold + this
+    colluder_report_margin: float = 5.0   # colluders report threshold + this ("fixed", or c >= P)
+    colluder_report_rule: str = "best"    # "best": margin chosen per colluder count to maximise P(pass) (C2)
 
     # ---------------- Arbiter pool ----------------
     eligible_oracles: int = 300           # active, unblocked, fee-eligible arbiters for the class. PLANNING value (D5)
@@ -597,6 +608,38 @@ def best_cluster(vals, P, rule="best_subset"):
     return members
 
 
+_MARGIN_CACHE = {}
+
+
+def best_colluder_margins(p, trials=2000):
+    """C2: for each colluder count c < P among the counted reveals, the report margin over the
+    threshold (0..10 in 0.5 steps) that maximises P(pass). Honest scores are drawn as in Sim.play
+    (lean + noise, clipped; no-shows ignored), with the same draws for every margin. Cached."""
+    key = (p.true_score, p.threshold, p.sigma_within, p.sigma_between, p.n_required, p.p_cluster,
+           p.cluster_rule, p.rng_seed)
+    if key in _MARGIN_CACHE:
+        return _MARGIN_CACHE[key]
+    rng = random.Random(p.rng_seed + 99)
+    grid = [0.5 * i for i in range(21)]
+    out = {}
+    for c in range(1, min(p.p_cluster, p.n_required + 1)):
+        draws = [[min(100.0, max(0.0, p.true_score + rng.gauss(0, p.sigma_between) + rng.gauss(0, p.sigma_within)))
+                  for _ in range(p.n_required - c)] for _ in range(trials)]
+        best_m, best_w = p.colluder_report_margin, -1
+        for m in grid:
+            rep = min(100.0, p.threshold + m)
+            wins = 0
+            for h in draws:
+                vals = [rep] * c + h
+                mem = best_cluster(vals, p.p_cluster, p.cluster_rule)
+                wins += sum(vals[i] for i in mem) / len(mem) >= p.threshold
+            if wins > best_w:
+                best_m, best_w = m, wins
+        out[c] = best_m
+    _MARGIN_CACHE[key] = out
+    return out
+
+
 def order_stat_index(rng, n, length):
     """Index of the best of n uniform draws (with replacement) from a pool sorted best-first."""
     x = 1.0 - (1.0 - rng.random()) ** (1.0 / n)
@@ -635,7 +678,7 @@ class Network:
     def predict(self, sel):
         p, s = self.sim.p, self.sim
         c = sum(self.col[j] for j in sel)
-        rep = s.report
+        rep = s.report_for(c)
         if c >= p.p_cluster:
             return 1.0 if rep >= p.threshold else 0.0
         honest = [p.true_score + self.est[j] for j in sel if not self.col[j]]
@@ -680,6 +723,12 @@ class Sim:
         self.evals = max(10, int(p.evals_per_network * scale))
         self.pool_n = max(150, int(p.selection_pool * scale))
         self.report = min(100.0, p.threshold + p.colluder_report_margin)
+        if p.colluder_report_rule == "best":
+            self.margins = best_colluder_margins(p)
+        elif p.colluder_report_rule == "fixed":
+            self.margins = {}
+        else:
+            raise ValueError(f"unknown colluder_report_rule {p.colluder_report_rule!r}")
         self.pred_sd = math.sqrt((p.sigma_within ** 2 + p.sigma_estimate ** 2) / 2) or 1e-9
         self.fee = p.oracle_fee_eth * p.eth_usd
         g = lambda gas: gas * p.gas_price_gwei * 1e-9 * p.eth_usd
@@ -688,6 +737,11 @@ class Sim:
         self.beacon_usd = self.fee * p.beacon_fee_multiplier * (1 - p.x_colluding_oracles) + g(p.beacon_gas)
         self.two_phase_usd = g(p.two_phase_extra_gas)
         self.hold_blocks = max(1, int(p.builder_max_hold_s / p.block_time_s))
+
+    def report_for(self, c):
+        """Colluders' shared score when c of them were polled (C2)."""
+        m = self.margins.get(min(c, self.p.n_required))
+        return self.report if m is None else min(100.0, self.p.threshold + m)
 
     # ---------- one aggregation round ----------
     def play(self, net, sel, builder=False, fast=True, fair=False):
@@ -698,6 +752,7 @@ class Sim:
             return False, 0.0  # beacon never answered: no round
         is_col = lambda j: net.col[j] and not fair
         cost = self.fee * sum(1 for j in sel if not is_col(j)) + self.req_gas_usd
+        rep = self.report_for(sum(1 for j in sel if is_col(j)))
         commits = []
         for j in sel:
             c = is_col(j)
@@ -728,7 +783,7 @@ class Sim:
                     continue
                 d = lognorm(r, p.honest_reveal_median_s, p.honest_latency_sigma)
             if t0 + d <= p.response_timeout_s:
-                s = self.report if c else min(100.0, max(0.0, p.true_score + net.lean[j] + r.gauss(0, p.sigma_within)))
+                s = rep if c else min(100.0, max(0.0, p.true_score + net.lean[j] + r.gauss(0, p.sigma_within)))
                 reveals.append((t0 + d, s, c))
         if len(reveals) < p.n_required:
             return False, cost
@@ -859,8 +914,12 @@ class Sim:
                 free = net.best_of(r4, n)[1] if n else None
                 add("s4_free", self.play(net, free))
                 add("s4_order", self.play(net, free, builder=True))
+                pre = 0  # seeds known before building: colluder-only pairs in each B+1 version (H''4)
+                for _ in range(G):
+                    v = net.random_cp(r4)
+                    pre += v * (v - 1) // 2
                 cp = net.best_cp(r4, G)
-                n = self.first_two_builder_options(cp, self.provider_blocks(p.beacon_providers - cp))
+                n = pre + self.first_two_builder_options(cp, self.provider_blocks(p.beacon_providers - cp))
                 ground = net.best_of(r4, n)[1] if n else None
                 add("s4_seed", self.play(net, ground))
                 add("s4_all", self.play(net, ground, builder=True))
@@ -1004,6 +1063,14 @@ def print_table(title, rows, free, fair, avail):
           f"(builder availability {avail:.0%})")
 
 
+def margins_text(sim):
+    p = sim.p
+    if not sim.margins:
+        return f"{sim.report:g}"
+    parts = [f"{c}:{min(100.0, p.threshold + m):g}" for c, m in sorted(sim.margins.items())]
+    return "by count " + ", ".join(parts) + f", >={p.p_cluster}:{sim.report:g}"
+
+
 def run(p: Params, scale=1.0):
     sim, R, s1, s2, s3, s4, avail2 = build(p, scale)
     print("=" * 120)
@@ -1013,7 +1080,7 @@ def run(p: Params, scale=1.0):
           f"Y = {p.y_colluding_builders:.0%} | Z = {usd(p.z_builder_bribe_usd)} | base fee {usd(sim.fee)} | "
           f"K,M,N,P = {p.k_commit_poll},{p.m_reveal},{p.n_required},{p.p_cluster} ({p.cluster_rule} clustering)")
     print(f"true score {p.true_score:.0f}, threshold {p.threshold:.0f}, lean sd {p.sigma_between}, "
-          f"noise sd {p.sigma_within}, estimate error sd {p.sigma_estimate}, colluders report {sim.report:.0f} | "
+          f"noise sd {p.sigma_within}, estimate error sd {p.sigma_estimate}, colluders report {margins_text(sim)} | "
           f"beacon seed from response block: {p.beacon_seed_uses_response_block}")
     print(f"\nFair pass rate (everyone honest, unbiased seed): {pct(R['fair'][0])}")
     print_table("S1  CURRENT CODE", s1, R["s1_free"][0], R["fair"][0], p.y_colluding_builders)
@@ -1084,6 +1151,8 @@ def main():
     ap.add_argument("--request-block-seed", action="store_true", help="beacon mixes REQUEST-block entropy")
     ap.add_argument("--cluster-rule", choices=("best_subset", "greedy"),
                     help="best_subset (default, TODO item 10) or greedy (current AggregatorLib)")
+    ap.add_argument("--colluder-report", choices=("best", "fixed"),
+                    help="best (default): colluders pick their score by how many were drawn; fixed: threshold + margin")
     ap.add_argument("--scale", type=float, default=1.0, help="scale Monte Carlo sizes")
     ap.add_argument("--no-sweep", action="store_true")
     a = ap.parse_args()
@@ -1097,6 +1166,8 @@ def main():
             setattr(p, attr, getattr(a, k))
     if a.cluster_rule:
         p.cluster_rule = a.cluster_rule
+    if a.colluder_report:
+        p.colluder_report_rule = a.colluder_report
     if a.request_block_seed:
         p.beacon_seed_uses_response_block = False
     run(p, a.scale)
