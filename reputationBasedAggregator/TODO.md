@@ -569,7 +569,12 @@ of squared distances over every pair in the subset).
   today.
 - **P = 2 is unchanged.** The best pair is the closest pair, so the current 6/4/3/2 config
   behaves exactly as now.
-- With true clustering, colluders need P of the 2P − 1 counted responses, whatever they report.
+- With true clustering, P colluders among the 2P − 1 counted responses always win. P − 1 can still
+  win sometimes: they report just above the threshold, and when the honest responses happen to be
+  spread out, the colluders plus the highest honest response form the tightest group. In the risk
+  model (P = 3, N = 5, nominal 80, threshold 90, SD 3) two colluders win about 8% of the rounds
+  that poll them, and those rounds dominate the risk at P = 3. Item 11's Q-of-N rule removes this:
+  with Q = P, colluders need P scores at or above the threshold.
 
 ### Recommended configs
 `setConfig(K, M, N, P, timeout)` with N = 2P − 1 counted, M = 2P reveal requests and K = 2P + 2
@@ -579,12 +584,19 @@ K must fit within the selection shortlist (`shortlist_size` 20), and the class n
 eligible arbiters.
 
 ### Expected payoff
-Estimated from the risk model's assumptions (300 eligible arbiters, SD 3, the item 9 two-phase
-request, a $1,000 sequencer bribe):
-- P = 3, K = 8, first 2 of 4 beacons, $5 base fee: about **$90K** per decision at 3% colluders,
-  against about $4.3K with greedy clustering. At 5% colluders about $17K; at 10% about $2.1K.
-- P = 5, K = 12, today's $0.05 fee, no beacons: about $300K at 3% colluders.
+Estimated from the risk model's assumptions (300 eligible arbiters, nominal 80, threshold 90, SD 3,
+the item 9 two-phase request, a $1,000 sequencer bribe), with the cluster mean as the pass rule:
+- P = 3, K = 8, first 2 of 4 beacons, $5 base fee: about **$33K** per decision at 3% colluders,
+  against about $4.2K with greedy clustering. At 5% colluders about $9K; at 10% about $1.4K.
+- P = 5, K = 12, today's $0.05 fee, no beacons: about $15K at 3% colluders.
 - A larger P also tightens the honest cluster (the mean of P values), so pure spam gets harder.
+
+Earlier versions of this item quoted about $90K, $17K and $2.1K for the first config and about
+$300K for the second. Those figures are for **item 11's Q-of-N rule** with Q = P (re-computed
+2026-11-10: $88K, $17K and $1.9K; $245K), not for the cluster mean. Under the cluster mean the
+P − 1 colluder case above sets the limit. Under Q-of-N the cluster decides only the bonus, so the
+larger gain comes from item 11. True clustering still matters for consumers that use the cluster
+mean and for who earns the bonus.
 
 ### Why it's deferred
 It is a library change with an aggregator redeploy and new tests. A larger P also raises the
@@ -656,6 +668,33 @@ Add a view that returns every counted arbiter's score for one outcome, in reveal
   0.006 gwei and $2,300/ETH); N = 30, ~165k. About 10.5k fixed plus 5k per arbiter. The outcome
   index and vector length do not change it. Off-chain reads via `eth_call` are free. The final
   reveal pays nothing extra.
+
+### Design targets (set 2026-11-10)
+Q, N and the fee are chosen to meet all three:
+- **Keep out work scored 80 or below.** Forcing a pass for a submission whose honest arbiters
+  typically answer 80 must cost an attacker more than the value at stake. The target is **$100K**
+  per decision.
+- **T = 90**, the explicit threshold each counted score is compared against.
+- **Accept work scored 95 at least 99.9% of the time** when there is no attack.
+
+These are the defaults of `python3 scripts/selection_randomness_risk.py --config-search` (`--true 80`,
+`--threshold 90`, `--good-true 95`, `--min-good 0.999`, `--target 100000`). Its cheapest results
+at 3% colluders, SD 3, with the item 9 two-phase request, no beacons and a $1,000 sequencer bribe:
+
+| K/M/N | Q | Fee each | Hunter cost/round | Re-submit limit | Sequencer limit | Good pass |
+|---|---|---|---|---|---|---|
+| 18/13/9 | 6 | $0.05 (today's) | $1.25 | $716K | $2.5M | 99.90% |
+| 17/12/8 | 5 | $0.11 to $0.16 | ~$3.80 | $100K | $110K | 99.94% |
+| 15/11/7 | 4 | ~$2 | ~$47 | $100K | $9K (fails) | 99.91% |
+
+- P only sets who earns the bonus here, so P = 2 is cheapest. A larger P costs more bonus.
+- No cluster-mean config meets the 99.9% target: the best reaches 97.7%, and P = 5 reaches 89.6%.
+- K = 17 or 18 must fit the selection shortlist (`shortlist_size` 20), and the class needs at least
+  K eligible arbiters.
+- The 99.9% assumes the SD 3 noise target. Today's measured noise is heavy-tailed (normal-SD
+  equivalent 7.1), so recheck with `--sigma-within` once arbiter noise is re-measured.
+- Q = 6 of 9 means 4 counted colluders can block a pass. The "attacked" column (about 99%) is a
+  good submission's pass rate while colluders block whenever they can.
 
 ### Why it's deferred
 It needs an aggregator redeploy, plus a BountyEscrow change to use it. The current build is 22,032
