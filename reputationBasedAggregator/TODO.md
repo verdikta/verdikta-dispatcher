@@ -601,3 +601,86 @@ per-round cost (`fee × (K + B×P)`) and latency: the round waits for the (2P)-t
 - Bonus credits and reputation updates are per cluster member and do not change.
 - `scripts/selection_randomness_risk.py` models true clustering by default (`cluster_rule`), with
   greedy available for comparison.
+
+---
+
+## 11. Per-arbiter score getter, so consumers can apply a Q-of-N threshold
+
+**Status:** not started (design discussed 2026-11-09)
+**Scope:** `ReputationAggregator.sol` (one new view) + consumers (`BountyEscrow.sol`). Needs an
+aggregator redeploy. No arbiter-node or keeper change, and no new storage.
+
+### Problem
+Consumers can read only the cluster mean (`getEvaluation`). A contract cannot test how many
+arbiters individually cleared a threshold. The values exist on-chain in `responses[i].likelihoods`,
+but `aggregatedEvaluations` is internal and no getter exposes them. Emitting them would not help,
+because a contract cannot read events.
+
+### Idea
+Add a view that returns every counted arbiter's score for one outcome, in reveal order:
+
+    function getOutcomeScores(bytes32 aggId, uint256 outcome)
+        external view returns (uint256[] memory scores, bool valid)
+    {
+        AggregatedEvaluation storage agg = aggregatedEvaluations[aggId];
+        if (!agg.isComplete || agg.failed || outcome >= agg.aggregatedLikelihoods.length)
+            return (new uint256[](0), false);
+
+        uint256 n = agg.responses.length;
+        scores = new uint256[](n);
+        for (uint256 i = 0; i < n; i++) {
+            uint256[] storage v = agg.responses[i].likelihoods;
+            if (outcome < v.length) scores[i] = v[outcome];   // short reveal stays 0
+        }
+        valid = true;
+    }
+
+- **Caller picks the outcome.** A "top outcome" return would add tie-breaking, let the cluster
+  choose which column comes back, and give the wrong column for thresholds at or below 50.
+- **Consumer applies the rule.** It counts scores >= T and passes if the count is >= Q, comparing
+  at raw scale before any integer division. "At least Q of N are >= T" is the same as "the Q-th
+  highest is >= T"; with Q = P and N = 2P − 1 that is the median.
+- **The threshold stays out of the aggregator.** T and Q are applied after finalization and are
+  never sent to arbiters, so they add no new value to rally behind.
+- **Flag, not revert,** matching `getEvaluation`, so a consumer's settlement cannot get stuck on it.
+
+### Expected payoff
+- The scores are the same stored reveals that were hash-checked against the commit and that
+  clustering scored and paid on. Arbiters commit before knowing who will cluster, so all N values
+  were written under the clustering incentive. Pay is unchanged.
+- Colluders need Q of the N counted reveals, whatever the cluster does. Example with greedy
+  clustering, N = 5, P = 3, T = 90, Q = 3 and accept scores `[100, 81, 100, 80, 79]` (the 100s
+  colluding): the cluster mean is 93.7 and passes; the count is 2 and fails.
+- Measured gas for an on-chain read plus the threshold count (test harness with the same `Response`
+  layout and compiler settings, 4-score vectors): N = 3, ~26k; N = 12, ~72k (about $0.001 at
+  0.006 gwei and $2,300/ETH); N = 30, ~165k. About 10.5k fixed plus 5k per arbiter. The outcome
+  index and vector length do not change it. Off-chain reads via `eth_call` are free. The final
+  reveal pays nothing extra.
+
+### Why it's deferred
+It needs an aggregator redeploy, plus a BountyEscrow change to use it. The current build is 22,032
+of 24,576 bytes, so it fits, but it shares the remaining 2,544 bytes with the other items here.
+
+### Notes / related
+- **Today's config gains nothing.** At N = 3, P = 2, Q = 2, two colluders win under either rule. It
+  needs a larger config (see item 10's recommended ones).
+- **Overlap with item 10.** True clustering also fixes the example above, and with Q = P colluders
+  need P either way. This item is the cheaper route (no subset enumeration), and it lets a consumer
+  set Q above P for high-stakes decisions without changing the aggregator config. A higher Q also
+  raises false rejections and lets N − Q + 1 colluders block a pass.
+- **Non-cluster values now count.** Today an out-of-cluster report has no effect on the result;
+  under Q-of-N it does. That is what makes colluders need Q, but it also gives honest noise more
+  weight, so Q and T need calibrating against measured arbiter noise. Add this rule to
+  `scripts/selection_randomness_risk.py` to compare it with the cluster mean.
+- **Cluster membership is not stored** (`cluster` is memory-only and `BonusPayment` has no `aggId`).
+  A rule over all N does not need it. A cluster-based rule would need a bitmap, ~22k gas on the
+  final reveal.
+- **Inactive at finalization.** `_processPollSlot` leaves such an arbiter out of the mean and pays no
+  bonus, but its reveal still appears in this column. Leave it in and document it: the value was
+  still bound by the commit, and the case should be rare.
+- **Scope of the secrecy.** Withholding T stops honest arbiters anchoring on it, but colluders do not
+  need it: they can report 100 under a per-arbiter rule.
+- A successful round always has exactly N reveals (`finalizeEvaluationTimeout` fails any round short
+  of N), so Q can be absolute or a fraction of N.
+- Update `test/aggregatorEth.test.js`, `docs/contracts/reputation-aggregator.md` and the consumer
+  examples under `docs/examples/`.

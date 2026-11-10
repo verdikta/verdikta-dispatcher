@@ -369,6 +369,36 @@ flags still override it).
 #   L2. --scale multiplies networks, evals and selection_pool (with floors). sweep_scale
 #       applies on top for the sweep.
 #
+# L'. BROAD THRESHOLD (pass_rule = "broad", TODO item 11)
+#   L'1. Pass = at least Q (quota, default P) of the N counted reveals are >= threshold. The
+#       cluster is still formed, but only decides the bonus. Consumers apply this with
+#       getOutcomeScores; it does not exist on-chain yet.
+#   L'2. Colluders report threshold + colluder_report_margin. Any score >= threshold counts the
+#       same, so the "best" report rule (C2) does not apply.
+#   L'3. Predictor (F1): 1 if c >= Q. Otherwise each polled honest arbiter is counted with
+#       probability (N - c) / honest polled, and the chance of Q - c honest passes comes from a
+#       Poisson-binomial over estimated leans.
+#   L'4. A bribed builder choosing reveals (I3) keeps the N highest scores it can see.
+#   L'5. --config-search does not use Monte Carlo: pass rates near 1e-5 are far below what
+#       networks x evals can resolve, and F2's selection pool saturates. broad_config_eval is exact
+#       under these simplifications:
+#         - c ~ Hypergeometric(eligible, n_c, K). Exact when colluder_weight_multiplier = 1, because
+#           the shortlist is uniform and weights do not depend on being a colluder (averaged over
+#           networks). Other multipliers are not supported.
+#         - Colluders always win the commit and reveal races (slightly favours the attacker).
+#         - Honest scores are independent N(true_score, sigma_between^2 + sigma_within^2).
+#         - Attacker's gas stays at request_gas (a floor for large K, favouring the attacker). The
+#           honest requester's bill scales it by K / 6 (a ceiling).
+#         - S3 only: a re-submit bound, and a bribed sequencer taking the best of
+#           builder_grind_options seeds by colluder count. Ordering-only (L3) is ignored; at these
+#           gaps it adds almost nothing, which the Monte Carlo cross-check confirms.
+#   L'6. Blocking. Q above a majority makes a false FAIL easier: N - Q + 1 counted colluders block a
+#       pass, and colluders can also withhold when K - c < M. "attacked pass" is a good
+#       submission's pass rate when colluders do whichever is worse per draw. A block costs the
+#       hunter a retry; it is not a theft by itself, so it is reported and only loosely constrained.
+#       "hunter $" = total fee / attacked pass, the expected spend for a good submission to get through
+#       a cartel that blocks every round (geometric retries). Deadlines and competing hunters are ignored.
+#
 # M. WHAT TO UPDATE WHEN THE CONTRACTS CHANGE
 #   - Selection algorithm, shortlist, weights, fee factor -> select_oracles(), Network.__init__.
 #   - K/M/N/P, bonus, timeout, fee accounting              -> Params, Sim.play cost lines.
@@ -488,6 +518,8 @@ class Params:
     n_required: int = 3
     p_cluster: int = 2
     cluster_rule: str = "best_subset"     # TRUE clustering (TODO item 10); "greedy" = current AggregatorLib
+    pass_rule: str = "cluster_mean"       # "broad": at least quota of N counted reveals >= threshold (L')
+    quota: int = 0                      # Q for pass_rule "broad"; 0 means Q = P
     bonus_multiplier: int = 3
     shortlist_size: int = 20
     response_timeout_s: float = 300.0
@@ -679,6 +711,8 @@ class Network:
         p, s = self.sim.p, self.sim
         c = sum(self.col[j] for j in sel)
         rep = s.report_for(c)
+        if s.broad:
+            return self.predict_broad(sel, c, rep)
         if c >= p.p_cluster:
             return 1.0 if rep >= p.threshold else 0.0
         honest = [p.true_score + self.est[j] for j in sel if not self.col[j]]
@@ -691,6 +725,28 @@ class Network:
             tot += phi((m - p.threshold) / s.pred_sd)
             cnt += 1
         return tot / cnt if cnt else 0.0
+
+    def predict_broad(self, sel, c, rep):
+        """L'3: predicted pass under the broad rule."""
+        p, s = self.sim.p, self.sim
+        if rep < p.threshold:
+            return 0.0
+        if c >= s.quota:
+            return 1.0
+        honest = [j for j in sel if not self.col[j]]
+        need = p.n_required - c
+        if not honest or need <= 0:
+            return 0.0
+        share = min(1.0, need / len(honest))
+        dist = [1.0]
+        for j in honest:
+            q = share * phi((p.true_score + self.est[j] - p.threshold) / s.pred_sd)
+            nxt = [0.0] * (len(dist) + 1)
+            for i, v in enumerate(dist):
+                nxt[i] += v * (1 - q)
+                nxt[i + 1] += v * q
+            dist = nxt
+        return sum(dist[s.quota - c:])
 
     def best_of(self, rng, n):
         return self.pool[order_stat_index(rng, max(1, n), len(self.pool))]
@@ -723,7 +779,15 @@ class Sim:
         self.evals = max(10, int(p.evals_per_network * scale))
         self.pool_n = max(150, int(p.selection_pool * scale))
         self.report = min(100.0, p.threshold + p.colluder_report_margin)
-        if p.colluder_report_rule == "best":
+        if p.pass_rule not in ("cluster_mean", "broad"):
+            raise ValueError(f"unknown pass_rule {p.pass_rule!r}")
+        self.broad = p.pass_rule == "broad"
+        self.quota = p.quota or p.p_cluster
+        if self.broad and not 1 <= self.quota <= p.n_required:
+            raise ValueError(f"quota {self.quota} must be in 1..N ({p.n_required})")
+        if self.broad and p.colluder_report_rule in ("best", "fixed"):
+            self.margins = {}  # L'2: any score >= threshold counts the same
+        elif p.colluder_report_rule == "best":
             self.margins = best_colluder_margins(p)
         elif p.colluder_report_rule == "fixed":
             self.margins = {}
@@ -791,7 +855,10 @@ class Sim:
         if builder:
             cutoff = min(reveals[p.n_required - 1][0] + p.builder_max_hold_s, p.response_timeout_s)
             cand = [x for x in reveals if x[0] <= cutoff]
-            subsets = combinations(cand, p.n_required)
+            if self.broad:  # L'4: the N highest scores maximise the count
+                subsets = [sorted(cand, key=lambda x: -x[1])[:p.n_required]]
+            else:
+                subsets = combinations(cand, p.n_required)
         else:
             subsets = [reveals[:p.n_required]]
         best = None
@@ -799,11 +866,13 @@ class Sim:
             vals = [x[1] for x in sub]
             mem = best_cluster(vals, p.p_cluster, p.cluster_rule)
             m = sum(vals[i] for i in mem) / len(mem)
+            if self.broad:
+                m = sum(1 for v in vals if v >= p.threshold)  # L'1: the count replaces the mean
             honest_in = sum(1 for i in mem if not sub[i][2])
             if best is None or m > best[0]:
                 best = (m, honest_in)
         cost += p.bonus_multiplier * self.fee * best[1]
-        return best[0] >= p.threshold, cost
+        return best[0] >= (self.quota if self.broad else p.threshold), cost
 
     # ---------- beacon helpers ----------
     def first_two_options(self, cp, blocks):
@@ -1078,7 +1147,8 @@ def run(p: Params, scale=1.0):
     print("=" * 120)
     print(f"X = {p.x_colluding_oracles:.0%} of {p.eligible_oracles} eligible -> {sim.n_c} colluders | "
           f"Y = {p.y_colluding_builders:.0%} | Z = {usd(p.z_builder_bribe_usd)} | base fee {usd(sim.fee)} | "
-          f"K,M,N,P = {p.k_commit_poll},{p.m_reveal},{p.n_required},{p.p_cluster} ({p.cluster_rule} clustering)")
+          f"K,M,N,P = {p.k_commit_poll},{p.m_reveal},{p.n_required},{p.p_cluster} ({p.cluster_rule} clustering)"
+          + (f" | broad threshold: {sim.quota} of {p.n_required}" if sim.broad else ""))
     print(f"true score {p.true_score:.0f}, threshold {p.threshold:.0f}, lean sd {p.sigma_between}, "
           f"noise sd {p.sigma_within}, estimate error sd {p.sigma_estimate}, colluders report {margins_text(sim)} | "
           f"beacon seed from response block: {p.beacon_seed_uses_response_block}")
@@ -1113,6 +1183,130 @@ def sweep(p: Params):
         for x in p.sweep_x:
             cells = [" /".join(f"{usd(res[(x, sb)][i]):>9}" for i in idx) for sb in p.sweep_sigma_between]
             print(f"{x:>12.0%} | " + " | ".join(f"{c:^32}" for c in cells))
+
+
+# =====================================================================================
+#                          BROAD THRESHOLD: EXACT CONFIG SEARCH (L'5)
+# =====================================================================================
+def upper_tail(mean, threshold, sd):
+    """P(score >= threshold) for N(mean, sd^2), accurate far into the tail."""
+    if sd <= 0:
+        return 1.0 if mean >= threshold else 0.0
+    return 0.5 * math.erfc((threshold - mean) / (sd * math.sqrt(2)))
+
+
+def binom_tail(n, q, k):
+    """P(Binomial(n, q) >= k)."""
+    if k <= 0:
+        return 1.0
+    if k > n:
+        return 0.0
+    return sum(math.comb(n, i) * q ** i * (1 - q) ** (n - i) for i in range(k, n + 1))
+
+
+def broad_config_eval(p: Params, K, M, N, Q, P, target, good_true, fee_floor_usd):
+    """L'5: exact pass rates, fee needed for `target`, and liveness for one configuration."""
+    n_c = min(p.eligible_oracles, max(0, round(p.x_colluding_oracles * p.eligible_oracles)))
+    pop = math.comb(p.eligible_oracles, K)
+    pmf = [math.comb(n_c, c) * math.comb(p.eligible_oracles - n_c, K - c) / pop for c in range(K + 1)]
+    show = 1 - p.honest_no_show_prob
+    sd = math.hypot(p.sigma_between, p.sigma_within)
+    q_bad, q_good = upper_tail(p.true_score, p.threshold, sd), upper_tail(good_true, p.threshold, sd)
+
+    free, fee_units, attacked = 0.0, 0.0, 0.0
+    win = [0.0] * (K + 1)
+    for c, w in enumerate(pmf):
+        promoted = min(c, M)
+        ok = binom_tail(K - c, show, M - c) * binom_tail(M - promoted, show, N - promoted)
+        counted = min(promoted, N)
+        win[c] = ok * binom_tail(N - counted, q_bad, Q - counted)
+        free += w * win[c]
+        if counted >= P:
+            honest_in = 0
+        elif p.cluster_rule == "greedy" and counted >= 2:
+            honest_in = P - counted  # identical colluders seed the cluster, and all of them join it
+        else:
+            honest_in = min(P, N - counted)
+        fee_units += w * ((K - c) + ok * p.bonus_multiplier * honest_in)
+        vote_no = ok * binom_tail(N - counted, q_good, Q)
+        withhold = binom_tail(K - c, show, M) * binom_tail(M, show, N) * binom_tail(N, q_good, Q)
+        attacked += w * min(vote_no, withhold)
+
+    # A sequencer tries G seeds and keeps the one with the most colluders.
+    G, ground, tail, above = p.builder_grind_options, 0.0, 0.0, 0.0
+    for c in range(K, -1, -1):
+        tail += pmf[c]
+        at_least = -math.expm1(G * math.log1p(-tail)) if tail < 1 else 1.0
+        ground += (at_least - above) * win[c]
+        above = at_least
+
+    gas = lambda units: units * p.gas_price_gwei * 1e-9 * p.eth_usd
+    attack_gas = gas(p.request_gas + p.two_phase_extra_gas)
+    fee_needed = max(0.0, (target * free - attack_gas) / fee_units)
+    fee = max(fee_needed, fee_floor_usd)
+    complete = binom_tail(K, show, M) * binom_tail(M, show, N)
+    Z = p.z_builder_bribe_usd
+    delta = ground - free
+    return {
+        "K": K, "M": M, "N": N, "Q": Q, "P": P, "free": free, "ground": ground, "fee": fee,
+        "total": fee * (K + p.bonus_multiplier * P) + gas(p.request_gas * K / 6 + p.two_phase_extra_gas),
+        "resubmit": ratio(fee * fee_units + attack_gas, free),
+        "sequencer": min(Z / delta if delta > 0 else INF, ratio(fee * fee_units + attack_gas + Z, ground)),
+        "complete": complete, "good": complete * binom_tail(N, q_good, Q), "attacked": attacked,
+    }
+
+
+def print_configs(rows):
+    print(f"  {'K/M/N/P':<12} {'Q':>3} {'fee each':>9} {'total fee':>10} {'P(pass)/try':>12} {'re-submit V':>12} "
+          f"{'sequencer V':>12} {'complete':>9} {'good pass':>10} {'attacked':>9} {'hunter $':>10}")
+    for r in rows:
+        print(f"  {str(r['K']) + '/' + str(r['M']) + '/' + str(r['N']) + '/' + str(r['P']):<12} {r['Q']:>3} "
+              f"{usd(r['fee']):>9} {usd(r['total']):>10} {r['free']:>12.2e} {usd(r['resubmit']):>12} "
+              f"{usd(r['sequencer']):>12} {pct(r['complete']):>9} {pct(r['good']):>10} {pct(r['attacked']):>9} "
+              f"{usd(ratio(r['total'], r['attacked'])):>10}")
+
+
+def config_search(p: Params, target, k_max, good_true, fee_floor_usd, min_good=0.98, min_attacked=0.5, min_complete=0.99):
+    """Cheapest configurations meeting `target` under the broad rule, by K. P is fixed at 2 (cheapest)
+    and at a majority of N (keeps the bonus odds of a typical arbiter near today's)."""
+    if p.colluder_weight_multiplier != 1.0:
+        raise ValueError("--config-search requires colluder_weight_multiplier = 1 (L'5)")
+    print("=" * 120)
+    print(f"BROAD THRESHOLD CONFIG SEARCH (S3 two-phase): target ${target:,.0f}, X = {p.x_colluding_oracles:.0%}, "
+          f"noise sd {p.sigma_within}, true {p.true_score:g}, threshold {p.threshold:g}, good submission {good_true:g}")
+    print(f"Constraints: complete >= {min_complete:.0%}, good pass >= {min_good:.0%}, attacked pass >= {min_attacked:.0%}, "
+          f"fee floor {usd(fee_floor_usd)}, bonus {p.bonus_multiplier}x, sequencer bribe {usd(p.z_builder_bribe_usd)}")
+    print("=" * 120)
+    found = {"either": {}, "sequencer": {}}
+    for K in range(4, k_max + 1):
+        for M in range(2, K + 1):
+            for N in range(2, M + 1):
+                for Q in range((N + 2) // 2, N + 1):
+                    for P in sorted({2, (N + 1) // 2 + (N % 2 == 0)}):
+                        if P > N:
+                            continue
+                        r = broad_config_eval(p, K, M, N, Q, P, target, good_true, fee_floor_usd)
+                        if r["complete"] < min_complete or r["good"] < min_good or r["attacked"] < min_attacked:
+                            continue
+                        if r["resubmit"] < target * (1 - 1e-9):  # the fee is solved to land exactly on target
+                            continue
+                        key = (K, P == 2)
+                        if key not in found["either"] or r["total"] < found["either"][key]["total"]:
+                            found["either"][key] = r
+                        if r["sequencer"] >= target and (
+                                key not in found["sequencer"] or r["total"] < found["sequencer"][key]["total"]):
+                            found["sequencer"][key] = r
+    for title, key in (("Re-submission only (sequencer trusted), cheapest per K", "either"),
+                       ("Also safe against the bribed sequencer, cheapest per K", "sequencer")):
+        print(f"\n{title}")
+        rows = sorted(found[key].values(), key=lambda r: r["total"])
+        if rows:
+            print_configs(rows[:16])
+        else:
+            print("  none found")
+    print("\nCluster-mean rule with true clustering, for comparison (K = 2P + 2, M = 2P, N = 2P - 1, Q = P):")
+    print_configs([broad_config_eval(p, min(2 * P + 2, k_max), 2 * P, 2 * P - 1, P, P, target, good_true, fee_floor_usd)
+                   for P in range(2, (k_max - 2) // 2 + 1)])
 
 
 def load_params_json(p: Params, path: str):
@@ -1153,6 +1347,17 @@ def main():
                     help="best_subset (default, TODO item 10) or greedy (current AggregatorLib)")
     ap.add_argument("--colluder-report", choices=("best", "fixed"),
                     help="best (default): colluders pick their score by how many were drawn; fixed: threshold + margin")
+    ap.add_argument("--pass-rule", choices=("cluster_mean", "broad"),
+                    help="cluster_mean (default) or broad: at least Q of the N counted reveals >= threshold")
+    ap.add_argument("--quota", type=int, help="Q for the broad rule (default P)")
+    ap.add_argument("--knmp", type=str, help="K,M,N,P as four comma-separated integers")
+    ap.add_argument("--config-search", action="store_true", help="exact search for the cheapest broad-threshold configs (L'5)")
+    ap.add_argument("--target", type=float, default=100_000.0, help="config search: value to protect, USD")
+    ap.add_argument("--k-max", type=int, default=20, help="config search: largest K (shortlist_size 20 unless raised)")
+    ap.add_argument("--good-true", type=float, default=95.0, help="config search: honest score of a good submission")
+    ap.add_argument("--fee-floor", type=float, default=0.046, help="config search: lowest fee per arbiter, USD")
+    ap.add_argument("--min-attacked", type=float, default=0.5, help="config search: lowest good-submission pass rate while colluders block")
+    ap.add_argument("--min-good", type=float, default=0.98, help="config search: lowest good-submission pass rate with no attack")
     ap.add_argument("--scale", type=float, default=1.0, help="scale Monte Carlo sizes")
     ap.add_argument("--no-sweep", action="store_true")
     a = ap.parse_args()
@@ -1170,6 +1375,15 @@ def main():
         p.colluder_report_rule = a.colluder_report
     if a.request_block_seed:
         p.beacon_seed_uses_response_block = False
+    if a.pass_rule:
+        p.pass_rule = a.pass_rule
+    if a.quota is not None:
+        p.quota = a.quota
+    if a.knmp:
+        p.k_commit_poll, p.m_reveal, p.n_required, p.p_cluster = (int(v) for v in a.knmp.split(","))
+    if a.config_search:
+        config_search(p, a.target, a.k_max, a.good_true, a.fee_floor, min_good=a.min_good, min_attacked=a.min_attacked)
+        return
     run(p, a.scale)
     if not a.no_sweep:
         sweep(p)
