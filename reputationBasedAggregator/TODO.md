@@ -728,7 +728,7 @@ of 24,576 bytes, so it fits, but it shares the remaining 2,544 bytes with the ot
 
 ## 12. Bounty-side decision rules: Q-of-N pass, bond forfeited only on a hard fail, re-run on block
 
-**Status:** not started (design discussed 2026-11-11)
+**Status:** not started (design discussed 2026-11-11). Sized for the $100K bounty in item 13.
 **Scope:** bounty program (`BountyEscrow.sol`, `EvaluationWallet.sol`, site, agent skill and docs).
 Depends on item 11 (`getOutcomeScores`). No aggregator change beyond item 11; the aggregator
 config (K/M/N/P) and the existing race rules (first M commits, first N reveals) stay as they are.
@@ -797,6 +797,12 @@ blocking cartel, blocked pass per round >= 50%, fee $0.046):
 | 20% | two-phase, no beacons | 44/33/30 | 20 | 14 | $1 | 91.9% | 56.5% | 6.3% | $151K | $2.63 |
 | 20% | + first 2 of 4 beacons | 50/37/33 | 21 | 15 | $11 | 96.4% | 54.8% | 8.4% | $216K | $3.05 |
 
+- **These rows are optimistic (found 2026-11-12).** They model only one way to sink a round:
+  colluders not committing, so fewer than M commits arrive. A cartel can also commit fast and then
+  never reveal. Only the first M committers get reveal requests (`_dispatchRevealRequests`), so
+  once more than M − N of them stay silent the round has fewer than N reveals and fails. Configs
+  with a small M − N gap (12/10/8, 16/13/10) are much easier to block than the table shows. Item 13
+  re-sizes with both routes (the cartel picks the worse split).
 - At 20% colluders the same targets without these rules (blocked pass >= 90%, good pass >= 99% per
   round, cluster-mean or Q-of-N pass) need K of about 90. The rules roughly halve it, but K still
   exceeds the 20-arbiter shortlist (`shortlist_size`). At 10% colluders K = 12 to 16 fits today's
@@ -838,3 +844,216 @@ changes. The sizing above also assumes the two-phase request (item 9).
 - **Creator-approval windows** (`PendingCreatorApproval`): a re-run should not reopen the
   window; it goes straight to arbitration.
 - Update the BountyEscrow tests, the bounty site, the agent skill and the bounty docs.
+
+---
+
+## 13. Option A: configuration for a $100K bounty (50/38/27, Q = 17, R = 12)
+
+**Status:** chosen as the nominal config (2026-11-12). Not started. The cluster size P and the
+clustering rule are still open; they will be decided with reputation management (see below).
+**Scope:** brings together items 6, 7, 8, 9, 11 and 12, and adds some new work: a config for each
+aggregator, a larger shortlist, gas limits at K = 50, and an update to the risk script. Needs a
+redeploy of the aggregator and keeper, plus a BountyEscrow release.
+
+### Targets and assumptions
+- **The bounty.** V = $100K. Bad work scores 80 on average, the threshold T is 90 and good work
+  scores 95. Arbiter noise is SD 3.
+- **The attacker.** 15% of 300 eligible arbiters collude, and colluders always win the commit and
+  reveal races. A sequencer can be bribed for $1,000 per block.
+- **Honest arbiters.** 5% of polled honest arbiters do not show (they miss the commit or the
+  reveal).
+- **Randomness.** Item 9's two-phase request, plus item 6's hash-chain beacons: 4 polled, the first
+  2 to respond are used. The sequencer can grind 256 versions of block B+1; with the beacons that
+  leaves it about 40 usable seeds.
+- **Re-runs.** Item 12's rules, with at most 5 rounds per submission.
+- **Requirements:**
+  - Good work is eventually paid at least 99% of the time, even when a cartel blocks every round.
+  - Each round passes good work at least 70% of the time while the cartel blocks.
+  - Forcing a pass on bad work costs more than V, whether by repeated submissions or through the
+    sequencer.
+- **How the cartel blocks.** It can do either of two things:
+  - not commit, so fewer than M commits arrive;
+  - commit fast and then never reveal, so fewer than N of the first M committers reveal.
+
+  The model lets the cartel use the worse split in each round (see the caveat added to item 12).
+
+### Configuration
+| Parameter | Value | Set where |
+|---|---|---|
+| K / M / N | 50 / 38 / 27 | `setConfig` on a high-value aggregator (see notes) |
+| P, B | P = 17, B = 3 nominal (bonus ≈ base); P = 2 until clustering is decided | `setConfig`, `setBonusMultiplier` |
+| Q / R / T | 17 / 12 / 90 | per bounty (item 12) |
+| Bond | $250 (≈ 0.109 ETH at $2,287) | per bounty (item 12) |
+| Fee floor | $0.25 per arbiter (≈ 0.000109 ETH) | per bounty, `minOracleFee` (item 8) |
+| Rounds per submission | at most 5 | per bounty or a constant (item 12) |
+| Shortlist | `shortlistSize` = 60 (minimum 50 = K; see below) | `setShortlistSize` on the keeper |
+| Beacons | 4 polled, first 2 used | item 6 |
+
+- **Why 50/38/27.** This is the smallest K that meets every target; feasible configs run from
+  K = 49 to 60.
+  - The M − N gap of 11 limits commit-then-silent blocking.
+  - The K − M gap of 12 limits blocking by not committing.
+- **Why R = 12.** It sits well below Q, so a cartel that blocks rarely pushes good work to a hard
+  fail. Bad work almost never reaches 12 scores at or above 90, so the bond is lost on most failed
+  attempts.
+- **Why a $250 bond.** The forcing target needs only about $16 at a $0.25 fee, or about $28 at
+  $0.046. $250 raises the repeated-submission limit to about $860K and costs an honest hunter
+  about $1.22 in expected losses while a cartel blocks.
+
+### Expected results (exact model, cross-checked by Monte Carlo)
+| Metric | Value |
+|---|---|
+| Good work, no attack: pass per round | 99.95% (the shortfall is the beacon quorum) |
+| Good work while blocked: pass per round | 73.3% |
+| Good work while blocked: hard fail per round | 0.36% |
+| Good work while blocked: never paid (hard fail 0.49% + out of rounds 0.13%) | 0.61% |
+| Bad work: pass per round, best cartel play | 0.024% |
+| Bad work: keeps its bond per round (queue-squatting rate) | 22.6% |
+| Repeated-submission limit (fee $0.25, bond $250) | $857K |
+| Sequencer limit | $162K; the fee and bond do not move it |
+
+Cost to a hunter. "Per round" is the cost of one round. The last two columns are the expected
+total over all rounds a submission needs, including expected bond loss. Gas is about $0.39 per
+round at 0.006 gwei.
+
+| P, B | Fee | Per round | Escrow prepay | Total, no attack | Total, cartel blocks |
+|---|---|---|---|---|---|
+| 2, 3 | $0.25 | $14.89 | $15.00 | $14.89 | $21.07 |
+| 2, 3 | $0.046 | $3.05 | $2.76 | $3.05 | $5.29 |
+| 17, 3 | $0.25 | $26.14 | $26.25 | $26.14 | $35.88 |
+| 17, 3 | $0.046 | $5.12 | $4.83 | $5.12 | $8.02 |
+
+- **What the prepay covers.** It is `fee × (K + B×P + 2 + beacons)`: base fees, bonus, item 9's
+  trigger reward and 2 paid beacon values. The unspent part is refunded.
+- **P affects only costs.** Under the Q-of-N rule P decides only who earns the bonus. It leaves
+  the pass, blocking and forcing figures unchanged; the repeated-submission limit rises slightly
+  with larger P, to about $890K.
+- **Sensitivity.** The smallest feasible K moves with each assumption:
+  - Arbiter noise: SD 4 needs K 54. SD 5, and today's measured SD 7.1 (normal-SD equivalent),
+    cannot be met at K ≤ 60.
+  - Honest no-show: 2% needs K 39. 10% cannot be met.
+  - Colluder share: 12% needs K 22. At 16%, option C (58/44/31) already fails the forcing
+    target, at $81K. 17% and 20% cannot be met.
+  - Eligible pool: 60 arbiters need K 29, 80 need 32, 150 need 38, 200 need 43, 1,000 need 52.
+  - Rounds per submission: a cap of 3 needs K ≥ 58.
+  - Beacons: with no beacons the smallest feasible K is 45. Colluding beacons give the cartel a
+    choice of seeds, which costs more in blocking than the beacons save against the sequencer.
+    Revisit whether to keep them.
+- **Margin.** For more margin over the sequencer, the alternative is 60/46/33 Q = 20 R = 16. It
+  costs $17.46 per round at P = 2, $0.25. Its blocked pass is 77.0%, never-paid while blocked
+  is 0.63%, and the sequencer limit is $641K. With Q = 21 the sequencer limit is $3.0M.
+
+### Work needed beyond items 6 to 12
+- **A config for each aggregator.**
+  - `setConfig` applies to the whole aggregator, so K = 50 would apply to every request it
+    serves. Run high-value bounties on a separate aggregator deployment with this config, or
+    make K/M/N/P a per-request (per-bounty) setting.
+  - BountyEscrow must store which aggregator a bounty uses. At each start it must check the live
+    K/M/N against the bounty's Q and R (item 12 already checks Q ≤ N).
+- **Shortlist.**
+  - **Target: `shortlistSize` = 60. Minimum: 50 (= K).** Today's value is 20.
+    - **Below 50 it breaks.** `_weightedSelect` picks every shortlisted arbiter once and fills
+      the rest of the jury with duplicates.
+    - **At exactly 50 it works, with no margin.** Every shortlisted arbiter is picked, so the jury
+      is a uniform sample and reputation has no effect on selection.
+    - **At 60 there is margin and reputation counts.** The 50 jurors are picked by selection score
+      from 60 uniformly shortlisted arbiters, so the keeper's reputation weights can favour
+      better arbiters. The margin also leaves room for a later K up to 60 (option D, 60/46/33)
+      without another shortlist change.
+  - **The model must be re-run at 60.** Option A's figures assume a uniform jury: each colluder is
+    picked as often as an honest arbiter. At 60 a cartel that farms reputation (for example by
+    collecting the bonus as described below) gets more than its 15% share of jury slots, and
+    honest arbiters with high scores get more too. Add the selection weighting to the risk model:
+    a 60-arbiter uniform shortlist, then 50 picks by score without replacement. Re-check the
+    targets for the colluder weights the reputation design allows. The reputation-management
+    discussion has to bound how far a colluder's weight can rise above an honest arbiter's.
+  - `shortlistSize` is global to the keeper, so this also needs its own keeper or a per-request
+    shortlist size.
+  - The draw must revert, or BountyEscrow must refuse the start, when fewer than K arbiters are
+    eligible. Today `_weightedSelect` fills the remaining slots with duplicates, and that would
+    hand colluders extra slots.
+- **Registry size.**
+  - The model assumes 300 eligible arbiters in the class; 32 are registered today.
+  - With fewer eligible arbiters a smaller K suffices, as long as colluders stay at 15%. K cannot
+    exceed the eligible count, though.
+  - Re-run the search at the real pool size before launch.
+- **Arbiter quality gates.**
+  - The targets fail at SD ≥ 5 or a 10% no-show rate. Before launch, re-measure arbiter noise
+    and no-show for the class used.
+  - Item 7's freeze keeps no-show rates down. Consider admitting only arbiters measured at
+    SD ≤ 3 to the high-value class.
+- **Gas at K = 50.** Measure each of these on Base Sepolia with 300 registered arbiters.
+  - **The draw.** Selection over the eligible pool plus 50 commit dispatches and the beacon
+    requests. The model scales the K = 6 request (~3.3M gas) linearly, to about 27M. That may
+    exceed a block's or a transaction's gas limit (EIP-7825 caps a transaction at 2^24 gas
+    where it applies). It would then need item 2's cheaper selection, or a draw split across
+    several calls.
+  - **The 38th commit.** That arbiter's `fulfill` runs `_dispatchRevealRequests`, which sends
+    38 reveal requests, so the arbiter pays for them. If the job's gas limit is too low the
+    fulfill reverts, the commit is lost and the round stalls until timeout.
+    - Raise the job's gas limit, or move reveal dispatch into a permissionless call with a
+      trigger reward, like item 9's draw.
+    - A cartel member can grief this: it commits 38th with too little gas.
+  - **The 27th reveal.** That `fulfill` finalizes the round: clustering, the keeper's score
+    updates for all 50 slots (item 1) and bonus credits. Measure it the same way. Consider
+    finalizing in a separate permissionless call.
+  - **The consumer.** BountyEscrow's read of `getOutcomeScores` at N = 27 is about 146k gas
+    (item 11's fit).
+- **Response timeout.** The round waits for the 38th commit and the 27th reveal. Set
+  `responseTimeoutSeconds` from measured arbiter latency at that depth, not from the 6/4/3
+  config.
+- **Risk script.**
+  - Move the item 12 / item 13 search into `scripts/selection_randomness_risk.py`. That covers
+    the Q/R outcome bands, re-runs with a cap, both blocking routes, beacon and sequencer seed
+    choice, bond sizing and colluder counts drawn hypergeometrically from the eligible pool.
+  - Add weighted selection: a uniform 60-arbiter shortlist, then K picks by selection score
+    without replacement, with a colluder-to-honest weight ratio as an input.
+  - Today `broad_config_eval` models only blocking by not committing.
+  - Add a `--config 50,38,27,17,12` check that prints the tables above.
+- **Bounty UI and docs.**
+  - Present option A as the preset for bounties near $100K: fee floor, bond, Q, R and rounds per
+    submission.
+  - Show the hunter both the expected cost and the expected number of rounds while blocked (about
+    1.36).
+
+### Open: P, clustering and reputation (next discussion)
+- **Goal for P.** Total bonus should roughly equal total base pay, so P × B ≈ K. P = 17 with
+  B = 3 gives 51 against 50. `setConfig` already accepts it (K ≥ M ≥ N ≥ P ≥ 2), and
+  `setBonusMultiplier` allows B up to 20.
+- **Who collects the bonus.** Colluders who report identical scores near the expected consensus
+  always seed the greedy cluster. Their share of bonus slots depends on P and B:
+
+  | P, B | Colluders' share of bonus slots |
+  |---|---|
+  | 2, 3 | ~100% |
+  | 5, 10 | ~97% |
+  | 10, 5 | ~73% |
+  | 17, 3 | ~44% |
+  | 25, 2 | ~30% |
+
+  Their fair share is 15% of counted reveals. They collect this without changing any outcome,
+  and with it the cluster reputation gain.
+- **Gas.**
+  - Greedy `findBestCluster` at N = 27, P = 17 makes about 11,000 `calculateDistance` calls.
+  - Computing the 351 pairwise distances once and updating scores incrementally gives the same
+    cluster for about 800 calls.
+  - Item 10's exact enumeration is out of reach at this size. Its nearest-neighbour variant is
+    the alternative.
+- **Questions for the reputation-management discussion:**
+  - How reputation is earned (cluster membership versus agreement with the Q-of-N outcome).
+  - What happens to committed-but-silent arbiters, which are the commit-then-silent blocking
+    route.
+  - How reputation weights selection from the 60-arbiter shortlist. In particular, how far a
+    colluder's selection weight can rise above an honest arbiter's (this sets the colluder share
+    used in the model).
+  - Which clustering rule and P to adopt.
+
+### Notes / related
+- **Lowering K.** Possible change: send reveal requests to late committers as they arrive (the
+  current code stops counting commits after the M-th), and count the first N reveals. A promoted
+  colluder that stays silent can then be replaced, which weakens the commit-then-silent route and
+  should lower K. Model it before committing to the design.
+- **Fee figures.** Dollar figures assume ETH at $2,287 and 0.006 gwei. The fee floor and bond are
+  set in wei, so re-price them for long-lived bounties (item 8).
+- **Source.** Search and tables come from the 2026-11-12 analysis (exact calculator plus Monte
+  Carlo). Fold them into the risk script, as listed above, so they can be reproduced.
