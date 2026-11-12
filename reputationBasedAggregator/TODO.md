@@ -723,3 +723,118 @@ of 24,576 bytes, so it fits, but it shares the remaining 2,544 bytes with the ot
   of N), so Q can be absolute or a fraction of N.
 - Update `test/aggregatorEth.test.js`, `docs/contracts/reputation-aggregator.md` and the consumer
   examples under `docs/examples/`.
+
+---
+
+## 12. Bounty-side decision rules: Q-of-N pass, bond forfeited only on a hard fail, re-run on block
+
+**Status:** not started (design discussed 2026-11-11)
+**Scope:** bounty program (`BountyEscrow.sol`, `EvaluationWallet.sol`, site, agent skill and docs).
+Depends on item 11 (`getOutcomeScores`). No aggregator change beyond item 11; the aggregator
+config (K/M/N/P) and the existing race rules (first M commits, first N reveals) stay as they are.
+
+### Problem
+A blocking cartel and a forcing cartel pull the same lever in opposite directions. With one
+pass/fail line, every config that is hard to force is easy to block, and the reverse. Holding
+good work at a 90% pass rate while colluders block whenever they can is what forces K up in the
+risk model. Today a block is also costly for an honest hunter: a failed or dead round ends the
+submission (`finalizeSubmission` marks it `Failed`; `failTimedOutSubmission` does the same for a
+round with no result). The hunter loses their place in the payout order, and a copy of their work
+submitted later can win (the residual exposure noted at `_hasEarlierPendingByOther`).
+
+### Idea
+Read each counted arbiter's score with `getOutcomeScores(aggId, ACCEPT)` and sort every round into
+one of four outcomes, using three per-bounty parameters set by the creator: the threshold T (the
+existing `threshold`), the pass quota Q and the forfeit line R (R <= Q):
+
+| Outcome | Condition | Result |
+|---|---|---|
+| Pass | at least Q of the N scores >= T | paid (subject to payout priority) |
+| Soft fail | R to Q - 1 scores >= T | hunter may re-run; keeps place and bond |
+| No result | round failed to finish: beacon quorum missed (item 6 / 9), fewer than M commits, fewer than N reveals | hunter may re-run; keeps place and bond |
+| Hard fail | fewer than R scores >= T | bond forfeited to the creator; submission ends |
+
+- **Bond.** The hunter posts a bond with the prepay at start. It is returned on a pass and on
+  any exit that is not a hard fail, and forfeited to the creator on a hard fail. This replaces
+  item 8's "deposit forfeited on failure", which would cost honest hunters their deposit
+  whenever a cartel blocks them.
+- **Why R sits below Q.** To make an honest hunter forfeit, a cartel must push the count below R:
+  good work (honest score ~95) gets >= T from almost every honest arbiter, so that takes about
+  N - R + 1 counted colluders. Bad work (honest score ~80) almost never gets >= T from honest
+  arbiters, so avoiding forfeit takes about R counted colluders, and attackers lose the bond on
+  nearly every failed attempt. With R = Q every block would also cost the honest hunter the bond.
+- **Re-run.** A soft fail or no result moves the submission to a new state (e.g.
+  `AwaitingRerun`) instead of `Failed`. The hunter re-runs it for a fresh prepay; the same
+  `EvaluationWallet` makes a new request, and the new jury is drawn from a fresh seed. The
+  submission keeps its index, so it keeps payout priority (`_hasEarlierPendingByOther` and the
+  pending list must treat `AwaitingRerun` as still in evaluation).
+- **Re-runs are capped** (e.g. 3 to 5 per submission) and must start within a re-run window
+  (e.g. a few hours, and before `submissionDeadline`). Otherwise a submission that soft-fails or
+  is blocked can hold the head of the queue indefinitely, and every later passing submission's
+  payout waits behind it. When the cap or the window runs out, the submission ends as `Failed`
+  and the bond is returned (the last outcome was not a hard fail).
+- **Both blocking routes are covered.** Under race counting a cartel blocks either by
+  withholding (the round does not finish) or by voting low (the round finishes and fails). If
+  only unfinished rounds could re-run, the cartel would vote low instead, so soft fails must
+  re-run too.
+- **Honest noise is covered too.** A good submission that falls short through arbiter noise
+  usually lands in the soft-fail band, so it re-runs rather than failing. A single round then
+  only needs to pass good work most of the time (~90%), with the final false-negative rate set by
+  the hard-fail rate (well under 1%). That, and relaxing the blocked pass rate to ~50%, is what
+  lowers K.
+
+### Expected payoff
+From `scripts/selection_randomness_risk.py`-style exact calculations (300 eligible arbiters, SD 3,
+nominal 80, T = 90, good work 95, V = $100K, $1,000 sequencer bribe, colluders always win the
+commit/reveal races, per-round good pass >= 90%, good-work hard fail <= 1% with or without a
+blocking cartel, blocked pass per round >= 50%, fee $0.046):
+
+| Colluders | Seed | K/M/N | Q | R | Bond | Good pass per round | Pass per round while blocked | Bad work keeps bond | Sequencer limit | Fees per round |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 10% | two-phase, no beacons | 12/10/8 | 7 | 4 | $2 | 91.8% | 51.8% | 4.6% | $139K | $0.92 |
+| 10% | two-phase, no beacons | 16/13/10 | 8 | 5 | $2 | 98.0% | 67.2% | 2.1% | $133K | $1.13 |
+| 10% | + first 2 of 4 beacons | 16/13/10 | 7 | 5 | $40 | 98.9% | 76.9% | 2.5% | $164K | $1.23 |
+| 20% | two-phase, no beacons | 44/33/30 | 20 | 14 | $1 | 91.9% | 56.5% | 6.3% | $151K | $2.63 |
+| 20% | + first 2 of 4 beacons | 50/37/33 | 21 | 15 | $11 | 96.4% | 54.8% | 8.4% | $216K | $3.05 |
+
+- At 20% colluders the same targets without these rules (blocked pass >= 90%, good pass >= 99% per
+  round, cluster-mean or Q-of-N pass) need K of about 90. The rules roughly halve it, but K still
+  exceeds the 20-arbiter shortlist (`shortlist_size`). At 10% colluders K = 12 to 16 fits today's
+  shortlist.
+- Under race counting the first-2-of-4 beacons do not lower K here: their silencing (~4%) only
+  costs a re-run, but colluding beacons still give the cartel a choice of seeds.
+- "Bad work keeps bond" is the chance per round that a bad submission soft-fails or gets no
+  result, i.e. keeps its bond and its place. It is the queue-squatting rate (see below).
+- **Bond rule of thumb:** bond ≈ V × (bad-work pass rate per round) ÷ (bad-work hard-fail
+  rate). The re-run rule does not change the attacker's economics beyond that: a bad submission
+  that draws R or more colluders soft-fails and keeps its bond, which the bond size already
+  accounts for.
+- **Cost to honest hunters:** about 1 / (blocked pass rate) rounds while a cartel blocks every
+  round (~2 rounds at 50%), each costing one prepay. Without an attack, ~1 / (good pass rate).
+- **Queue squatting:** a cartel-backed bad submission keeps its bond and its place at the
+  "bad work kept bond" rate per round. Prefer a higher R, and keep the re-run cap low.
+
+### Why it's deferred
+It needs item 11 (an aggregator redeploy) and a BountyEscrow release with new per-bounty
+parameters (Q, R, bond), a new submission state and re-run entrypoint, and site / agent-skill
+changes. The sizing above also assumes the two-phase request (item 9).
+
+### Notes / related
+- **Alternatives considered:** a hunter-only appeal to a second, larger jury, and a two-sided
+  appeal (the creator or anyone can challenge a pass). Both also split the blocking requirement
+  across rounds. Re-running the same config is simpler: one config, no challenge window, no
+  watcher.
+- **Q and R are applied by the consumer, never sent to arbiters**, like T in item 11.
+- **Per-bounty parameters.** Add `quota` (Q), `forfeitLine` (R) and `bond` to `CreateParams` /
+  `Bounty`, next to `threshold`. Validate R <= Q at creation, and Q <= N at each start (N from
+  the live aggregator config; reject the start otherwise).
+- **`_requireNoPassingSubmission` and `finalizeSubmission`** switch from the cluster-mean
+  `_scoreVector` test to the Q-of-N count.
+- **Re-run funding.** Each re-run needs a fresh `maxTotalFee` prepay; the leftover from the
+  previous round is refunded as today (`_refundLeftoverEth`). With item 3 (`refundTo`), the
+  per-submission wallet could be dropped.
+- **Concurrency.** `AwaitingRerun` submissions should count against `MAX_ACTIVE_EVALUATIONS`
+  only while a round is actually in flight, or a blocked bounty fills its slots.
+- **Creator-approval windows** (`PendingCreatorApproval`): a re-run should not reopen the
+  window; it goes straight to arbitration.
+- Update the BountyEscrow tests, the bounty site, the agent skill and the bounty docs.
