@@ -2,7 +2,7 @@
 // -------------------------------------------------
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
-const { getContract } = require("./test-helpers");
+const { getContract, skipUnlessDeployed } = require("./test-helpers");
 
 describe("ReputationKeeper (register & config only)", function () {
   let keeper, token, owner, fee, stakeRequirement;
@@ -11,7 +11,8 @@ describe("ReputationKeeper (register & config only)", function () {
   // Add a delay between transactions to avoid nonce issues
   const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
   
-  before(async () => {
+  before(async function () {
+    await skipUnlessDeployed(this, "ReputationKeeper");
     // First, get the signers
     const signers = await ethers.getSigners();
     owner = signers[0];

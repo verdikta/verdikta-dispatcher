@@ -4,7 +4,7 @@
 // hardhat‑deploy (tags: aggregator, keeper, tokens).
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
-const { getContract } = require("./test-helpers");
+const { getContract, skipUnlessDeployed } = require("./test-helpers");
 
 describe("ReputationAggregator (config & getters only)", function () {
   let agg, keeper, link;
@@ -12,7 +12,8 @@ describe("ReputationAggregator (config & getters only)", function () {
   // Add a delay between transactions to avoid nonce issues
   const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-  before(async () => {
+  before(async function () {
+    await skipUnlessDeployed(this, "ReputationKeeper", "ReputationAggregator");
     // First, get the signers
     const signers = await ethers.getSigners();
     owner = signers[0];
