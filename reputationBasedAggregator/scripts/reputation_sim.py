@@ -26,15 +26,25 @@ Reputation policies:
   v2       - proposal. Per-arbiter tests, each a CUSUM (floored at 0, so long good records
              buy no immunity), each leading to a block whose duration doubles, with a ban after
              --max-offenses:
-               quality  - capped z^2 of the reveal against the round median (wrong model, lazy)
-               extreme  - Bernoulli CUSUM on z > 3 (intermittent large deviations: forcing)
-               flip     - consumer feedback (--flip): voted on the other side of T from the
+               quality  - (--scoring two, default) one CUSUM per arbiter with increment
+                          (min(z^2, 9) - 2) / 5 + (2.3 if z > 3 else -0.095), block at 8: z is the
+                          reveal's distance from the round median in robust SDs, so persistent
+                          deviation (wrong model, lazy) and intermittent large deviations both count.
+                          --scoring three keeps the earlier separate CUSUMs:
+                 quality  - capped z^2, block at 40
+                 extreme  - Bernoulli CUSUM on z > 3, block at 7
+               flip     - OFF by default, not implementable in the core contracts (they do not know
+                          T or how results are used); kept only as an experiment (--flip 1) for an
+                          application-side feedback channel.
+                          Consumer feedback: voted on the other side of T from the
                           submission's eventual outcome, exact LLR against the honest flip rate,
                           plus a round-level bonus when the flippers changed the outcome
                silence  - misses counted only when unambiguous: timed-out rounds, or any round
                           when late commits / reveals are recorded (--late-window); plus a
                           round-level sink rule (a round sunk by more live arbiters than the
-                          slack allows penalises all of them)
+                          slack allows penalises all of them, scaled by how improbable that many
+                          silences are under honest miss rates, so small rounds with a slack of 1 do
+                          not block honest arbiters for two coincident transients)
              Selection weight is bounded (max/min ratio --w-ratio) and built from EMAs of
              agreement and on-time commits. Race rank is never penalised.
 
@@ -43,8 +53,20 @@ plus jurors that missed a commit last round (suspects) and --live-random random 
 called arbiter that has not answered by the end of the round is frozen (excluded from selection)
 until it answers (modelled as a geometric delay after it is back up).
 
+Races (--commit-select): "race" promotes the first M commits (today); "random" promotes M drawn at
+random from the commits that arrive within --commit-window, so answering early earns nothing.
+Colluder speed (--col-speed, default attack): colluders answer near-instantly only in attack rounds,
+where no inference is needed (a fixed force / low vote, or a junk commit for silent); otherwise
+they have honest-like latency. "always" reproduces the earlier worst case.
+
+Workload (--mix): each round draws a class K/M/N/P/Q/R by share; all classes share one arbiter pool,
+one reputation state and the keeper's global shortlist. The mix-* presets use the nominal workload
+(80% 6/5/4/3/3, 16% 8/6/5/4/4, 4% option A 50/38/27/17/17). Bonus shares are by value: every round
+escrows a pool of B x P x fee; the cluster pays it to exactly P members, the band rule splits it
+evenly among the counted reveals within --agree-z of the median.
+
 Examples:
-    python3 scripts/reputation_sim.py                       # standard comparison table
+    python3 scripts/reputation_sim.py --compare --presets today,mix-cur,mix-v2,mix-v2-rnd
     python3 scripts/reputation_sim.py --preset A-v2 --strategy block --lever silent
     python3 scripts/reputation_sim.py --compare --days 60 --json out.json
 """
@@ -60,6 +82,9 @@ import time
 HON, COL, BIAS, NOISY, LAZY = range(5)
 TYPE_NAMES = ["honest", "colluder", "biased", "noisy", "lazy"]
 
+# nominal workload: K/M/N/P/Q/R:share of rounds (TODO item 13 option A for the 4% of high-value rounds)
+NOMINAL_MIX = "6/5/4/3/3/1:80,8/6/5/4/4/1:16,50/38/27/17/17/12:4"
+
 PRESETS = {
     # today's deployed config: 6/4/3/2, shortlist 20, current rules, no liveness calls
     "today":     dict(K=6, M=4, N=3, P=2, Q=2, R=1, shortlist=20, policy="current", liveness="none"),
@@ -70,15 +95,29 @@ PRESETS = {
     "A-cur-frz": dict(K=50, M=38, N=27, P=17, Q=17, R=12, shortlist=60, policy="current", liveness="freeze"),
     # option A, proposed rules + hash-chain freeze
     "A-v2":      dict(K=50, M=38, N=27, P=17, Q=17, R=12, shortlist=60, policy="v2", liveness="freeze",
-                      late_window=1, flip=1),
+                      late_window=1),
+    # as A-v2, but the M promoted committers are drawn at random from the commits that arrive within
+    # the commit window, instead of the first M to arrive
+    "A-v2-rnd":  dict(K=50, M=38, N=27, P=17, Q=17, R=12, shortlist=60, policy="v2", liveness="freeze",
+                      late_window=1, commit_select="random"),
+    # nominal mixed workload (80% 6/5/4/3/3, 16% 8/6/5/4/4, 4% option A), one shared arbiter pool and
+    # reputation state; the keeper's shortlist is global, so 60 for every class
+    "mix-cur":     dict(mix=NOMINAL_MIX, shortlist=60, policy="current", liveness="none"),
+    "mix-cur-frz": dict(mix=NOMINAL_MIX, shortlist=60, policy="current", liveness="freeze"),
+    "mix-v2":      dict(mix=NOMINAL_MIX, shortlist=60, policy="v2", liveness="freeze", late_window=1),
+    "mix-v2-rnd":  dict(mix=NOMINAL_MIX, shortlist=60, policy="v2", liveness="freeze", late_window=1,
+                        commit_select="random", commit_window=2.0),
 }
 
 
 def build_parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     a = ap.add_argument
-    a("--preset", default="A-v2", choices=sorted(PRESETS))
+    a("--preset", default="mix-v2", choices=sorted(PRESETS))
     a("--compare", action="store_true", help="run every preset against every cartel strategy")
+    a("--presets", default=None, help="comma-separated presets for --compare (default: all)")
+    a("--mix", default=None, help="round classes K/M/N/P/Q/R:share,... drawn per round (overrides K..R); "
+                                  f"nominal: {NOMINAL_MIX}")
     a("--days", type=float, default=30.0)
     a("--rounds-per-day", type=float, default=144.0, help="evaluation rounds per day (144 = one per 10 min)")
     a("--seed", type=int, default=1)
@@ -114,6 +153,11 @@ def build_parser():
     a("--slow-frac", type=float, default=0.10, help="honest arbiters with --slow-factor x latency")
     a("--slow-factor", type=float, default=3.0)
     a("--on-time", type=float, default=4.0, help="v2 absolute commit deadline, in median-latency units")
+    a("--commit-select", choices=["race", "random"], default=None,
+      help="race: the first M commits are promoted (today); random: M drawn at random from the commits "
+           "that arrive within --commit-window (if fewer than M arrive in time, the earliest late ones fill up)")
+    a("--commit-window", type=float, default=None, help="commit window for --commit-select random, in "
+                                                         "median-latency units (default --on-time)")
     a("--eps-commit", type=float, default=0.01, help="honest transient miss rate per commit")
     a("--eps-reveal", type=float, default=0.01, help="honest transient miss rate per reveal")
     a("--eps-call", type=float, default=0.005, help="honest transient miss rate per hash-chain call")
@@ -123,7 +167,7 @@ def build_parser():
     a("--call-checks-ai", type=int, default=1, help="1 = the hash-chain call exercises the AI pipeline (item 7)")
     # cartel
     a("--strategy", choices=["mimic", "block", "force", "honest"], default="mimic",
-      help="mimic: identical consensus-like scores, always fast; block: sink good-work rounds; "
+      help="mimic: identical consensus-like scores; block: sink good-work rounds; "
            "force: vote >= T on bad-work rounds; honest: behave honestly (control)")
     a("--lever", choices=["silent", "low", "abstain"], default="silent",
       help="block lever: commit then never reveal, vote T-1, or never commit")
@@ -131,7 +175,10 @@ def build_parser():
       help="always: attack every eligible round; win: only when enough colluders are seated to win")
     a("--attack-frac", type=float, default=1.0, help="fraction of eligible rounds the cartel attacks")
     a("--force-vote", type=float, default=None, help="score colluders report when forcing (default T)")
-    a("--col-fast", type=int, default=1, help="1 = colluders always win the commit and reveal races")
+    a("--col-speed", choices=["always", "attack", "never"], default="attack",
+      help="when colluders answer near-instantly: always; attack = only in attack rounds, where the vote "
+           "is fixed in advance (force, low) or the commit is junk (silent), so no inference is needed; "
+           "never. Otherwise they have honest-like latency (one shared inference run)")
     # current-policy parameters (keeper / aggregator defaults)
     a("--alpha", type=int, default=500, help="timeliness weight in selection, 0..1000")
     a("--lock-hours", type=float, default=24.0)
@@ -150,6 +197,12 @@ def build_parser():
     a("--e-a", type=float, default=2.3, help="extreme CUSUM increment, ~ln(p1/p0) = ln(0.1/0.01)")
     a("--e-b", type=float, default=0.095, help="extreme CUSUM decrement, ~-ln(0.9/0.99)")
     a("--e-h", type=float, default=7.0)
+    a("--scoring", choices=["two", "three"], default="two",
+      help="v2 quality alarms. two: one CUSUM, increment (min(z^2,cap) - q_k)/q_div + extreme term, "
+           "block at --qm-h (with silence this gives one timeliness and one quality alarm). "
+           "three: separate quality (--q-h) and extreme (--e-h) CUSUMs (earlier runs)")
+    a("--q-div", type=float, default=5.0, help="two-score: divisor putting the z^2 term in LLR-like units")
+    a("--qm-h", type=float, default=8.0, help="two-score: merged quality alarm threshold")
     a("--flip", type=int, default=None, help="1 = the consumer (BountyEscrow) reports which counted arbiters "
                                          "voted on the other side of T from the median")
     a("--flip-min-gap", type=float, default=1.0, help="score flips only when |median - T| >= this many SDs")
@@ -159,6 +212,10 @@ def build_parser():
     a("--f-decisive", type=float, default=5.0, help="extra flip increment when the flippers changed the outcome")
     a("--sink-rule", type=int, default=1, help="1 = penalise every live arbiter whose silence sank a round")
     a("--s-sink", type=float, default=30.0, help="sink penalty (default = --s-h: block on the first sink)")
+    a("--sink-mode", choices=["fixed", "surprise"], default="surprise",
+      help="fixed: every sinker gets --s-sink; surprise: --sink-per-decade x -log10 P(at least that many "
+           "silent | honest miss rate), capped at --s-sink, so sinks honest transients could cause cost little")
+    a("--sink-per-decade", type=float, default=5.0)
     a("--late-window", type=int, default=None, help="1 = record commits and reveals that arrive after the "
                                                      "race but before the timeout (needed to score silence)")
     a("--noise-df", type=float, default=0.0, help="Student-t degrees of freedom for arbiter noise (0 = normal)")
@@ -183,6 +240,19 @@ def resolve(args):
     for k in ("late_window", "flip"):
         if p[k] is None:
             p[k] = 0
+    if p["commit_select"] is None:
+        p["commit_select"] = "race"
+    if p["commit_window"] is None:
+        p["commit_window"] = p["on_time"]
+    if p["mix"] is None:
+        p["mix"] = "/".join(str(p[k]) for k in ("K", "M", "N", "P", "Q", "R")) + ":100"
+    classes = []
+    for part in p["mix"].split(","):
+        cfg, share = part.split(":")
+        K, M, N, P, Q, R = (int(x) for x in cfg.split("/"))
+        assert 1 <= R <= Q <= N <= M <= K and P <= N, part
+        classes.append(dict(name=cfg, K=K, M=M, N=N, P=P, Q=Q, R=R, share=float(share)))
+    p["classes"] = classes
     if p["force_vote"] is None:
         p["force_vote"] = p["threshold"]
     return p
@@ -238,8 +308,9 @@ def pctl(xs, q):
 # ---------------------------------------------------------------------------------------------
 def run(p):
     rng = random.Random(p["seed"])
-    E, K, M, N, P = p["eligible"], p["K"], p["M"], p["N"], p["P"]
-    Qq, Rr, T = p["Q"], p["R"], p["threshold"]
+    E, T = p["eligible"], p["threshold"]
+    classes = p["classes"]
+    cw = [c["share"] for c in classes]
     rpd = p["rounds_per_day"]
     R_total = int(round(p["days"] * rpd))
     lock = p["lock_hours"] / 24.0 * rpd
@@ -259,7 +330,7 @@ def run(p):
     for i in range(E):
         if slow[i]:
             lat[i] *= p["slow_factor"]
-        if p["col_fast"] and types[i] == COL:
+        if p["col_speed"] == "always" and types[i] == COL:
             lat[i] = 0.02
 
     # ---- state ----
@@ -284,6 +355,12 @@ def run(p):
     outcomes = dict(complete=0, commit_to=0, reveal_to=0)
     good = dict(n=0, pass_=0, soft=0, hard=0, nores=0)
     bad = dict(n=0, pass_=0, soft=0, hard=0, nores=0)
+    # per round class; bonus is accounted in units of B x fee: the cluster pays exactly P members one
+    # unit each, the band rule splits the same pool of P units among everyone in the band
+    cm = {c["name"]: dict(rounds=0, complete=0, commit_to=0, reveal_to=0, attacks=0, rt=[],
+                          good=dict(n=0, pass_=0, soft=0, hard=0, nores=0),
+                          bad=dict(n=0, pass_=0, soft=0, hard=0, nores=0),
+                          slots=[0] * 5, clus=[0.0] * 5, band=[0.0] * 5) for c in classes}
     shortfall = 0
     first_block = [-1] * E
     sel_before_block = [-1] * E
@@ -293,6 +370,9 @@ def run(p):
     hb_time = [0, 0]                  # honest blocked arbiter-rounds: [fast, slow]
     honest_frozen_up_time = 0
     attacks = 0
+    round_time = []                   # complete rounds: promotion time + N-th reveal, latency units
+    promote_time = []
+    rnd = p["commit_select"] == "random"
     down_events = []
     open_ev = {}
     pf = 1.0 / (p["mtbf_days"] * rpd) if p["mtbf_days"] > 0 else 0.0
@@ -393,9 +473,15 @@ def run(p):
             if frozen[i] and up[i]:
                 honest_frozen_up_time += 1
 
-        # ---- selection: uniform shortlist, then weighted picks without replacement ----
+        # ---- round class ----
         if not elig:
             continue
+        cls = classes[0] if len(classes) == 1 else rng.choices(classes, weights=cw)[0]
+        K, M, N, P, Qq, Rr = cls["K"], cls["M"], cls["N"], cls["P"], cls["Q"], cls["R"]
+        cs_ = cm[cls["name"]]
+        cs_["rounds"] += 1
+
+        # ---- selection: uniform shortlist, then weighted picks without replacement ----
         sl = rng.sample(elig, p["shortlist"]) if len(elig) > p["shortlist"] else elig
         if len(sl) < K:
             shortfall += 1
@@ -408,6 +494,7 @@ def run(p):
         for i, t in zip(jury, jt):
             sel_count[i] += 1
             slots[t] += 1
+            cs_["slots"][t] += 1
             if r >= late_quarter:
                 slots_late[t] += 1
             if i in open_ev:
@@ -425,19 +512,26 @@ def run(p):
         msd = math.exp(rng.gauss(0, p["task_sd_spread"]))
         is_col = [t == COL for t in jt]
         c_jury = sum(is_col)
-        # colluders seated needed for an attack to work (they always win the races)
-        need = {"force": Qq, "low": N - Qq + 2, "silent": M - N + 1, "abstain": K - M + 1}
+        # colluders needed for an attack to work: force / low count promoted colluders (they reveal
+        # first, so all of them are counted); silent counts promoted colluders; abstain counts seats.
+        need = {"force": Qq, "low": N - Qq + 1, "silent": M - N + 1, "abstain": K - M + 1}
+        # what the cartel can count on before committing: under the race, every seated colluder is
+        # promoted (they commit instantly); under random promotion about M/K of them are.
+        exp_prom = c_jury * M / K if rnd else c_jury
+        lever = p["lever"]
         act = "mimic"
         if p["strategy"] == "honest":
             act = "honest"
         elif p["strategy"] == "block" and kind == "good" and rng.random() < p["attack_frac"]:
-            if p["attack_when"] == "always" or c_jury >= need[p["lever"]]:
+            # race: decided now (every seated colluder will be promoted). Random promotion: silent
+            # commits a real score and decides after promotion is known whether to withhold the
+            # reveal, so it is tentatively on here and re-checked after promotion.
+            if p["attack_when"] == "always" or (rnd and lever == "silent") or \
+                    (exp_prom if lever == "low" else c_jury) >= need[lever]:
                 act = "block"
         elif p["strategy"] == "force" and kind == "bad" and rng.random() < p["attack_frac"]:
-            if p["attack_when"] == "always" or c_jury >= need["force"]:
+            if p["attack_when"] == "always" or exp_prom >= need["force"]:
                 act = "force"
-        if act in ("block", "force") and any(is_col):
-            attacks += 1
 
         shared = tv + rng.gauss(0, 1.0)
         sc = []
@@ -455,6 +549,11 @@ def run(p):
             sc.append(min(max(round(v), 0), 100))
 
         # ---- commit phase ----
+        # colluders answer near-instantly when they need no inference (--col-speed attack); a silent
+        # blocker under random promotion still commits a real score, but on time
+        quick = p["col_speed"] == "always" or (p["col_speed"] == "attack" and act in ("block", "force")
+                                               and not (rnd and lever == "silent"))
+        fast_now = [is_col[j] and quick for j in range(K)]
         committed = [False] * K
         clat = [0.0] * K
         for j, i in enumerate(jury):
@@ -468,33 +567,55 @@ def run(p):
                 nocommit["transient"] += 1
                 continue
             committed[j] = True
-            clat[j] = lat[i] * math.exp(rng.gauss(0, p["lat_noise"]))
+            clat[j] = (0.02 if fast_now[j] else lat[i]) * math.exp(rng.gauss(0, p["lat_noise"]))
         corder = sorted((j for j in range(K) if committed[j]), key=lambda j: clat[j])
         promoted = [False] * K
-        for j in corder[:M]:
+        if rnd:
+            ontime = [j for j in corder if clat[j] <= p["commit_window"]]
+            if len(ontime) >= M:
+                chosen = rng.sample(ontime, M)
+                t_prom = p["commit_window"]
+            else:
+                chosen = corder[:M]                   # all on-time, then the earliest late commits
+                t_prom = max(p["commit_window"], clat[corder[M - 1]]) if len(corder) >= M else None
+        else:
+            chosen = corder[:M]
+            t_prom = clat[corder[M - 1]] if len(corder) >= M else None
+        for j in chosen:
             promoted[j] = True
+        # silent lever: the cartel sees who was promoted before deciding to withhold its reveals
+        if rnd and act == "block" and lever == "silent" and p["attack_when"] == "win":
+            if sum(1 for j in chosen if is_col[j]) < need["silent"]:
+                act = "mimic"
+        if act in ("block", "force") and any(is_col):
+            attacks += 1
+            cs_["attacks"] += 1
         counted = [False] * K
         rlat = [0.0] * K
         rev = []
         if len(corder) < M:
             result = "commit_to"
         else:
-            for j in corder[:M]:
+            for j in chosen:
                 if is_col[j] and act == "block" and p["lever"] == "silent":
                     continue
                 if rng.random() < p["eps_reveal"]:
                     continue
-                rlat[j] = lat[jury[j]] * math.exp(rng.gauss(0, p["lat_noise"]))
+                rlat[j] = (0.02 if fast_now[j] else lat[jury[j]]) * math.exp(rng.gauss(0, p["lat_noise"]))
                 rev.append(j)
             if len(rev) < N:
                 result = "reveal_to"
             else:
                 rev.sort(key=lambda j: rlat[j])
                 cidx = rev[:N]                       # reveal order
+                promote_time.append(t_prom)
+                round_time.append(t_prom + rlat[cidx[-1]])
+                cs_["rt"].append(t_prom + rlat[cidx[-1]])
                 for j in cidx:
                     counted[j] = True
                 result = "complete"
         outcomes[result] += 1
+        cs_[result] += 1
 
         # ---- clustering and the Q-of-N outcome ----
         cl = [False] * K
@@ -504,20 +625,22 @@ def run(p):
             for pos in inc:
                 cl[cidx[pos]] = True
                 clus_slots[jt[cidx[pos]]] += 1
+                cs_["clus"][jt[cidx[pos]]] += 1
             # alternative bonus rule for comparison: every counted reveal within --agree-z robust
             # SDs of the median earns the bonus (no fixed P, so identical votes gain nothing extra)
             bv = [sc[j] for j in cidx]
             bmed = median(bv)
             bsref = max(median([abs(v - bmed) for v in bv]) * 1.4826, p["sigma_floor"])
-            for j in cidx:
-                if abs(sc[j] - bmed) / bsref <= p["agree_z"]:
-                    band_slots[jt[j]] += 1
+            inband = [j for j in cidx if abs(sc[j] - bmed) / bsref <= p["agree_z"]]
+            for j in inband:
+                band_slots[jt[j]] += P / len(inband)
+                cs_["band"][jt[j]] += P / len(inband)
             npass = sum(1 for j in cidx if sc[j] >= T)
             oc = "pass_" if npass >= Qq else ("soft" if npass >= Rr else "hard")
         if kind != "general":
-            d = good if kind == "good" else bad
-            d["n"] += 1
-            d[oc] += 1
+            for d in ((good, cs_["good"]) if kind == "good" else (bad, cs_["bad"])):
+                d["n"] += 1
+                d[oc] += 1
 
         # ---- reputation updates ----
         if not v2:
@@ -552,10 +675,17 @@ def run(p):
                 for j in scored:
                     i = jury[j]
                     z = abs(sc[j] - med) / sref
-                    # (a) persistent deviation: CUSUM on capped z^2 (wrong model, lazy)
-                    cq[i] = max(0.0, cq[i] + min(z * z, p["q_cap"]) - p["q_k"])
-                    # (b) rare large deviation: Bernoulli CUSUM on z > tau (intermittent forcing)
-                    ce[i] = max(0.0, ce[i] + (p["e_a"] if z > p["e_tau"] else -p["e_b"]))
+                    dev = min(z * z, p["q_cap"]) - p["q_k"]
+                    ext = p["e_a"] if z > p["e_tau"] else -p["e_b"]
+                    if p["scoring"] == "two":
+                        # one quality alarm in LLR-like units: persistent deviation (capped z^2,
+                        # rescaled by --q-div) plus the rare-large-deviation term
+                        cq[i] = max(0.0, cq[i] + dev / p["q_div"] + ext)
+                    else:
+                        # (a) persistent deviation: CUSUM on capped z^2 (wrong model, lazy)
+                        cq[i] = max(0.0, cq[i] + dev)
+                        # (b) rare large deviation: Bernoulli CUSUM on z > tau (intermittent forcing)
+                        ce[i] = max(0.0, ce[i] + ext)
                     # (c) consumer feedback: voted on the other side of T from the median.
                     #     Exact Bernoulli LLR with the honest flip rate p0 = Phi(-|med - T| / sref).
                     # Reference side: the submission's eventual outcome, which BountyEscrow learns
@@ -575,8 +705,9 @@ def run(p):
                                 step += p["f_decisive"]
                             cf[i] = max(0.0, cf[i] + step)
                     qa[i] += p["ema"] * ((1.0 if z <= p["agree_z"] else 0.0) - qa[i])
-                    for arr, h, why in ((cq, p["q_h"], "quality"), (ce, p["e_h"], "extreme"),
-                                        (cf, p["f_h"], "flip")):
+                    tests = (((cq, p["qm_h"], "quality"),) if p["scoring"] == "two" else
+                             ((cq, p["q_h"], "quality"), (ce, p["e_h"], "extreme")))
+                    for arr, h, why in tests + ((cf, p["f_h"], "flip"),):
                         if arr[i] >= h and not banned[i]:
                             v2_block(i, r, why)
                             arr[i] = 0.0
@@ -589,10 +720,18 @@ def run(p):
                 sil = [j for j in range(K) if promoted[j] and j not in revealed_set and not frozen_end[j]]
                 if len(sil) > M - N:
                     sink = set(sil)
+                    sink_tail = (len(sil), sum(1 for j in range(K) if promoted[j] and not frozen_end[j]),
+                                 p["eps_reveal"])
             elif p["sink_rule"] and result == "commit_to":
                 miss = [j for j in range(K) if not committed[j] and not frozen_end[j]]
                 if len(miss) > K - M:
                     sink = set(miss)
+                    sink_tail = (len(miss), sum(1 for j in range(K) if not frozen_end[j]), p["eps_commit"])
+            sink_inc = p["s_sink"]
+            if sink and p["sink_mode"] == "surprise":
+                k_, n_, e_ = sink_tail
+                tail = sum(math.comb(n_, x) * e_ ** x * (1 - e_) ** (n_ - x) for x in range(k_, n_ + 1))
+                sink_inc = min(p["s_sink"], p["sink_per_decade"] * -math.log10(max(tail, 1e-300)))
             for j, i in enumerate(jury):
                 if committed[j]:
                     cs[i] = max(0.0, cs[i] - p["s_b"])
@@ -609,7 +748,7 @@ def run(p):
                 elif sure and not committed[j]:
                     cs[i] += p["s_miss"]
                 if j in sink:
-                    cs[i] += p["s_sink"]
+                    cs[i] += sink_inc
                 if cs[i] >= p["s_h"] and not banned[i]:
                     v2_block(i, r, "silence")
                     cs[i] = 0.0
@@ -639,6 +778,7 @@ def run(p):
     years = p["days"] / 365.0
     out = dict(params={k: p[k] for k in ("preset", "K", "M", "N", "P", "Q", "R", "shortlist", "policy",
                                          "liveness", "strategy", "lever", "attack_when", "days", "eligible",
+                                         "commit_select", "col_speed", "mix",
                                          "colluders", "late_window", "flip", "noise_df")})
     n_by = [types.count(t) for t in range(5)]
     tot, totl, totc = max(sum(slots), 1), max(sum(slots_late), 1), max(sum(clus_slots), 1)
@@ -648,12 +788,25 @@ def run(p):
     out["bonus_share"] = {TYPE_NAMES[t]: clus_slots[t] / totc for t in range(5)}
     out["band_bonus_share"] = {TYPE_NAMES[t]: band_slots[t] / max(sum(band_slots), 1) for t in range(5)}
     out["band_bonus_slots_per_round"] = sum(band_slots) / max(outcomes["complete"], 1)
+    rate = lambda d: {k: (v / d["n"] if k != "n" and d["n"] else v) for k, v in d.items()}
+    share = lambda xs: {TYPE_NAMES[t]: xs[t] / max(sum(xs), 1e-12) for t in range(5)}
+    out["classes"] = {c["name"]: dict(
+        share=c["share"], rounds=cm[c["name"]]["rounds"],
+        complete=cm[c["name"]]["complete"] / max(cm[c["name"]]["rounds"], 1),
+        good_work=rate(cm[c["name"]]["good"]), bad_work=rate(cm[c["name"]]["bad"]),
+        attacks=cm[c["name"]]["attacks"],
+        round_time_median=(median(cm[c["name"]]["rt"]) if cm[c["name"]]["rt"] else None),
+        jury_share=share(cm[c["name"]]["slots"]), bonus_share=share(cm[c["name"]]["clus"]),
+        band_bonus_share=share(cm[c["name"]]["band"])) for c in classes}
     out["rounds"] = dict(total=R_total, **outcomes, shortfall=shortfall)
     out["no_show_rate"] = sum(nocommit.values()) / max(total_slots, 1)
     out["no_show_breakdown"] = {k: v / max(total_slots, 1) for k, v in nocommit.items()}
     out["good_work"] = {k: (v / good["n"] if k != "n" and good["n"] else v) for k, v in good.items()}
     out["bad_work"] = {k: (v / bad["n"] if k != "n" and bad["n"] else v) for k, v in bad.items()}
     out["cartel_attack_rounds"] = attacks
+    out["round_time"] = dict(promote_median=(median(promote_time) if promote_time else None),
+                             median=(median(round_time) if round_time else None),
+                             p90=(pctl(round_time, 90) if round_time else None))
 
     rem = {}
     for t in (COL, BIAS, NOISY, LAZY, HON):
@@ -713,7 +866,7 @@ def fmt(x, nd=2, pct=False):
 
 def print_one(o):
     pr = o["params"]
-    print(f"\n=== {pr['preset']}  {pr['K']}/{pr['M']}/{pr['N']} P={pr['P']} Q={pr['Q']} R={pr['R']} "
+    print(f"\n=== {pr['preset']}  rounds {pr['mix']} (K/M/N/P/Q/R:share) "
           f"shortlist {pr['shortlist']}  policy={pr['policy']} liveness={pr['liveness']}  "
           f"cartel={pr['strategy']}{'/' + pr['lever'] if pr['strategy'] == 'block' else ''}  "
           f"{pr['days']:.0f} days ({o['runtime_s']} s)")
@@ -724,6 +877,10 @@ def print_one(o):
     print(f" juror no-show {fmt(o['no_show_rate'], 2, True)} (down {fmt(o['no_show_breakdown']['down'], 2, True)}, "
           f"transient {fmt(o['no_show_breakdown']['transient'], 2, True)}, strategic "
           f"{fmt(o['no_show_breakdown']['strategic'], 2, True)})")
+    rt = o["round_time"]
+    print(f" commit selection {pr['commit_select']}, colluder speed {pr['col_speed']}: promotion at "
+          f"{fmt(rt['promote_median'], 2)}, finalised at median {fmt(rt['median'], 2)} p90 {fmt(rt['p90'], 2)} "
+          f"(median-latency units); cartel attack rounds {o['cartel_attack_rounds']}")
     g, b = o["good_work"], o["bad_work"]
     print(f" good work/round: pass {fmt(g['pass_'], 1, True)} soft {fmt(g['soft'], 1, True)} hard "
           f"{fmt(g['hard'], 2, True)} no-result {fmt(g['nores'], 1, True)}   bad work: pass "
@@ -743,9 +900,17 @@ def print_one(o):
           f"{fmt(h['frac_time_blocked'], 2, True)} (fast {fmt(h['frac_time_blocked_fast'], 2, True)}, slow "
           f"{fmt(h['frac_time_blocked_slow'], 2, True)}), false freezes/arbiter-year "
           f"{h['false_freezes_per_arbiter_year']:.1f}, time frozen while up {fmt(h['frac_time_frozen_while_up'], 2, True)}")
-    print(f" bonus share if paid to everyone within --agree-z of the median: colluder "
-          f"{o['band_bonus_share']['colluder']:.1%}, honest {o['band_bonus_share']['honest']:.1%} "
-          f"({o['band_bonus_slots_per_round']:.1f} slots/round)")
+    print(f" bonus share (value) if the same pool is split among everyone within --agree-z of the median: "
+          f"colluder {o['band_bonus_share']['colluder']:.1%}, honest {o['band_bonus_share']['honest']:.1%}")
+    if len(o["classes"]) > 1:
+        print("    class (share)            rounds compl  good pass/no-result  bad pass  attacks  t-fin  "
+              "colluder jury / cluster bonus / band bonus")
+        for name, c in o["classes"].items():
+            print(f"    {name:<16} ({c['share']:>3.0f}%) {c['rounds']:>7} {c['complete']:6.1%}  "
+                  f"{fmt(c['good_work']['pass_'], 1, True):>7} / {fmt(c['good_work']['nores'], 1, True):<6}  "
+                  f"{fmt(c['bad_work']['pass_'], 2, True):>7} {c['attacks']:>7}  {fmt(c['round_time_median'], 1):>5}  "
+                  f"{c['jury_share']['colluder']:6.1%} / {c['bonus_share']['colluder']:5.1%} / "
+                  f"{c['band_bonus_share']['colluder']:5.1%}")
     print(f" block reasons: {o['block_reasons']}")
 
 
@@ -755,7 +920,7 @@ def main():
     if args.compare:
         strategies = [("mimic", "silent"), ("block", "silent"), ("block", "low"), ("block", "abstain"),
                       ("force", "silent")]
-        for pre in PRESETS:
+        for pre in (args.presets.split(",") if args.presets else PRESETS):
             for st, lv in strategies:
                 a = build_parser().parse_args(sys.argv[1:])
                 a.preset, a.strategy, a.lever = pre, st, lv
