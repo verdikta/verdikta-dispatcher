@@ -1067,7 +1067,8 @@ round at 0.006 gwei.
 ## 14. Reputation v2: two scores (timeliness, quality) with fixed points, plus the liveness freeze
 
 **Status:** design simulated (rules simplified 2026-11-15), not started in the contracts.
-**Scope:** `ReputationKeeper.sol` (two scores, points, blocks, ban, selection weight) and
+**Scope:** `ReputationKeeper.sol` (two scores, points, blocks, ban, selection weight, stake burns,
+unbonding) and
 `ReputationAggregator.sol` (record late reveals, classify each reveal as close / off / far, report
 which live arbiters failed to deliver, optional random promotion). Builds on item 7 (freeze) and
 serves item 13. Simulator: `scripts/reputation_sim.py` (presets `mix-v2`, `mix-v2-rnd`; `--rules
@@ -1118,6 +1119,8 @@ not frozen at round end.
 | Any score | selection weight = `1000 + ((1000 − alpha) × quality + alpha × timeliness) / 1000`, so 1000–2000 |
 | Either score reaches **0** | **blocked** for 24 h × 2^(earlier blocks); that score restarts at 500 |
 | Third block | **banned** (permanent) |
+| Block | burns `burnPerBlock` × 2^(earlier blocks) VDKA from the stake (owner-set, **default 0**) |
+| Ban | burns the whole remaining stake if `burnOnBan` is on (owner switch, **default off**) |
 | 90 days with no block, counted from the end of the last block | one earlier block is **forgiven** (repeats every 90 clean days) |
 | A liveness (hash-chain) call unanswered past the deadline | **frozen** until it answers; no points either way (item 7) |
 
@@ -1152,6 +1155,31 @@ keeper. Scores are clamped to 0–1000.
   because one coincidence in a K=6 round is enough. −200 (the same as an ordinary miss) leaves
   abstaining cartels, and silent cartels that attack only when they can win, mostly unblocked
   (4–31%).
+
+**Stake and burns.** Every arbiter stakes `STAKE_REQUIREMENT` (100 VDKA) to register. Both burns
+start disabled and can be turned on by the owner once real block rates are known.
+- **What today's keeper does.** A severe or worsening block lowers `stakeAmount` by
+  `slashAmountConfig` (default 0). The tokens stay in the keeper with no way out, so they are lost
+  rather than explicitly burned. Selection never checks `stakeAmount`, so an arbiter slashed to 0 is
+  still selected. `deregisterOracle` refunds the remaining stake whenever the arbiter isn't locked,
+  so an operator watching its score fall can leave before the block.
+- **Burns are explicit.** Use the token's burn function, or send to a dead address. Slashed stake
+  never goes to the requester, a reporter or a treasury the arbiters can influence: paying anyone
+  from slashing creates an incentive to make other arbiters fail.
+- **Nothing is burned for freezing.** Being down is not misbehaviour.
+- **Full stake to be selected.** An arbiter whose stake is below `STAKE_REQUIREMENT` after a burn is
+  not eligible until it tops up. Otherwise a burn that reaches 0 means nothing.
+- **Unbonding on exit.** Deregistering starts a delay (e.g. 7 days, owner-set) during which the
+  arbiter is not selected but blocks and bans still apply. The stake is refunded only after the
+  delay. Deregistering while blocked stays forbidden. This closes the leave-before-punishment route.
+- **What burns can and can't do.** They hit only what reputation sees: cartels that fail rounds,
+  wrong or lazy models, and honest bad luck (about 0.01–0.3 blocks per arbiter-year in the
+  simulator). They never touch a cartel voting plausibly near the threshold, so the bounty limits in
+  items 12 and 13 still come from the configuration.
+- **Ban burn.** While `burnOnBan` is off, a banned arbiter can get its stake back through unbonding
+  and re-register under a new address, so a ban costs it only time and gas. Honest bans essentially
+  never happen in the simulator (none in two years, with decay), so turning it on mainly costs broken
+  models and cartels.
 
 **Pool shortage.** When no arbiter is eligible (active, within the fee limit, in the requested
 class, and not frozen, blocked or banned), `selectOracles` reverts and the request fails. The most
