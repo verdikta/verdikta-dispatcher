@@ -60,7 +60,7 @@ Simple rules (--rules simple, the default under policy v2): two integer scores, 
               deliver (no reveal when promoted, or no commit while live) in a round that then failed -500
   quality     per scored reveal: z <= 1.5 +20, 1.5 < z <= 3 -50, z > 3 -200
 Nothing else counts. A score that reaches 0 blocks the arbiter (24 h x 2^offenses, ban at the 3rd)
-and restarts at 500. Weight = 1000 + ((1000 - alpha) x quality + alpha x timeliness) / 1000.
+and restarts at 500. One offense is forgiven per 90 clean days (--decay-days); a ban is permanent. Weight = 1000 + ((1000 - alpha) x quality + alpha x timeliness) / 1000.
 --rules v2 keeps the averages-plus-CUSUM-alarms design described above.
 
 Liveness (--liveness freeze): every juror also gets a hash-chain call with its commit request,
@@ -247,6 +247,8 @@ def build_parser():
     a("--t-miss-ema", type=int, default=0, help="reveal basis: 1 = a live arbiter that never committed also "
                                               "lowers the timeliness average")
     a("--max-offenses", type=int, default=3, help="v2: ban after this many blocks (durations double)")
+    a("--decay-days", type=float, default=90.0, help="v2: forgive one offense per this many clean days "
+                                                   "(no block) since the last block ended; 0 = never")
     a("--ema", type=float, default=0.02, help="average update rate (0.02 = 20 per mille)")
     a("--rules", choices=["simple", "v2"], default="simple",
       help="simple: two integer scores 0..--pt-cap (timeliness, quality), fixed points per event, block "
@@ -398,6 +400,7 @@ def run(p):
             return x + ((1000 - x) * rate_pm + 999) // 1000
         return x - (x * rate_pm + 999) // 1000
     offenses = [0] * E
+    clean_from = [0] * E; forgiven = [0]
     suspects = set()
 
     # ---- metrics ----
@@ -482,7 +485,15 @@ def run(p):
             hlen[i] = 0; run_w[i] = 0
 
     def v2_block(i, r, reason):
-        do_block(i, r, reason, lock * (2 ** offenses[i]))
+        # offense decay, applied lazily at the next block (as the keeper would): one offense is
+        # forgiven per --decay-days clean days, counted from the end of the previous block
+        if p["decay_days"] > 0 and offenses[i] > 0:
+            n_forgive = max(0, r - clean_from[i]) // int(p["decay_days"] * rpd)
+            forgiven[0] += min(n_forgive, offenses[i])
+            offenses[i] = max(0, offenses[i] - n_forgive)
+        dur = lock * (2 ** offenses[i])
+        do_block(i, r, reason, dur)
+        clean_from[i] = r + dur
         offenses[i] += 1
         if offenses[i] >= p["max_offenses"]:
             banned[i] = True
@@ -940,6 +951,7 @@ def run(p):
         key = f"{TYPE_NAMES[types[i]]}:{why}"
         reasons[key] = reasons.get(key, 0) + 1
     out["block_reasons"] = reasons
+    out["offenses_forgiven"] = forgiven[0]
     det = [e["removed"] - e["start"] for e in down_events if e["removed"] is not None]
     out["down"] = dict(
         events=len(down_events),

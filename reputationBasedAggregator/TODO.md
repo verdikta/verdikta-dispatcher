@@ -1113,7 +1113,8 @@ not frozen at round end.
 | New arbiter, or after a block | starts at **500**; the maximum is **1000** |
 | Any score | selection weight = `1000 + ((1000 − alpha) × quality + alpha × timeliness) / 1000`, so 1000–2000 |
 | Either score reaches **0** | **blocked** for 24 h × 2^(earlier blocks); that score restarts at 500 |
-| Third block | **banned** |
+| Third block | **banned** (permanent) |
+| 90 days with no block, counted from the end of the last block | one earlier block is **forgiven** (repeats every 90 clean days) |
 | A liveness (hash-chain) call unanswered past the deadline | **frozen** until it answers; no points either way (item 7) |
 
 `alpha` (per mille, owner-settable, default 500) weighs timeliness against quality, as in today's
@@ -1134,6 +1135,12 @@ keeper. Scores are clamped to 0–1000.
   failed rounds in quick succession block it.
 - **Banked credit is limited.** The cap means a cartel member at 1000 must deliver 25 reveals to earn
   back each failed round it causes.
+- **Offenses decay.** Without decay, three honest blocks spread over years would mean a ban. The
+  keeper can apply it lazily at the next block: forgiven = (now − lastBlockEnd) / 90 days. The cost
+  is that a cartel member that is blocked at most about once every 90 days is never banned (each
+  block still takes it out for 24–96 h). In a one-year run with a silent cartel attacking only when
+  it can win, 69% of its members were banned with decay and 84% without. Honest arbiters were not
+  banned either way (honest blocks ~0.01 per arbiter-year over two years).
 - **Weight can at most double**, so a fast or always-agreeing cartel gains little seat share. Race
   rank is never penalised.
 - **The −500 for a failed round is the balance point.** −1000 (block on the first failed round)
@@ -1200,8 +1207,6 @@ work in small rounds.
   rewards fake commits. Rerunning without it changed nothing material.
 
 ### Open
-- **Offense decay.** Offenses never decay, so three honest blocks over years mean a ban. Add a decay
-  (e.g. one offense forgiven per 90 clean days).
 - **Point values and cutoffs.** +20 / −50 / −200 / −500 and the 1.5 / 3 spread cutoffs were tuned on
   simulated normal noise (SD 3). Check them against real arbiter score distributions, especially
   heavy-tailed or bimodal tasks.
@@ -1222,6 +1227,7 @@ Depends on item 7 (freeze) and the late-reveal recording change. Keeper and aggr
 - Reproduce: `python3 scripts/reputation_sim.py --compare --presets mix-v2,mix-v2-rnd --days 60
   --attack-when win` (and `--attack-when always`, `--colluders 0` for the honest control). Point
   values: `--pt-gain`, `--pt-minor`, `--pt-major`, `--pt-fail`, `--pt-start`, `--pt-cap`; cutoffs:
-  `--close-z`, `--far-z`. `--rules v2` runs the averages-plus-alarms design.
+  `--close-z`, `--far-z`; decay: `--decay-days` (0 = never). `--rules v2` runs the
+  averages-plus-alarms design.
 - Colluders are fast only in attack rounds (`--col-speed attack`). Always-fastest overstated the
   cartel's seat share (A-cur mimic 54% → 18%).
