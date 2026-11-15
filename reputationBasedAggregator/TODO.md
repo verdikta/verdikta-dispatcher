@@ -1087,17 +1087,22 @@ T), so nothing depends on that.
   a commit last round) and some random arbiters. An arbiter that hasn't answered by the deadline is
   frozen. A frozen arbiter is excluded from selection until it answers, and its reputation is
   untouched. Frozen arbiters are not charged for missed work.
-- **Timeliness score.**
-  - Average: an EMA (rate 0.02) of commits arriving within 4 median-latency units. It feeds the
-    selection weight.
-  - Alarm: one silence CUSUM. +10 for a promoted arbiter that never revealed, +4 for a live arbiter
-    that never committed, −1 per commit. Blocks at 30. A miss counts only when it is unambiguous: a
-    timed-out round, or any round once late commits and reveals are recorded.
+- **Timeliness score.** Commits and commit speed never count. A commit can't be checked unless the
+  arbiter is promoted and reveals it, and a fake commit is easy, so any credit for commits (or for
+  committing fast) would reward fake ones. Timeliness is judged only on what promoted arbiters
+  deliver.
+  - Average: an EMA (rate 0.02) over promoted arbiters. 1 when the reveal arrived, 0 when it didn't.
+    It feeds the selection weight. Arbiters that committed but weren't promoted are not updated.
+  - Alarm: one silence CUSUM. +10 for a promoted arbiter that never revealed, −1 per delivered
+    reveal. Blocks at 30. A miss counts only when it is unambiguous: a timed-out round, or any
+    round once late reveals are recorded. A missing commit costs nothing by itself.
   - Sink rule: when a round fails because more live arbiters went silent than the slack allows
     (M − N at reveal, K − M at commit), each of them gets
     `min(30, 5 × log10(1 / P(≥ k misses of n | 1% honest miss rate)))`. Scaling by how unlikely the
     misses are stops small rounds (slack 1) from blocking honest arbiters for two coincident
     transients.
+    This is the only place a missing commit counts, and only when the missing commits sank the
+    round. It is what catches a cartel that blocks by never committing.
 - **Quality score.** For each scored reveal, `z = |score − median| / max(1.4826 × MAD, 3)`.
   - Average: an EMA of `z ≤ 1.5` (agreement). It feeds the selection weight.
   - Alarm: one CUSUM with increment `(min(z², 9) − 2) / 5 + (2.3 if z > 3 else −0.095)`. Blocks at 8.
@@ -1137,6 +1142,14 @@ Pass rates per round when the cartel attacks only when it can win (K=6 / K=8 / o
 
 For comparison, today's rules on the same mix: mimic seats 28%, and forcing passes 33% / 17% of bad
 work in small rounds.
+
+Timeliness basis (2026-11-15). The tables above used the earlier commit-based timeliness (−1 per
+commit, +4 per missing commit, on-time-commit average). Rerunning with the reveal-only rule
+(`--t-basis reveal --s-miss 0`, now the default) changed nothing material:
+- abstaining cartels are still blocked (89–96%, median 5–12 days), through the sink rule alone;
+- silent cartels are still blocked (96–100%);
+- honest blocks stay at ~0.1 per arbiter-year;
+- incompetent-arbiter removal, down-arbiter removal and pass rates are within run-to-run noise.
 
 ### Limits
 - **Score-manipulating cartels are invisible.** A cartel voting plausible scores just on the wrong

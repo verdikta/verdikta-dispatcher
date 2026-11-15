@@ -46,7 +46,13 @@ Reputation policies:
                           silences are under honest miss rates, so small rounds with a slack of 1 do
                           not block honest arbiters for two coincident transients)
              Selection weight is bounded (max/min ratio --w-ratio) and built from EMAs of
-             agreement and on-time commits. Race rank is never penalised.
+             agreement and delivered reveals. Race rank is never penalised.
+             Timeliness (--t-basis reveal, default) never scores commits or commit speed: a commit
+             is unverifiable unless the arbiter is promoted and reveals it, so rewarding commits
+             would reward fake ones. Only a promoted arbiter's delivered reveal earns credit (-1 on
+             the silence CUSUM, 1 into the average). A missing commit costs nothing by itself
+             (--s-miss 0); it counts only through the sink rule, when the round failed for lack of
+             commits.
 
 Liveness (--liveness freeze): every juror also gets a hash-chain call with its commit request,
 plus jurors that missed a commit last round (suspects) and --live-random random arbiters. Any
@@ -221,9 +227,16 @@ def build_parser():
     a("--noise-df", type=float, default=0.0, help="Student-t degrees of freedom for arbiter noise (0 = normal)")
     a("--sigma-floor", type=float, default=3.0, help="floor on the round's robust SD for z")
     a("--s-silent", type=float, default=10.0, help="silence CUSUM increment: promoted, no reveal, round timed out")
-    a("--s-miss", type=float, default=4.0, help="silence CUSUM increment: alive, no commit, round timed out")
+    a("--s-miss", type=float, default=0.0, help="silence CUSUM increment: alive, no commit, round timed out "
+                                              "(0: missing commits are judged only by the sink rule)")
     a("--s-b", type=float, default=1.0, help="silence CUSUM decrement per commit")
     a("--s-h", type=float, default=30.0)
+    a("--t-basis", choices=["reveal", "commit"], default="reveal",
+      help="v2 timeliness. reveal: only a promoted arbiter's delivered reveal earns credit; commits earn "
+           "nothing and commit speed is never scored (no incentive for fake commits). commit: earlier "
+           "rule, -1 per commit and an on-time-commit average")
+    a("--t-miss-ema", type=int, default=0, help="reveal basis: 1 = a live arbiter that never committed also "
+                                              "lowers the timeliness average")
     a("--max-offenses", type=int, default=3, help="v2: ban after this many blocks (durations double)")
     a("--ema", type=float, default=0.02)
     a("--agree-z", type=float, default=1.5)
@@ -733,11 +746,24 @@ def run(p):
                 tail = sum(math.comb(n_, x) * e_ ** x * (1 - e_) ** (n_ - x) for x in range(k_, n_ + 1))
                 sink_inc = min(p["s_sink"], p["sink_per_decade"] * -math.log10(max(tail, 1e-300)))
             for j, i in enumerate(jury):
-                if committed[j]:
-                    cs[i] = max(0.0, cs[i] - p["s_b"])
-                    ta[i] += p["ema"] * ((1.0 if clat[j] <= p["on_time"] else 0.0) - ta[i])
+                if p["t_basis"] == "commit":
+                    # earlier rule: every commit earns credit and commit speed feeds the average
+                    if committed[j]:
+                        cs[i] = max(0.0, cs[i] - p["s_b"])
+                        ta[i] += p["ema"] * ((1.0 if clat[j] <= p["on_time"] else 0.0) - ta[i])
+                    elif not frozen_end[j]:
+                        ta[i] += p["ema"] * (0.0 - ta[i])
                 elif not frozen_end[j]:
-                    ta[i] += p["ema"] * (0.0 - ta[i])
+                    # reveal basis: a commit by itself earns nothing (it is unverifiable unless the
+                    # arbiter is promoted and reveals it), and commit speed is never scored. Credit
+                    # only a promoted arbiter whose reveal arrived; debit promoted-silent and, when
+                    # --t-miss-ema, live arbiters that never committed.
+                    if promoted[j] and j in revealed_set:
+                        cs[i] = max(0.0, cs[i] - p["s_b"])
+                        ta[i] += p["ema"] * (1.0 - ta[i])
+                    elif (promoted[j] or (not committed[j] and p["t_miss_ema"])) and \
+                            (result != "complete" or p["late_window"]):
+                        ta[i] += p["ema"] * (0.0 - ta[i])
                 if frozen_end[j]:
                     continue
                 # Misses are unambiguous only when the arbiter had the whole timeout: in a timed-out
