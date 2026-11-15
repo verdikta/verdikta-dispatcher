@@ -54,6 +54,15 @@ Reputation policies:
              (--s-miss 0); it counts only through the sink rule, when the round failed for lack of
              commits.
 
+Simple rules (--rules simple, the default under policy v2): two integer scores, timeliness and quality,
+0..1000, start 500. Fixed points per event, the same for every K/M/N/P:
+  timeliness  promoted and revealed +20; promoted, no reveal, round still finished -200; failed to
+              deliver (no reveal when promoted, or no commit while live) in a round that then failed -500
+  quality     per scored reveal: z <= 1.5 +20, 1.5 < z <= 3 -50, z > 3 -200
+Nothing else counts. A score that reaches 0 blocks the arbiter (24 h x 2^offenses, ban at the 3rd)
+and restarts at 500. Weight = 1000 + ((1000 - alpha) x quality + alpha x timeliness) / 1000.
+--rules v2 keeps the averages-plus-CUSUM-alarms design described above.
+
 Liveness (--liveness freeze): every juror also gets a hash-chain call with its commit request,
 plus jurors that missed a commit last round (suspects) and --live-random random arbiters. Any
 called arbiter that has not answered by the end of the round is frozen (excluded from selection)
@@ -238,7 +247,21 @@ def build_parser():
     a("--t-miss-ema", type=int, default=0, help="reveal basis: 1 = a live arbiter that never committed also "
                                               "lowers the timeliness average")
     a("--max-offenses", type=int, default=3, help="v2: ban after this many blocks (durations double)")
-    a("--ema", type=float, default=0.02)
+    a("--ema", type=float, default=0.02, help="average update rate (0.02 = 20 per mille)")
+    a("--rules", choices=["simple", "v2"], default="simple",
+      help="simple: two integer scores 0..--pt-cap (timeliness, quality), fixed points per event, block "
+           "at 0. v2: averages for weight plus separate CUSUM alarms for blocking")
+    a("--pt-gain", type=int, default=20, help="simple: points for a delivered reveal / a close score")
+    a("--pt-minor", type=int, default=50, help="simple: points lost for an off score (close_z < z <= far_z)")
+    a("--pt-major", type=int, default=200, help="simple: points lost for a far score or a missed delivery")
+    a("--pt-fail", type=int, default=500, help="simple: points lost by each live arbiter that failed to deliver "
+                                              "in a round that then failed (timed out)")
+    a("--pt-start", type=int, default=500, help="simple: starting score, and the score after a block")
+    a("--pt-cap", type=int, default=1000)
+    a("--close-z", type=float, default=1.5)
+    a("--far-z", type=float, default=3.0)
+    a("--int-avg", type=int, default=1, help="1 = timeliness and quality averages are integers 0..1000, "
+                                           "updated in integer arithmetic as the keeper would; 0 = reals 0..1")
     a("--agree-z", type=float, default=1.5)
     a("--w-ratio", type=float, default=2.0, help="v2: max / min selection weight")
     return ap
@@ -357,7 +380,23 @@ def run(p):
     hlen = [0] * E; run_w = [0] * E; pQ = [0] * E; pT = [0] * E
     cq = [0.0] * E; cs = [0.0] * E    # v2 CUSUMs: quality (z^2), silence
     ce = [0.0] * E; cf = [0.0] * E    # v2 CUSUMs: extreme deviation, consumer-reported flips
-    qa = [0.5] * E; ta = [0.5] * E    # v2 EMAs
+    # v2 averages: integers 0..1000 (as stored on-chain) unless --int-avg 0
+    simple = v2 and p["rules"] == "simple"
+    if simple:
+        p["int_avg"] = 1                  # the two scores are the integers 0..pt_cap themselves
+    AVG_ONE = 1000 if p["int_avg"] else 1.0
+    qa = [(p["pt_start"] if simple else AVG_ONE // 2) if p["int_avg"] else 0.5] * E; ta = list(qa)
+    rate_pm = round(p["ema"] * 1000)
+
+    def ema(x, hit):
+        """One average update toward 1000 (hit) or 0 (miss). Integer form: move rate_pm / 1000 of the
+        way, rounded toward the target, so each update moves at least 1 and both ends are reachable
+        (truncation would stall at ~951 going up and ~49 going down)."""
+        if not p["int_avg"]:
+            return x + p["ema"] * ((1.0 if hit else 0.0) - x)
+        if hit:
+            return x + ((1000 - x) * rate_pm + 999) // 1000
+        return x - (x * rate_pm + 999) // 1000
     offenses = [0] * E
     suspects = set()
 
@@ -450,6 +489,11 @@ def run(p):
 
     def weight(i):
         if v2:
+            if p["int_avg"]:
+                # keeper form: alpha (per mille) weighs timeliness against quality, weight 1000..2000
+                # for the default --w-ratio 2
+                rep = ((1000 - p["alpha"]) * qa[i] + p["alpha"] * ta[i]) // 1000
+                return float(1000 + int((p["w_ratio"] - 1.0) * rep))
             rep = (1 - a_w) * qa[i] + a_w * ta[i]
             return 1.0 + (p["w_ratio"] - 1.0) * min(max(rep, 0.0), 1.0)
         ws = ((1000 - p["alpha"]) * Qs[i] + p["alpha"] * Ts[i]) // 1000
@@ -688,6 +732,15 @@ def run(p):
                 for j in scored:
                     i = jury[j]
                     z = abs(sc[j] - med) / sref
+                    if simple:
+                        # simple rules: close +gain, off -minor, far -major; score 0..cap; 0 = block
+                        pts = (p["pt_gain"] if z <= p["close_z"] else
+                               -p["pt_minor"] if z <= p["far_z"] else -p["pt_major"])
+                        qa[i] = min(p["pt_cap"], max(0, qa[i] + pts))
+                        if qa[i] == 0 and not banned[i]:
+                            v2_block(i, r, "quality")
+                            qa[i] = p["pt_start"]
+                        continue
                     dev = min(z * z, p["q_cap"]) - p["q_k"]
                     ext = p["e_a"] if z > p["e_tau"] else -p["e_b"]
                     if p["scoring"] == "two":
@@ -717,7 +770,7 @@ def run(p):
                             if flipped and decisive:
                                 step += p["f_decisive"]
                             cf[i] = max(0.0, cf[i] + step)
-                    qa[i] += p["ema"] * ((1.0 if z <= p["agree_z"] else 0.0) - qa[i])
+                    qa[i] = ema(qa[i], z <= p["agree_z"])
                     tests = (((cq, p["qm_h"], "quality"),) if p["scoring"] == "two" else
                              ((cq, p["q_h"], "quality"), (ce, p["e_h"], "extreme")))
                     for arr, h, why in tests + ((cf, p["f_h"], "flip"),):
@@ -746,13 +799,33 @@ def run(p):
                 tail = sum(math.comb(n_, x) * e_ ** x * (1 - e_) ** (n_ - x) for x in range(k_, n_ + 1))
                 sink_inc = min(p["s_sink"], p["sink_per_decade"] * -math.log10(max(tail, 1e-300)))
             for j, i in enumerate(jury):
+                if simple:
+                    # simple rules: a promoted arbiter's delivered reveal +gain; promoted but no reveal
+                    # -major; alive (liveness call answered) but no commit in a round that failed for
+                    # lack of commits -major. Nothing else (commits, speed, not promoted) counts.
+                    if frozen_end[j]:
+                        continue
+                    pts = 0
+                    if promoted[j] and j in revealed_set:
+                        pts = p["pt_gain"]
+                    elif promoted[j] and result == "reveal_to":
+                        pts = -p["pt_fail"]          # failed to deliver, and the round failed
+                    elif promoted[j] and p["late_window"]:
+                        pts = -p["pt_major"]         # failed to deliver, the round still finished
+                    elif not committed[j] and result == "commit_to":
+                        pts = -p["pt_fail"]
+                    ta[i] = min(p["pt_cap"], max(0, ta[i] + pts))
+                    if ta[i] == 0 and not banned[i]:
+                        v2_block(i, r, "silence")
+                        ta[i] = p["pt_start"]
+                    continue
                 if p["t_basis"] == "commit":
                     # earlier rule: every commit earns credit and commit speed feeds the average
                     if committed[j]:
                         cs[i] = max(0.0, cs[i] - p["s_b"])
-                        ta[i] += p["ema"] * ((1.0 if clat[j] <= p["on_time"] else 0.0) - ta[i])
+                        ta[i] = ema(ta[i], clat[j] <= p["on_time"])
                     elif not frozen_end[j]:
-                        ta[i] += p["ema"] * (0.0 - ta[i])
+                        ta[i] = ema(ta[i], False)
                 elif not frozen_end[j]:
                     # reveal basis: a commit by itself earns nothing (it is unverifiable unless the
                     # arbiter is promoted and reveals it), and commit speed is never scored. Credit
@@ -760,10 +833,10 @@ def run(p):
                     # --t-miss-ema, live arbiters that never committed.
                     if promoted[j] and j in revealed_set:
                         cs[i] = max(0.0, cs[i] - p["s_b"])
-                        ta[i] += p["ema"] * (1.0 - ta[i])
+                        ta[i] = ema(ta[i], True)
                     elif (promoted[j] or (not committed[j] and p["t_miss_ema"])) and \
                             (result != "complete" or p["late_window"]):
-                        ta[i] += p["ema"] * (0.0 - ta[i])
+                        ta[i] = ema(ta[i], False)
                 if frozen_end[j]:
                     continue
                 # Misses are unambiguous only when the arbiter had the whole timeout: in a timed-out

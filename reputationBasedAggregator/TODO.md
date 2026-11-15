@@ -1060,13 +1060,14 @@ round at 0.006 gwei.
 
 ---
 
-## 14. Reputation v2: two scores (timeliness, quality) plus the liveness freeze
+## 14. Reputation v2: two scores (timeliness, quality) with fixed points, plus the liveness freeze
 
-**Status:** design simulated (2026-11-14), not started in the contracts.
-**Scope:** `ReputationKeeper.sol` (scores, alarms, block durations, ban, selection weight) and
-`ReputationAggregator.sol` (record late commits and reveals, report each reveal's distance from the
-median, sink rule, optional random promotion). Builds on item 7 (freeze) and serves item 13.
-Simulator: `scripts/reputation_sim.py` (presets `mix-v2`, `mix-v2-rnd`).
+**Status:** design simulated (rules simplified 2026-11-15), not started in the contracts.
+**Scope:** `ReputationKeeper.sol` (two scores, points, blocks, ban, selection weight) and
+`ReputationAggregator.sol` (record late reveals, classify each reveal as close / off / far, report
+which live arbiters failed to deliver, optional random promotion). Builds on item 7 (freeze) and
+serves item 13. Simulator: `scripts/reputation_sim.py` (presets `mix-v2`, `mix-v2-rnd`; `--rules
+simple` is the default).
 
 ### Problem
 Today's rules are cumulative quality and timeliness points with mild, severe and worsening thresholds.
@@ -1078,78 +1079,100 @@ The simulator shows three weaknesses:
 - They are slow on incompetent arbiters, and they charge honest arbiters for losing the commit or
   reveal race.
 
-### Idea
-Everything uses only what the contracts see: commit and reveal times, and each reveal's score against
-the round's median. The contracts don't know how results are used (for example a bounty's threshold
-T), so nothing depends on that.
+The rules also have to be easy to explain. Operators (people and agents) are more likely to join,
+and anomalies are easier to understand, when the whole rule set fits in two short tables that don't
+change with K, M, N or P.
 
-- **Liveness (item 7, not a score).** Hash-chain/beacon calls go to every juror, plus suspects (missed
-  a commit last round) and some random arbiters. An arbiter that hasn't answered by the deadline is
-  frozen. A frozen arbiter is excluded from selection until it answers, and its reputation is
-  untouched. Frozen arbiters are not charged for missed work.
-- **Timeliness score.** Commits and commit speed never count. A commit can't be checked unless the
-  arbiter is promoted and reveals it, and a fake commit is easy, so any credit for commits (or for
-  committing fast) would reward fake ones. Timeliness is judged only on what promoted arbiters
-  deliver.
-  - Average: an EMA (rate 0.02) over promoted arbiters. 1 when the reveal arrived, 0 when it didn't.
-    It feeds the selection weight. Arbiters that committed but weren't promoted are not updated.
-  - Alarm: one silence CUSUM. +10 for a promoted arbiter that never revealed, −1 per delivered
-    reveal. Blocks at 30. A miss counts only when it is unambiguous: a timed-out round, or any
-    round once late reveals are recorded. A missing commit costs nothing by itself.
-  - Sink rule: when a round fails because more live arbiters went silent than the slack allows
-    (M − N at reveal, K − M at commit), each of them gets
-    `min(30, 5 × log10(1 / P(≥ k misses of n | 1% honest miss rate)))`. Scaling by how unlikely the
-    misses are stops small rounds (slack 1) from blocking honest arbiters for two coincident
-    transients.
-    This is the only place a missing commit counts, and only when the missing commits sank the
-    round. It is what catches a cartel that blocks by never committing.
-- **Quality score.** For each scored reveal, `z = |score − median| / max(1.4826 × MAD, 3)`.
-  - Average: an EMA of `z ≤ 1.5` (agreement). It feeds the selection weight.
-  - Alarm: one CUSUM with increment `(min(z², 9) − 2) / 5 + (2.3 if z > 3 else −0.095)`. Blocks at 8.
-    The first term catches persistent deviation (wrong or lazy model). The second catches rare large
-    deviations.
-- **Selection weight.** `1 + (ratio − 1) × rep`, where `rep` is the average of the two EMAs and the
-  ratio is 2. Weight can at most double, so a fast or always-agreeing cartel gains little seat share.
-  Race rank is never penalised.
-- **Blocks.** Either alarm blocks for 24 h × 2^offenses, and the alarm resets. Ban after 3 offenses.
-  Alarms are floored at 0, so a long good record buys no immunity.
+### Idea
+Each arbiter has two integer scores, **timeliness** and **quality**, from 0 to 1000. Fixed points per
+event, the same for every configuration. Everything uses only what the contracts see (deliveries and
+each reveal's distance from the round's median). The contracts don't know how results are used (for
+example a bounty's threshold T), so nothing depends on that.
+
+**Table 1: how scores change.** Only arbiters selected for the round are scored, and an arbiter
+frozen by the liveness check at round end is not scored.
+
+| Event in a round | Timeliness | Quality |
+|---|---|---|
+| Promoted, and its reveal arrived (even late) | **+20** | scored by distance, below |
+| … revealed score is **close** to the median (within 1.5 spreads) | | **+20** |
+| … revealed score is **off** (1.5–3 spreads) | | **−50** |
+| … revealed score is **far** (more than 3 spreads) | | **−200** |
+| Promoted, no reveal, round still finished | **−200** | |
+| **Round failed**, and this arbiter was one of the live arbiters that didn't deliver (no reveal when promoted, or no commit) | **−500** | |
+| Anything else: committing, speed, not being promoted, not being selected | 0 | 0 |
+
+A **spread** is `max(1.48 × MAD, 3 points)`, where MAD is the median absolute deviation of the
+round's counted scores. It adapts to how much honest arbiters disagree on a given task. "Live" means
+not frozen at round end.
+
+**Table 2: what the scores do.**
+
+| Score state | Effect |
+|---|---|
+| New arbiter, or after a block | starts at **500**; the maximum is **1000** |
+| Any score | selection weight = `1000 + ((1000 − alpha) × quality + alpha × timeliness) / 1000`, so 1000–2000 |
+| Either score reaches **0** | **blocked** for 24 h × 2^(earlier blocks); that score restarts at 500 |
+| Third block | **banned** |
+| A liveness (hash-chain) call unanswered past the deadline | **frozen** until it answers; no points either way (item 7) |
+
+`alpha` (per mille, owner-settable, default 500) weighs timeliness against quality, as in today's
+keeper. Scores are clamped to 0–1000.
+
+**Why these rules.**
+- **Commits never earn points.** A commit can't be checked unless the arbiter is promoted and reveals
+  it, and a fake commit is easy, so credit for committing (or for committing fast) would reward fake
+  ones. A missing commit costs points only when the round then failed for lack of commits, which is
+  the attack where a cartel blocks by never committing. A fake commit doesn't avoid that: if it is
+  promoted it must be revealed and scored.
+- **No round-size terms.** No rule mentions K, M, N, P, the slack, or a probability. An honest
+  arbiter nets on average about +18 timeliness and +10 quality per round it serves in, whatever the
+  configuration. In any finished round, at least half the counted reveals are close and gain points,
+  because at least half of them lie within one MAD of the median.
+- **Rare bad luck can't block a good arbiter.** An arbiter in good standing survives any single event,
+  including one honest coincidence that fails a small round (two transients in a K=6 round). Two
+  failed rounds in quick succession block it.
+- **Banked credit is limited.** The cap means a cartel member at 1000 must deliver 25 reveals to earn
+  back each failed round it causes.
+- **Weight can at most double**, so a fast or always-agreeing cartel gains little seat share. Race
+  rank is never penalised.
+- **The −500 for a failed round is the balance point.** −1000 (block on the first failed round)
+  blocks every silent and abstaining cartel, but honest blocks rise to 0.7–1.6 per arbiter-year,
+  because one coincidence in a K=6 round is enough. −200 (the same as an ordinary miss) leaves
+  abstaining cartels, and silent cartels that attack only when they can win, mostly unblocked
+  (4–31%).
+
+**Also part of the design.**
 - **Random promotion (optional, recommended).** Promote M commits drawn at random from those arriving
   within a commit window (2 units), instead of the first M. If fewer than M are on time, the earliest
   late commits fill. Answering early then earns nothing. This is the main protection small rounds have
   against forcing.
 - **Bonus.** Every round escrows a pool of B × P × fee. The cluster pays it to exactly P members. The
-  alternative band rule splits it evenly among counted reveals within z ≤ 1.5 of the median.
+  alternative band rule splits it evenly among the close reveals.
 
 ### Expected results (simulator, nominal mix, 60 days, 15% cartel, no consumer feedback)
-Nominal mix: 80% 6/5/4/3/3, 16% 8/6/5/4/4, 4% option A (50/38/27/17/17, R = 12). Single runs, so
+Nominal mix: 80% 6/5/4/3/3, 16% 8/6/5/4/4, 4% option A (50/38/27/17/17, R = 12). Each range covers
+the cartel strategies and both attack modes (only when it can win, and every chance). Single runs, so
 differences of a few points are noise.
 
-| | v2, first-M promotion | v2, random promotion |
+| | First-M promotion | Random promotion |
 |---|---|---|
-| Down arbiters removed before repair | 88–92%, ~0.8 h | 88–93%, ~0.8 h |
-| Biased / noisy / lazy model removed (all), median days | 6–13 / 3–10 / 0.6–1.9 | 6–17 / 3–8 / 0.7–1.9 |
-| Honest blocks per arbiter-year (all from silence, none from quality) | ~0.1 | ~0.1 |
+| Down arbiters removed before repair | 89–93%, ~0.8 h | 89–93%, ~0.8 h |
+| Biased / noisy / lazy model removed (all), median days | 6–12 / 5–8 / 0.9–2.6 | 6–14 / 3–7 / 0.8–2.0 |
+| Honest blocks per arbiter-year | 0.0–0.3 | 0.0–0.3 |
 | Mimic cartel: seats, cluster bonus, band bonus | 16%, 22%, 19% | 16%, 22%, 19% |
-| Silent / abstain cartels blocked | 91–100% | 89–100% |
-| Under-threshold blocking or forcing cartels removed | 0–2% | 0–7% |
+| Silent / abstain cartels blocked | 91–98%, median 5–12 d | 80–98%, median 11–27 d |
+| Under-threshold blocking or forcing cartels removed | 0% | 0% |
 
 Pass rates per round when the cartel attacks only when it can win (K=6 / K=8 / option A):
 
 | | First-M promotion | Random promotion |
 |---|---|---|
-| Good work passes, under-threshold blocking | 73% / 58% / 78% | 91% / 85% / 100% |
-| Bad work forced through | 4.0% / 1.4% / 0% | 0.6% / 0.7% / 0% |
+| Good work passes, under-threshold blocking | 78% / 57% / 88% | 92% / 88% / 100% |
+| Bad work forced through | 5.8% / 4.8% / 0% | 0.7% / 0% / 0% |
 
 For comparison, today's rules on the same mix: mimic seats 28%, and forcing passes 33% / 17% of bad
 work in small rounds.
-
-Timeliness basis (2026-11-15). The tables above used the earlier commit-based timeliness (−1 per
-commit, +4 per missing commit, on-time-commit average). Rerunning with the reveal-only rule
-(`--t-basis reveal --s-miss 0`, now the default) changed nothing material:
-- abstaining cartels are still blocked (89–96%, median 5–12 days), through the sink rule alone;
-- silent cartels are still blocked (96–100%);
-- honest blocks stay at ~0.1 per arbiter-year;
-- incompetent-arbiter removal, down-arbiter removal and pass rates are within run-to-run noise.
 
 ### Limits
 - **Score-manipulating cartels are invisible.** A cartel voting plausible scores just on the wrong
@@ -1162,24 +1185,43 @@ commit, +4 per missing commit, on-time-commit average). Rerunning with the revea
   BountyEscrow can track flips itself and exclude arbiters from its own juries only. The keeper stays
   application-agnostic.
 
+### Alternatives considered
+- **Averages plus alarms (`--rules v2`).** Each score was an average (0–1000, for weight) plus a
+  CUSUM alarm (for blocking). The quality alarm added `(min(z², 9) − 2) / 5 + (2.3 if z > 3 else
+  −0.095)` and blocked at 8. The silence alarm added +10 per promoted miss and −1 per delivered
+  reveal, and blocked at 30. A round-failure rule added up to 30, scaled by `5 × log10(1 / P(≥ k
+  misses of n))`, so that small rounds wouldn't block honest arbiters. It caught cartels that fail
+  rounds somewhat more often (96–100%) at a similar honest cost (0.1–0.5 blocks per arbiter-year).
+  But it needs four numbers per arbiter, fractional increments, a log10, and a slack (M − N, K − M)
+  that changes with the configuration. The simple rules keep the bounded score itself as the
+  detector. One state per dimension does both weighting and blocking, and the 0–1000 range makes the
+  surprise scaling unnecessary.
+- **Commit-based timeliness** (credit per commit, an on-time-commit average): dropped, because it
+  rewards fake commits. Rerunning without it changed nothing material.
+
 ### Open
-- **Offense decay.** Offenses never decay, so three honest silence blocks over years mean a ban. Add a
-  decay (e.g. one offense forgiven per 90 clean days).
+- **Offense decay.** Offenses never decay, so three honest blocks over years mean a ban. Add a decay
+  (e.g. one offense forgiven per 90 clean days).
+- **Point values and cutoffs.** +20 / −50 / −200 / −500 and the 1.5 / 3 spread cutoffs were tuned on
+  simulated normal noise (SD 3). Check them against real arbiter score distributions, especially
+  heavy-tailed or bimodal tasks.
 - **Biased models in small rounds** take 1–2 weeks to remove. A small-K median is a weak reference.
-  Consider weighting z by the round's N.
 - **Reconcile with item 7's details:** deadline D (~60 s), calls that exercise the AI pipeline, and
   self-service `requestHealthCall`. The simulator models a geometric unfreeze delay.
-- **Gas.** The quality CUSUM needs the median and MAD per round (sort N values), plus one SSTORE per
-  scored reveal. Check at N = 27. Recording late commits and reveals needs the aggregator to accept
-  `fulfill` after finalization for scoring only.
+- **Late reveals.** "Promoted, no reveal, round still finished" and scoring late reveals need the
+  aggregator to accept reveals after finalization until the reveal timeout, and a settlement step
+  (or lazy settlement at the arbiter's next selection) to charge promoted arbiters that never
+  revealed.
+- **Gas.** Median and MAD per round (sort N values) and one score update per scored reveal. Check at
+  N = 27.
 
 ### Why it's deferred
 Depends on item 7 (freeze) and the late-reveal recording change. Keeper and aggregator redeploy.
 
 ### Notes / related
 - Reproduce: `python3 scripts/reputation_sim.py --compare --presets mix-v2,mix-v2-rnd --days 60
-  --attack-when win` (and `--attack-when always`, `--colluders 0` for the honest control).
-  `--scoring three` runs the earlier separate quality and extreme alarms. Removal was slower (biased
-  8–22 d), with the same honest cost.
+  --attack-when win` (and `--attack-when always`, `--colluders 0` for the honest control). Point
+  values: `--pt-gain`, `--pt-minor`, `--pt-major`, `--pt-fail`, `--pt-start`, `--pt-cap`; cutoffs:
+  `--close-z`, `--far-z`. `--rules v2` runs the averages-plus-alarms design.
 - Colluders are fast only in attack rounds (`--col-speed attack`). Always-fastest overstated the
   cartel's seat share (A-cur mimic 54% → 18%).
