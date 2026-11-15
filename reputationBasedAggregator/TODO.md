@@ -316,6 +316,10 @@ work, so a short fixed deadline separates dead from slow fairly.
   - After restarting a node, the operator can call a self-service
     `requestHealthCall(oracle, jobId)` and pay the gas, so recovery does not depend on
     being picked at random. A restarted node may never process the old request.
+  - The node should make this call automatically whenever it is frozen and healthy again, and
+    the owner should be able to send calls to all frozen arbiters at once. Without that, a wide
+    outage can deadlock: with every arbiter frozen, requests revert, so no calls go out and
+    nobody unfreezes (see item 14, "Pool shortage").
 - **Use a separate `frozen` state, not `blocked`.** `blocked` carries a 24-hour lock,
   slashing and auto-unblock inside `updateScores`. A frozen arbiter's reputation is
   untouched.
@@ -1148,6 +1152,20 @@ keeper. Scores are clamped to 0–1000.
   because one coincidence in a K=6 round is enough. −200 (the same as an ordinary miss) leaves
   abstaining cartels, and silent cartels that attack only when they can win, mostly unblocked
   (4–31%).
+
+**Pool shortage.** When no arbiter is eligible (active, within the fee limit, in the requested
+class, and not frozen, blocked or banned), `selectOracles` reverts and the request fails. The most
+likely cause is a wide outage (an AI provider, a cloud region, Base), which freezes arbiters rather
+than blocking them, since frozen arbiters are not scored. A small class or fee band can also run dry
+while the overall pool is healthy. Rules:
+- **Blocked and banned arbiters are never admitted to fill a jury.** If a shortage reopened blocked
+  seats, a cartel could knock out honest arbiters to bring its own blocked members back.
+- **Recovery is self-service.** An arbiter unfreezes only by answering a hash-chain call, and those
+  calls go out with requests, so if every request reverts nobody unfreezes. The node calls
+  `requestHealthCall` (item 7) automatically whenever it is frozen and healthy again. The owner can
+  send health calls to all frozen arbiters at once after a wide outage.
+- **The keeper exposes the eligible count per class** (a view, optionally per fee limit), so
+  requesters such as BountyEscrow and monitoring can see a shortage before submitting.
 
 **Also part of the design.**
 - **Random promotion (optional, recommended).** Promote M commits drawn at random from those arriving
