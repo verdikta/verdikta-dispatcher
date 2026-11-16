@@ -56,8 +56,8 @@ Reputation policies:
 
 Simple rules (--rules simple, the default under policy v2): two integer scores, timeliness and quality,
 0..1000, start 500. Fixed points per event, the same for every K/M/N/P:
-  timeliness  promoted and revealed +20; promoted, no reveal, round still finished -200; failed to
-              deliver (no reveal when promoted, or no commit while live) in a round that then failed -500
+  timeliness  promoted and revealed +20; promoted, no reveal, round still finished -200; promoted,
+              no reveal, round failed -500; no commit while live, round failed for lack of commits -400
   quality     per scored reveal: z <= 1.5 +20, 1.5 < z <= 3 -50, z > 3 -200
 Nothing else counts. A score that reaches 0 blocks the arbiter (24 h x 2^offenses, ban at the 3rd)
 and restarts at 500. One offense is forgiven per 90 clean days (--decay-days); a ban is permanent. Weight = 1000 + ((1000 - alpha) x quality + alpha x timeliness) / 1000.
@@ -263,8 +263,10 @@ def build_parser():
     a("--pt-gain", type=int, default=20, help="simple: points for a delivered reveal / a close score")
     a("--pt-minor", type=int, default=50, help="simple: points lost for an off score (close_z < z <= far_z)")
     a("--pt-major", type=int, default=200, help="simple: points lost for a far score or a missed delivery")
-    a("--pt-fail", type=int, default=500, help="simple: points lost by each live arbiter that failed to deliver "
-                                              "in a round that then failed (timed out)")
+    a("--pt-fail", type=int, default=500, help="simple: points lost by each promoted live arbiter that never "
+                                              "revealed in a round that then failed (reveal timeout)")
+    a("--pt-nocommit", type=int, default=400, help="simple: points lost by a live arbiter that never "
+                                                   "committed in a round that failed for lack of commits")
     a("--pt-start", type=int, default=500, help="simple: starting score, and the score after a block")
     a("--pt-cap", type=int, default=1000)
     a("--close-z", type=float, default=1.5)
@@ -870,7 +872,7 @@ def run(p):
                     elif promoted[j] and p["late_window"]:
                         pts = -p["pt_major"]         # failed to deliver, the round still finished
                     elif not committed[j] and result == "commit_to":
-                        pts = -p["pt_fail"]
+                        pts = -p["pt_nocommit"]
                     ta[i] = min(p["pt_cap"], max(0, ta[i] + pts))
                     if ta[i] == 0 and not banned[i]:
                         v2_block(i, r, "silence")

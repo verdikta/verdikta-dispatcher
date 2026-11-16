@@ -1066,7 +1066,8 @@ round at 0.006 gwei.
 
 ## 14. Reputation v2: two scores (timeliness, quality) with fixed points, plus the liveness freeze
 
-**Status:** design simulated (rules simplified 2026-11-15), not started in the contracts.
+**Status:** design simulated (rules simplified 2026-11-15; no-commit penalty lowered to −400
+2026-11-16), not started in the contracts.
 **Scope:** `ReputationKeeper.sol` (two scores, points, blocks, ban, selection weight, stake burns,
 unbonding) and
 `ReputationAggregator.sol` (record late reveals, classify each reveal as close / off / far, report
@@ -1104,7 +1105,8 @@ frozen by the liveness check at round end is not scored.
 | … revealed score is **off** (1.5–3 spreads) | | **−50** |
 | … revealed score is **far** (more than 3 spreads) | | **−200** |
 | Promoted, no reveal, round still finished | **−200** | |
-| **Round failed**, and this arbiter was one of the live arbiters that didn't deliver (no reveal when promoted, or no commit) | **−500** | |
+| Promoted, no reveal, **round failed** | **−500** | |
+| Live, no commit, and the **round failed for lack of commits** | **−400** | |
 | Anything else: committing, speed, not being promoted, not being selected | 0 | 0 |
 
 A **spread** is `max(1.48 × MAD, 3 points)`, where MAD is the median absolute deviation of the
@@ -1133,6 +1135,11 @@ keeper. Scores are clamped to 0–1000.
   ones. A missing commit costs points only when the round then failed for lack of commits, which is
   the attack where a cartel blocks by never committing. A fake commit doesn't avoid that: if it is
   promoted it must be revealed and scored.
+- **Fake commits don't pay.** For a live arbiter that can't do the work in time in a K=6 / M=5
+  round, not committing costs about −23 expected (the round fails for lack of commits about 6% of
+  the time). A commit it can't reveal is promoted about 83% of the time and costs −200 in a round
+  that still finishes, about −165 expected. Faking would only pay at a no-commit penalty of about
+  −2,800.
 - **No round-size terms.** No rule mentions K, M, N, P, the slack, or a probability. An honest
   arbiter nets on average about +18 timeliness and +10 quality per round it serves in, whatever the
   configuration. In any finished round, at least half the counted reveals are close and gain points,
@@ -1141,7 +1148,7 @@ keeper. Scores are clamped to 0–1000.
   including one honest coincidence that fails a small round (two transients in a K=6 round). Two
   failed rounds in quick succession block it.
 - **Banked credit is limited.** The cap means a cartel member at 1000 must deliver 25 reveals to earn
-  back each failed round it causes.
+  back each failed round it causes by staying silent (20 if it caused it by not committing).
 - **Offenses decay.** Without decay, three honest blocks spread over years would mean a ban. The
   keeper can apply it lazily at the next block: forgiven = (now − lastBlockEnd) / 90 days. The cost
   is that a cartel member that is blocked at most about once every 90 days is never banned (each
@@ -1155,6 +1162,23 @@ keeper. Scores are clamped to 0–1000.
   because one coincidence in a K=6 round is enough. −200 (the same as an ordinary miss) leaves
   abstaining cartels, and silent cartels that attack only when they can win, mostly unblocked
   (4–31%).
+- **−400 for a missing commit is the smallest penalty that still works.** It is kept as small as
+  possible so that missing a commit costs less than staying silent after one. Sweep of the
+  no-commit penalty alone (the silent-reveal penalty stays −500), abstaining cartel, 60 days ×
+  4 seeds, first-M and random promotion:
+
+  | No-commit penalty | Abstaining cartel ever blocked | Blocked/banned at day 60 | Good work passes, K=6 |
+  |---|---|---|---|
+  | −500 | 88–93% | 37–48% | 80–81% |
+  | **−400** | **72–82%** | **18–32%** | **77–79%** |
+  | −300 | 39–67% | 2–12% | 74–77% |
+  | −200 | 12–20% | ~1% | 72–74% |
+  | 0 | 0% | 0% | 68–73% |
+
+  The penalty changes nothing measurable for honest arbiters (1–6 honest blocks per ~160
+  arbiter-years at every value, no trend), and the silent cartel is blocked 78–94% at every value.
+  Below −400 a cartel would switch to never committing, which then costs it little. With no
+  penalty, never committing is a free, undetectable way to block.
 
 **Stake and burns.** Every arbiter stakes `STAKE_REQUIREMENT` (100 VDKA) to register. Both burns
 start disabled and can be turned on by the owner once real block rates are known.
@@ -1214,7 +1238,8 @@ differences of a few points are noise.
 | Biased / noisy / lazy model removed (all), median days | 6–12 / 5–8 / 0.9–2.6 | 6–14 / 3–7 / 0.8–2.0 |
 | Honest blocks per arbiter-year | 0.0–0.3 | 0.0–0.3 |
 | Mimic cartel: seats, cluster bonus, band bonus | 16%, 22%, 19% | 16%, 22%, 19% |
-| Silent / abstain cartels blocked | 91–98%, median 5–12 d | 80–98%, median 11–27 d |
+| Silent cartels blocked | 98–100%, median 5–12 d | 80–96%, median 10–15 d |
+| Abstain cartels blocked (4 seeds) | 78%, median 13–14 d | 72–82%, median 13–14 d |
 | Under-threshold blocking or forcing cartels removed | 0% | 0% |
 
 Pass rates per round when the cartel attacks only when it can win (K=6 / K=8 / option A):
@@ -1222,6 +1247,7 @@ Pass rates per round when the cartel attacks only when it can win (K=6 / K=8 / o
 | | First-M promotion | Random promotion |
 |---|---|---|
 | Good work passes, under-threshold blocking | 78% / 57% / 88% | 92% / 88% / 100% |
+| Good work passes, abstain blocking | 77% / 89% / 100% | 81% / 89% / 100% |
 | Bad work forced through | 5.8% / 4.8% / 0% | 0.7% / 0% / 0% |
 
 For comparison, today's rules on the same mix: mimic seats 28%, and forcing passes 33% / 17% of bad
@@ -1310,9 +1336,9 @@ The honest rows come from 30-day runs × 4 seeds. For K=8, R = 4 gives the same 
   rewards fake commits. Rerunning without it changed nothing material.
 
 ### Open
-- **Point values and cutoffs.** +20 / −50 / −200 / −500 and the 1.5 / 3 spread cutoffs were tuned on
-  simulated normal noise (SD 3). Check them against real arbiter score distributions, especially
-  heavy-tailed or bimodal tasks.
+- **Point values and cutoffs.** +20 / −50 / −200 / −400 / −500 and the 1.5 / 3 spread cutoffs were
+  tuned on simulated normal noise (SD 3). Check them against real arbiter score distributions,
+  especially heavy-tailed or bimodal tasks.
 - **Biased models in small rounds** take 1–2 weeks to remove. A small-K median is a weak reference.
 - **Reconcile with item 7's details:** deadline D (~60 s), calls that exercise the AI pipeline, and
   self-service `requestHealthCall`. The simulator models a geometric unfreeze delay.
@@ -1329,8 +1355,8 @@ Depends on item 7 (freeze) and the late-reveal recording change. Keeper and aggr
 ### Notes / related
 - Reproduce: `python3 scripts/reputation_sim.py --compare --presets mix-v2,mix-v2-rnd --days 60
   --attack-when win` (and `--attack-when always`, `--colluders 0` for the honest control). Point
-  values: `--pt-gain`, `--pt-minor`, `--pt-major`, `--pt-fail`, `--pt-start`, `--pt-cap`; cutoffs:
-  `--close-z`, `--far-z`; decay: `--decay-days` (0 = never). `--rules v2` runs the
+  values: `--pt-gain`, `--pt-minor`, `--pt-major`, `--pt-fail`, `--pt-nocommit`, `--pt-start`,
+  `--pt-cap`; cutoffs: `--close-z`, `--far-z`; decay: `--decay-days` (0 = never). `--rules v2` runs the
   averages-plus-alarms design.
 - Colluding hunter: `python3 scripts/reputation_sim.py --preset mix-v2-rnd --days 2 --hunter-per-day 24
   --hunter-class 6/5/4/3/3/1 --attack-when always` prints the timeline and every hunter submission.
