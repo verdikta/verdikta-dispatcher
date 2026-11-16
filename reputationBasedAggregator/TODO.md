@@ -1227,6 +1227,63 @@ Pass rates per round when the cartel attacks only when it can win (K=6 / K=8 / o
 For comparison, today's rules on the same mix: mimic seats 28%, and forcing passes 33% / 17% of bad
 work in small rounds.
 
+### Colluding hunter, and the choice of R (2026-11-16)
+**Setup.** 300 arbiters, 45 colluding (15%), simple rules, nominal background workload. One hunter
+submits bad work (true 80, T = 90) once an hour for 2 days (about 48 submissions) to one bounty class.
+The cartel votes exactly 90 on the hunter's submissions only, and behaves honestly everywhere else. It
+either forces every time ("always") or only when it has enough seats to win ("win"). 40 seeds per case.
+Break-even bounty: the bounty at which wins just pay for the round fees ($5.15 / $6.67 / $31.29 per
+submission for K=6 / K=8 / option A) and the bonds lost on hard fails.
+
+**Results with R = 1, random promotion (per 2-day run):**
+
+| Class | Cartel | Passes | Soft fails (bond kept) | Hard fails | Break-even bounty, $25 / $250 bond | Cartel blocked after 2 days |
+|---|---|---|---|---|---|---|
+| K=6 | always | 0.45 | 24 | 24 | $1.9K / $13.7K | 0.3% |
+| K=6 | win | 0.15 | 1 | 47 | $9.5K / $80K | 0.2% |
+| K=8 | always | 0.25 | 29 | 18 | $3.1K / $19K | 0.1% |
+| K=8 | win | 0 | 2 | 45 | never wins | 0.1% |
+| Option A | always | 0 | 0 | 47 | never wins (0 in ~1,900 tries) | 24% |
+| Option A | win | 0 | 0 | 49 | never wins | 0.1% |
+
+- **The attack loses money.** Break-even is more than 10× the maximum bounties sized for these
+  classes ($159 / $1.1K for K=6, $314 / $1.8K for K=8 at $25 / $250 bonds).
+- **First-M promotion makes it much cheaper.** Under first-M the hunter wins 2.4 (K=6) and 1.2–1.6
+  (K=8) times per run, and break-even falls to about $0.3K / $2.0K (K=6) and $0.5K / $2.8K (K=8).
+  This is the main reason to adopt random promotion.
+- **Reputation reacts quickly only in option A.** Every forced 90 lands far from an honest median of
+  about 80 (−200 quality). The cartel's mean quality fell from 500 to 344 while honest arbiters rose
+  to 628, and 13–24% of colluders were blocked by the end of day 2. In small rounds each colluder
+  sits in about one hunter round in 2 days, and with 4 counted votes its own 90 moves the median, so
+  almost none are blocked.
+- **Damage to honest arbiters is negligible.** 1–8 honest reveals per run were scored far in the
+  hunter's rounds, and 0.02–0.12% of honest arbiters were blocked.
+
+**Raising R in the small classes was tested and rejected; R = 1 stays.** With R = 1, one colluder
+voting 90 turns the hunter's hard fail into a soft fail, so the bond is kept. That is why "always"
+shows about 24 soft fails.
+
+| Random promotion | R = 1 | R = 2 | R = 3 |
+|---|---|---|---|
+| K=6, colluding hunter (always): break-even, $25 / $250 bond | $1.9K / $13.7K | $2.9K / $24K | $3.2K / $27K |
+| K=8, colluding hunter (always): break-even, $25 / $250 bond | $3.1K / $19K | $5.0K / $39K | $5.8K / $47K |
+| K=6, honest good work, bond lost: no cartel | 0.00% | 0.22% | 1.4% |
+| K=6, honest good work, bond lost: low-vote blockers (win / always) | 0.5% / 0.7% | 4.5% / 5.3% | 7.0% / 26% |
+| K=8, honest good work, bond lost: no cartel | 0.00% | 0.00% | 0.00% |
+| K=8, honest good work, bond lost: low-vote blockers (win / always) | 0.0% / 0.4% | 1.1% / 2.6% | 7.3% / 10% |
+
+The honest rows come from 30-day runs × 4 seeds. For K=8, R = 4 gives the same break-even as R = 3.
+
+- **R never changes the number of wins.** It only removes the bond protection the cartel gives when
+  it forces every time. When the cartel forces only when it can win, R barely matters: its votes are
+  honest in the other rounds, so those are hard fails anyway.
+- **A higher R gives the blocking cartel a new weapon.** Colluders voting just under T already block
+  good work. With a higher R they also make honest hunters forfeit their bonds: about 1 in 20 good
+  submissions at K=6, R = 2. That moves the cost from the cheating hunter onto honest ones.
+- **The gain isn't needed.** Under random promotion the R = 1 break-even is already more than 10× the
+  sized maximum bounty. Under first-M, R = 2 only roughly doubles break-even, with honest bond losses
+  of 6.3% at K=6.
+
 ### Limits
 - **Score-manipulating cartels are invisible.** A cartel voting plausible scores just on the wrong
   side of T can't be told apart from honest variation without knowing T. The configuration has to
@@ -1275,5 +1332,8 @@ Depends on item 7 (freeze) and the late-reveal recording change. Keeper and aggr
   values: `--pt-gain`, `--pt-minor`, `--pt-major`, `--pt-fail`, `--pt-start`, `--pt-cap`; cutoffs:
   `--close-z`, `--far-z`; decay: `--decay-days` (0 = never). `--rules v2` runs the
   averages-plus-alarms design.
+- Colluding hunter: `python3 scripts/reputation_sim.py --preset mix-v2-rnd --days 2 --hunter-per-day 24
+  --hunter-class 6/5/4/3/3/1 --attack-when always` prints the timeline and every hunter submission.
+  Change R through `--mix` (e.g. `6/5/4/3/3/2:80,...`).
 - Colluders are fast only in attack rounds (`--col-speed attack`). Always-fastest overstated the
   cartel's seat share (A-cur mimic 54% → 18%).

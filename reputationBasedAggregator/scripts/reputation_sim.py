@@ -247,6 +247,13 @@ def build_parser():
     a("--t-miss-ema", type=int, default=0, help="reveal basis: 1 = a live arbiter that never committed also "
                                               "lowers the timeliness average")
     a("--max-offenses", type=int, default=3, help="v2: ban after this many blocks (durations double)")
+    a("--hunter-per-day", type=float, default=0.0,
+      help="colluding-hunter mode: submissions per day by one hunter working with the cartel. Each is bad "
+           "work the cartel tries to force through (subject to --attack-when); on every other task the "
+           "cartel behaves honestly (mimic)")
+    a("--hunter-class", default=None, help="round class for the hunter's bounties, e.g. 6/5/4/3/3/1 "
+                                           "(default: drawn from the mix)")
+    a("--snap-hours", type=float, default=6.0, help="hunter mode: timeline snapshot interval")
     a("--decay-days", type=float, default=90.0, help="v2: forgive one offense per this many clean days "
                                                    "(no block) since the last block ended; 0 = never")
     a("--ema", type=float, default=0.02, help="average update rate (0.02 = 20 per mille)")
@@ -401,6 +408,12 @@ def run(p):
         return x - (x * rate_pm + 999) // 1000
     offenses = [0] * E
     clean_from = [0] * E; forgiven = [0]
+    hunt = p["hunter_per_day"] > 0
+    hunter_cls = None
+    if hunt and p["hunter_class"]:
+        hunter_cls = next(c for c in classes if c["name"].startswith(p["hunter_class"]))
+    h_trace = []; h_far = {"honest": 0, "colluder": 0, "honest_scored": 0}; snaps = []
+    snap_every = max(1, int(round(p["snap_hours"] / 24.0 * rpd)))
     suspects = set()
 
     # ---- metrics ----
@@ -544,7 +557,22 @@ def run(p):
         # ---- round class ----
         if not elig:
             continue
-        cls = classes[0] if len(classes) == 1 else rng.choices(classes, weights=cw)[0]
+        if hunt and r % snap_every == 0:
+            def st(ids):
+                n = len(ids) or 1
+                return dict(active=sum(1 for i in ids if not (frozen[i] or is_blocked(i, r))) / n,
+                            frozen=sum(1 for i in ids if frozen[i] and not banned[i]) / n,
+                            blocked=sum(1 for i in ids if is_blocked(i, r) and not banned[i]) / n,
+                            banned=sum(1 for i in ids if banned[i]) / n,
+                            quality=sum(qa[i] for i in ids) / n, timeliness=sum(ta[i] for i in ids) / n)
+            snaps.append(dict(hour=r / rpd * 24, colluder=st([i for i in range(E) if types[i] == COL]),
+                              honest=st(hon_ids), passes=sum(1 for h in h_trace if h["outcome"] == "pass_"),
+                              attempts=len(h_trace)))
+        h_round = hunt and rng.random() < p["hunter_per_day"] / rpd
+        if h_round and hunter_cls is not None:
+            cls = hunter_cls
+        else:
+            cls = classes[0] if len(classes) == 1 else rng.choices(classes, weights=cw)[0]
         K, M, N, P, Qq, Rr = cls["K"], cls["M"], cls["N"], cls["P"], cls["Q"], cls["R"]
         cs_ = cm[cls["name"]]
         cs_["rounds"] += 1
@@ -571,7 +599,9 @@ def run(p):
 
         # ---- task and cartel action ----
         u = rng.random()
-        if u < p["good_frac"]:
+        if h_round:
+            kind, tv = "bad", p["bad_true"]
+        elif u < p["good_frac"]:
             kind, tv = "good", p["good_true"]
         elif u < p["good_frac"] + p["bad_frac"]:
             kind, tv = "bad", p["bad_true"]
@@ -597,6 +627,10 @@ def run(p):
             if p["attack_when"] == "always" or (rnd and lever == "silent") or \
                     (exp_prom if lever == "low" else c_jury) >= need[lever]:
                 act = "block"
+        elif hunt:
+            # one colluding hunter: the cartel forces only the hunter's submissions
+            if h_round and (p["attack_when"] == "always" or exp_prom >= need["force"]):
+                act = "force"
         elif p["strategy"] == "force" and kind == "bad" and rng.random() < p["attack_frac"]:
             if p["attack_when"] == "always" or exp_prom >= need["force"]:
                 act = "force"
@@ -705,6 +739,12 @@ def run(p):
                 cs_["band"][jt[j]] += P / len(inband)
             npass = sum(1 for j in cidx if sc[j] >= T)
             oc = "pass_" if npass >= Qq else ("soft" if npass >= Rr else "hard")
+        if h_round:
+            h_trace.append(dict(hour=r / rpd * 24, cls=cls["name"], seated=c_jury,
+                                promoted=sum(1 for j in range(K) if promoted[j] and is_col[j]),
+                                counted=sum(1 for j in range(K) if counted[j] and is_col[j]),
+                                act=act, result=result, outcome=oc,
+                                pass_votes=(sum(1 for j in cidx if sc[j] >= T) if result == "complete" else None)))
         if kind != "general":
             for d in ((good, cs_["good"]) if kind == "good" else (bad, cs_["bad"])):
                 d["n"] += 1
@@ -743,6 +783,12 @@ def run(p):
                 for j in scored:
                     i = jury[j]
                     z = abs(sc[j] - med) / sref
+                    if h_round and types[i] in (HON, COL):
+                        tn = "honest" if types[i] == HON else "colluder"
+                        if tn == "honest":
+                            h_far["honest_scored"] += 1
+                        if z > p["far_z"]:
+                            h_far[tn] += 1
                     if simple:
                         # simple rules: close +gain, off -minor, far -major; score 0..cap; 0 = block
                         pts = (p["pt_gain"] if z <= p["close_z"] else
@@ -952,6 +998,11 @@ def run(p):
         reasons[key] = reasons.get(key, 0) + 1
     out["block_reasons"] = reasons
     out["offenses_forgiven"] = forgiven[0]
+    if hunt:
+        out["hunter"] = dict(trace=h_trace, snapshots=snaps, far=h_far,
+                             attempts=len(h_trace), forced=sum(1 for h in h_trace if h["act"] == "force"),
+                             outcomes={k: sum(1 for h in h_trace if h["outcome"] == k)
+                                       for k in ("pass_", "soft", "hard", "nores")})
     det = [e["removed"] - e["start"] for e in down_events if e["removed"] is not None]
     out["down"] = dict(
         events=len(down_events),
@@ -973,6 +1024,27 @@ def fmt(x, nd=2, pct=False):
     if x is None:
         return "-"
     return f"{100 * x:.{nd}f}%" if pct else f"{x:.{nd}f}"
+
+
+def print_hunter(o):
+    h = o["hunter"]
+    oc = h["outcomes"]
+    print(f"\n colluding hunter: {h['attempts']} submissions of bad work, cartel forced {h['forced']}; "
+          f"passed {oc['pass_']}, soft fail {oc['soft']}, hard fail {oc['hard']}, no result {oc['nores']}")
+    print(f" in the hunter's rounds: honest reveals scored far {h['far']['honest']} of {h['far']['honest_scored']}, "
+          f"colluder reveals scored far {h['far']['colluder']}")
+    print("\n  hour | colluders active/frozen/blocked/banned  mean Q / T | honest active  blocked  mean Q / T "
+          "| hunter tries / passes")
+    for sn in h["snapshots"]:
+        c, hn = sn["colluder"], sn["honest"]
+        print(f"  {sn['hour']:4.0f} | {c['active']:6.0%} {c['frozen']:6.0%} {c['blocked']:6.0%} {c['banned']:6.0%}"
+              f"   {c['quality']:5.0f} / {c['timeliness']:4.0f} | {hn['active']:6.0%}  {hn['blocked']:6.1%}  "
+              f"{hn['quality']:5.0f} / {hn['timeliness']:4.0f} | {sn['attempts']:4d} / {sn['passes']}")
+    print("\n  hunter submissions (hour, class, colluders seated/promoted/counted, cartel action, result, "
+          "votes >= T, outcome):")
+    for t in h["trace"]:
+        print(f"   {t['hour']:5.1f}h {t['cls']:<17} {t['seated']:2d}/{t['promoted']:2d}/{t['counted']:2d}  "
+              f"{t['act']:<6} {t['result']:<9} {'' if t['pass_votes'] is None else t['pass_votes']:>3}  {t['outcome']}")
 
 
 def print_one(o):
@@ -1042,6 +1114,8 @@ def main():
     else:
         o = run(resolve(args))
         print_one(o)
+        if "hunter" in o:
+            print_hunter(o)
         results.append(o)
     if args.json:
         with open(args.json, "w") as f:
