@@ -31,7 +31,23 @@ async function getContract(name, signer) {
   }
 }
 
+// Suites that read contracts from a hardhat-deploy deployment (keeper.test.js,
+// aggregator.test.js; e.g. test.sh runs them with --network base_sepolia) have nothing
+// to read on the in-process hardhat network. Call from a before() hook as
+// `await skipUnlessDeployed(this, "ReputationKeeper")`: it skips the suite there
+// instead of failing the hook, and changes nothing on a network that has the deployment.
+async function skipUnlessDeployed(mochaContext, ...names) {
+  const { deployments } = require("hardhat");
+  for (const name of names) {
+    if (!(await deployments.getOrNull(name))) {
+      console.log(`    skipped: no ${name} deployment on network "${network.name}"`);
+      mochaContext.skip();
+    }
+  }
+}
+
 module.exports = {
-  getContract
+  getContract,
+  skipUnlessDeployed
 };
 
