@@ -458,10 +458,10 @@ flags still override it).
 #               --to-block 53472663 --chunk 50000 --out noise-data.json
 #           node scripts/arbiter-noise.js analyze --data noise-data.json --nominal 80 --threshold 90
 #       The raw data file is not committed; collecting again over the same blocks reproduces it.
-#   N5. Not yet measured, still assumptions: latency and no-show parameters (E), eligible pool
-#       size and weights (D), X / Y / Z, the builder parameters, and selection_check_gas /
-#       beacon_gas. Use scripts/arbiter-stats.js (collect + analyze --params-out) for the race and
-#       pool values.
+#   N5. Not yet measured, still assumptions: honest_no_show_prob and the colluder latencies (E),
+#       eligible pool size and weights (D), X / Y / Z, the builder parameters, and
+#       selection_check_gas / beacon_gas. Honest latency is measured (N7). Use
+#       scripts/arbiter-stats.js (collect + analyze --params-out) for the race and pool values.
 #   N6. Economics (eth_usd, oracle_fee_eth, gas_price_gwei, request_gas), read 2026-11-03 from the
 #       same aggregator over the same blocks (N1):
 #         - The base fee charged is the ARBITER'S REGISTERED fee (ReputationKeeper.getOracleInfo
@@ -477,6 +477,32 @@ flags still override it).
 #       So one attempt costs the submitter about 6 x $0.046 base + 2 x $0.137 bonus + $0.046 gas
 #       = $0.59. Re-submission bounds scale linearly with this. Update these four values when a
 #       minimum payment is introduced, or when fees or the ETH price move.
+#   N7. Latency (honest_commit_median_s, honest_reveal_median_s, honest_latency_sigma), measured
+#       2026-11-17 from the same aggregator (N1), blocks 47043694 .. 58740507: 862 rounds,
+#       2026-06-09 .. 2026-11-15, all 6/4/3 in general classes 128/131, two operator nodes holding
+#       97% of the slots. The defaults are the October-November values (375 completed rounds), the
+#       current state of the network:
+#         - commit (request -> CommitReceived): lognormal median 68 s, sigma 0.49 (mean 76 s,
+#           SD 39 s); Kaplan-Meier median 66 s, p90 116 s. Over all rounds since June: median
+#           81 s, sigma 0.54.
+#         - reveal (reveal dispatch -> reveal): lognormal median 15 s, sigma 0.53; KM median 14 s,
+#           p90 30 s. Over all rounds: median 22 s, sigma 0.75. The fastest reveals take 4-8 s,
+#           which is the node-and-chain path with no inference.
+#       Censoring: the aggregator rejects responses once a round is complete, so a slot that had
+#       not answered by then is censored at the round's end; the fits are censored-lognormal MLE
+#       over completed rounds. Commit-timeout rounds are left out: they are outages (one node
+#       down in a few episodes) or requests no node took (every commit timeout since October had
+#       no commit at all), not slow answers. Those data can't separate a no-show from a late
+#       commit, so honest_no_show_prob stays an assumption.
+#       The colluder latencies (3 s) remain the assumption that a cartel skips inference and runs
+#       a faster path than the stock node; the fastest honest reveals (4-8 s) show such a path is
+#       plausible.
+#       Only the Monte Carlo race (E1-E4, L3) uses these values; the exact config search (L'5)
+#       uses honest_no_show_prob only. Reproduce (read-only, about 15 minutes):
+#           HARDHAT_NETWORK=base node scripts/arbiter-stats.js collect \
+#               --aggregator 0xd8F38bCBEE43bE3bd31655a563f20c9B3e67142a --from-block 47043694 \
+#               --out arbiter-data.json
+#           python3 scripts/latency_replay.py arbiter-data.json --since 2026-10
 # =====================================================================================
 
 from __future__ import annotations
@@ -553,12 +579,12 @@ class Params:
     selection_check_gas: int = 400_000    # in-tx selection recompute by a wrapper (0 if simulated off-chain)
     beacon_gas: int = 250_000
 
-    # ---------------- Latency ----------------
-    honest_commit_median_s: float = 30.0
-    honest_reveal_median_s: float = 6.0
-    honest_latency_sigma: float = 0.6
-    honest_no_show_prob: float = 0.05
-    colluder_commit_median_s: float = 3.0
+    # ---------------- Latency (honest values MEASURED on Base mainnet, see N7) ----------------
+    honest_commit_median_s: float = 68.0  # MEASURED: lognormal median, Oct-Nov 2026 (N7)
+    honest_reveal_median_s: float = 15.0  # MEASURED: lognormal median, Oct-Nov 2026 (N7)
+    honest_latency_sigma: float = 0.5     # MEASURED: commit 0.49, reveal 0.53 (N7); one value for both
+    honest_no_show_prob: float = 0.05     # assumption (N5, N7)
+    colluder_commit_median_s: float = 3.0  # assumption: no inference, custom fast path (N7)
     colluder_reveal_median_s: float = 3.0
     colluder_latency_sigma: float = 0.3
     honest_provider_median_s: float = 4.0

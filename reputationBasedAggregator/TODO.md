@@ -964,13 +964,12 @@ round at 0.006 gwei.
       from 60 uniformly shortlisted arbiters, so the keeper's reputation weights can favour
       better arbiters. The margin also leaves room for a later K up to 60 (option D, 60/46/33)
       without another shortlist change.
-  - **The model must be re-run at 60.** Option A's figures assume a uniform jury: each colluder is
-    picked as often as an honest arbiter. At 60 a cartel that farms reputation (for example by
-    collecting the bonus as described below) gets more than its 15% share of jury slots, and
-    honest arbiters with high scores get more too. Add the selection weighting to the risk model:
-    a 60-arbiter uniform shortlist, then 50 picks by score without replacement. Re-check the
-    targets for the colluder weights the reputation design allows. The reputation-management
-    discussion has to bound how far a colluder's weight can rise above an honest arbiter's.
+  - **Re-run at 60 under item 14's rules (2026-11-17): the uniform-jury assumption holds.**
+    Option A's figures assume each colluder is picked as often as an honest arbiter. Item 14
+    bounds selection weight to 1×–2×, and a mimicking cartel earns the same scores as honest
+    arbiters, so with a 60-arbiter shortlist it holds 16% of jury seats against its 15% share
+    (20, 60 and 120 all give 15.7–15.9%; see item 14, "Shortlist size"). The targets stand. Under
+    today's rules the concern was real: mimic seats reached 28% on the nominal mix.
   - `shortlistSize` is global to the keeper, so this also needs its own keeper or a per-request
     shortlist size.
   - The draw must revert, or BountyEscrow must refuse the start, when fewer than K arbiters are
@@ -1049,7 +1048,8 @@ round at 0.006 gwei.
     route.
   - How reputation weights selection from the 60-arbiter shortlist. In particular, how far a
     colluder's selection weight can rise above an honest arbiter's (this sets the colluder share
-    used in the model).
+    used in the model). **Answered by item 14:** weight is at most 2×, and a mimicking cartel
+    gets 16% of seats at a 15% share.
   - Which clustering rule and P to adopt.
 
 ### Notes / related
@@ -1325,10 +1325,12 @@ M. Commits after promotion are only logged, as today.
   one of 50 jurors is almost always slow or absent, so every round would wait for T+. A smaller M+
   brings back some of the race: a fast cartel is always among the first M+ commits, so it is
   promoted with probability M / M+ instead of M / K.
-- **T+ = mean + 2 SDs of honest commit latency.** Latency is right-skewed, so in the simulator's model
-  this is about 3.5 median latencies (mean 1.36, SD 1.06) and admits about 96% of honest commits. A
-  2-unit window admits 85%. On-chain T+ is in seconds, set from measured latencies, and well below
-  `responseTimeoutSeconds`.
+- **T+ = mean + 2 SDs of honest commit latency.** On mainnet in October–November 2026 that is about
+  **155 s** (mean 76 s, SD 39 s; 97% of commits arrive by then), against the 300 s
+  `responseTimeoutSeconds`; over all rounds since June it is 201 s (see "Real latency" below). In the
+  simulator's model it is about 3.5 median latencies (mean 1.36, SD 1.06), admitting about 96% of
+  honest commits where a 2-unit window admits 85%. Real latency is tighter: mean + 2 SDs is 2.3–2.5
+  median latencies, because the simulator adds 10% arbiters three times slower.
 - **Why it beats a fixed window.** Plain random promotion always waits the whole window. With M+ / T+ a
   round that is complete early promotes early, so T+ can be generous, which is fairer to slower
   honest arbiters, without most rounds waiting for it.
@@ -1374,6 +1376,110 @@ Below it the race comes back quickly.
   from the commit hashes either: the last committer chooses its salt and could grind it. Use item 6
   (arbiter hash chains) or item 9 (a later block hash).
 - **Reputation is unchanged.** Not being promoted earns 0, as in Table 1.
+- **Gas (estimates from the code, not measured).** The M reveal dispatches are the same as today
+  and dominate. Commits between M and M+ are now stored and counted (about 25k each, paid by the
+  committing arbiter): one more for K=6 and K=8, six for option A. The draw of M from at most K
+  commits in memory is under ~50k at K=50. `promote` moves the dispatch that today runs in the M-th
+  commit's `fulfill` into its own transaction (+~21k). The entropy source (item 6 or 9) is the
+  open cost.
+- **It limits a grief.** Today a cartel member can send the M-th commit with too little gas: the
+  `fulfill` reverts, the commit is lost and the round stalls until timeout (item 13). Under M+ / T+
+  a failed M+-th commit only delays promotion to T+, when anyone can call `promote`.
+- **Clustering is unchanged.** Promotion picks which M arbiters reveal; the first N reveals are
+  still counted, and clustering picks P of them. The reveal race remains: a promoted colluder
+  reveals at once and is always counted, and the slowest promoted reveals are dropped (1 of 5 at
+  K=6, 11 of 38 in option A). Counting N at random among the reveals received by a deadline would
+  remove it; not yet simulated. The mimic cartel's cluster bonus share (21–22%, fair 15%) is the
+  same under every promotion rule; it comes from cluster seeding (items 10 and 13).
+
+### Real latency (Base mainnet, 2026-11-17)
+**Data.** Every round of the mainnet aggregator `0xd8F38bCB…` from its deployment to the scan:
+862 rounds, 2026-06-09 to 2026-11-15, all on the deployed 6/4/3 configuration with a 300 s timeout, all
+in general classes 128/131 (none in the code classes 133/134). Five operator nodes served them, but two
+nodes (`0x860e…`, `0xeC9b…`, each running many jobs) held 97% of the selected slots, so this is
+mostly two machines. The aggregator rejects commits and reveals once a round is complete, so a slot
+that hadn't answered by then is censored at the round's end. The latencies below are Kaplan–Meier
+estimates and a lognormal fitted with censoring, over completed rounds only.
+
+**Commit latency** (request to commit):
+
+| | Median | p90 | p95 | Mean / SD (lognormal) | Mean + 2 SD | Arrived by then |
+|---|---|---|---|---|---|---|
+| All completed rounds (776) | 76 s | 172 s | 196 s | 93 s / 54 s (σ 0.54) | 201 s | 96% |
+| October–November (375) | 66 s | 116 s | 138 s | 76 s / 39 s (σ 0.49) | 155 s | 97% |
+
+- **The two main nodes are alike** (October–November medians 66 s and 66 s, means 74 s and 78 s). The
+  three small nodes had medians of 58 s, 136 s and 154 s, on 69, 13 and 24 slots.
+- **Latency has improved over time.** Monthly medians: June 120 s, July 78 s, August 148 s, September
+  92 s, October 66 s, November 86 s.
+- **Reveal latency** (promotion to reveal): median 22 s, p90 54 s over all rounds; 14 s and 30 s in
+  October–November.
+- **Today's rounds** (first-M, all completed): promoted at a median of 78 s (p90 160 s), finished at
+  a median of 104 s (p90 204 s). October–November: 68 s and 86 s (p90 110 s and 130 s).
+- **The race favours whichever node is faster.** Over October–November, `0x860e…` held 49% of the
+  selected slots but 55% of the promoted ones; by week the gap was 4–9 points, and in one week it
+  ran the other way. This is honest nodes only. Random draws among the commits remove it.
+
+**Outages, not latency, cause failed rounds.** 79 of 862 rounds (9.2%) timed out in the commit
+phase and 7 in the reveal phase. 24 commit timeouts had no commit at all, which looks like requests
+no node could process rather than slow nodes. The other 55 cluster in a few episodes (late June,
+July 29 to August 1), when one node stopped committing (`0x860e…` missed 146 of its 184 slots in
+those rounds). Item 7's freeze is aimed at exactly this. October–November had 6 commit timeouts
+(1.6%), all with no commits.
+
+**Replay of M+ / T+ on these rounds.** Promotion under the rule is min(t(M+), max(T+, t(M))) over
+each round's commit times. Commits after promotion are logged until the round ends, and a commit
+that never came before the end is imputed from its node's fitted distribution (50 draws per round).
+The reveal phase is the round's own. Finish times, October–November:
+
+| | First-M: median / p90 | M+ / T+, T+ = 120 s | T+ = 155 s (mean + 2 SD) | T+ = 180 s |
+|---|---|---|---|---|
+| Deployed 6/4 (M+ = 5) | 86 s / 130 s | 91 s / 136 s | 92 s / 140 s | 91 s / 140 s |
+| 6/5 (M+ = 6) | 88 s / 136 s | 98 s / 140 s | 98 s / 164 s | 98 s / 165 s |
+
+Over all rounds since June, at T+ = 201 s: 6/4 goes from 104 s / 204 s to 112 s / 212 s; 6/5 from
+106 s / 208 s to 124 s / 220 s.
+- **The rule costs about 5–10 s at the median** in October–November (up to 18 s over all rounds).
+  Real nodes answer close together, so the M+-th commit usually arrives soon after the M-th. The slow
+  tail costs more at 6/5, where M+ = K needs every juror: up to about 30 s at p90.
+- **T+ hardly matters between 120 s and 180 s.** Most rounds promote on M+ commits before T+.
+- The simulator's estimate (about +1 median latency at T+ = 3.5) overstated the cost because its
+  latency model has a heavier slow tail than the real nodes.
+
+**Limits of this data.** Two nodes, general classes, a 6/4/3 configuration. Code-class requests (long
+code-runner jobs) and a larger, more varied pool will have other latencies, and the K = 8 and option A
+classes can't be replayed from 6-slot rounds. Re-measure before setting T+ for those, and make T+
+owner-settable per class.
+
+**The risk script now uses these values.** `selection_randomness_risk.py` defaults to the
+October–November medians (commit 68 s, reveal 15 s, σ 0.5; provenance in its section N7), replacing
+the assumed 30 s and 6 s. Its results don't change beyond Monte Carlo noise: on two seeds the L1
+re-submit pass rate moved 1.56% → 1.39% and 1.40% → 1.55%. Colluders are modelled answering in
+about 3 s, so they win the race against honest arbiters at either latency. The exact config search
+behind items 12 and 13 doesn't use latency.
+
+### Shortlist size (2026-11-17)
+The keeper draws a uniform shortlist from the eligible arbiters, then K weighted picks without
+replacement (`ReputationKeeper.sol` ~500–585); the simulator does the same with Table 2's weights.
+M+ / T+ promotion, 15% cartel attacking only when it can win, 60 days × 3 seeds:
+
+| Shortlist | Mimic cartel seats | Bad models' seats | Biased model: selections before block | Bad work forced through | Good work passes, silent cartel |
+|---|---|---|---|---|---|
+| 20 (K=6 and K=8 classes only) | 15.7% | 2.1% | 34 | 0.65% | 84.6% |
+| 60 (K=6 and K=8 classes only) | 15.9% | 2.2% | 40 | 0.30% | 84.8% |
+| 120 (K=6 and K=8 classes only) | 15.9% | 2.1% | 32 | 0.40% | 84.0% |
+| 60, nominal mix | 15.9% | 1.5% | 30 | 0.23% | 83.5% |
+| 120, nominal mix | 15.9% | 1.4% | 27 | 0.23% | 84.4% |
+
+(20 can't run option A: K = 50 must fit the shortlist.)
+
+- **Shortlist size makes no material difference.** Weight spans only 1×–2×, and a mimicking cartel
+  scores like honest arbiters, so a larger shortlist gives reputation more room to act on almost no
+  difference. Bad arbiters are removed by blocking, not by selection weight.
+- **Keep 60.** Option A needs at least 50 plus margin (item 13). Larger only costs gas: one
+  selection-score read per shortlisted arbiter, very roughly 5–10k each (about +0.3M per request
+  from 20 to 60; not measured), still below the full registry scan (item 2). `shortlistSize` is
+  global to the keeper, so the small classes pay for 60 too unless it becomes per-class.
 
 ### Limits
 - **Score-manipulating cartels are invisible.** A cartel voting plausible scores just on the wrong
@@ -1413,8 +1519,9 @@ Below it the race comes back quickly.
   revealed.
 - **Gas.** Median and MAD per round (sort N values) and one score update per scored reveal. Check at
   N = 27.
-- **T+ from real latencies.** Measure honest commit latency per class and set T+ to its mean plus two
-  SDs. The simulator's latency model (lognormal, 10% slow arbiters at 3×) is a guess.
+- **T+ for other classes.** Measured for the general classes on two nodes (about 155 s, "Real
+  latency"). Code classes and a larger pool still need measuring, and T+ should be owner-settable per
+  class.
 
 ### Why it's deferred
 Depends on item 7 (freeze) and the late-reveal recording change. Keeper and aggregator redeploy.
@@ -1428,6 +1535,10 @@ Depends on item 7 (freeze) and the late-reveal recording change. Keeper and aggr
 - Colluding hunter: `python3 scripts/reputation_sim.py --preset mix-v2-rnd --days 2 --hunter-per-day 24
   --hunter-class 6/5/4/3/3/1 --attack-when always` prints the timeline and every hunter submission.
   Change R through `--mix` (e.g. `6/5/4/3/3/2:80,...`).
+- Real latency: `HARDHAT_NETWORK=base node scripts/arbiter-stats.js collect --aggregator
+  0xd8F38bCBEE43bE3bd31655a563f20c9B3e67142a --from-block 47043694 --out arbiter-data.json` (read-only,
+  about 15 min), then `python3 scripts/latency_replay.py arbiter-data.json --replay-m 4,5` (add
+  `--since 2026-10` for October–November).
 - Promotion rule: preset `mix-v2-hyb` (`--commit-select hybrid --commit-window 3.5`; T+ is
   `--commit-window`, M+ defaults to halfway, `--m-plus-slack s` sets M+ = K − s). Compare with
   `--compare --presets mix-v2,mix-v2-rnd,mix-v2-hyb --days 60 --attack-when win`, seeds 1–4.
