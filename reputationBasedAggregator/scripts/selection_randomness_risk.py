@@ -40,7 +40,7 @@ ATTACK LEVERS
     L2  Selection steering: choose a seed that polls colluders and/or lenient honest arbiters.
           S1 (current code): seed = keccak(entropyBuf, prevrandao, timestamp, selectionCounter, k).
               On Base these are all known before inclusion (prevrandao = L1-origin RANDAO,
-              timestamp = parent + 2s, the rest public storage), so a submitter can predict the
+              timestamp in whole seconds, the rest public storage), so a submitter can predict the
               draw and wait for a good one. A builder can re-roll it (delay, reorder, perturb
               blockhash, which feeds rollingEntropy).
           S2 (hash-chain beacon): the 4 providers are picked with S1 randomness; the first
@@ -235,10 +235,13 @@ flags still override it).
 #
 # G. SCENARIO S1: CURRENT CODE
 #   G1. On Base (OP stack) every seed input is known before inclusion: prevrandao = the
-#       L1-origin RANDAO, timestamp = parent + block_time_s, and entropyBuf / selectionCounter
-#       are public storage. The shortlist seed (RK line ~504) uses only timestamp + prevrandao.
-#   G2. Submitter: one fresh independent seed per block (~1 per block_time_s). It waits
-#       through T draws (submitter_grind_options) and submits the best. It may verify in-tx
+#       L1-origin RANDAO, timestamp in whole seconds, and entropyBuf / selectionCounter are
+#       public storage. The shortlist seed (RK line ~504) uses only timestamp + prevrandao.
+#       Since Base's 0.2 s blocks (N8) about 5 consecutive blocks share a timestamp and about
+#       60 share prevrandao, so the seed changes about once a second, not every block.
+#   G2. Submitter: one fresh independent seed per draw opportunity (about one a second, N8). It
+#       waits through T draws (submitter_grind_options) and submits the best. Only the count
+#       of draws matters to the model, not how long they take. It may verify in-tx
 #       with a wrapper costing selection_check_gas per draw (conservative; simulating off-chain
 #       costs nothing). Waiting time has no cost.
 #   G3. Builder: builder_grind_options independent seeds per manipulated block (delaying,
@@ -503,6 +506,22 @@ flags still override it).
 #               --aggregator 0xd8F38bCBEE43bE3bd31655a563f20c9B3e67142a --from-block 47043694 \
 #               --out arbiter-data.json
 #           python3 scripts/latency_replay.py arbiter-data.json --since 2026-10
+#   N8. Chain timing, read 2026-11-17 from Base mainnet:
+#         - Base switched from 2 s to 0.2 s blocks near block 53,556,261 (2026-11-05 18:00 UTC).
+#           block_time_s = 0.2. The N1 and N6 windows (to block 53,472,663) were on 2 s blocks.
+#         - block.timestamp stays in whole seconds, so about 5 consecutive blocks share it, and
+#           prevrandao (the L1-origin RANDAO) is shared by every block on one L1 origin (L1
+#           blocks are 12 s, so about 60 L2 blocks).
+#         - BLOCKHASH covers 256 blocks, now 51 s. The EIP-2935 history contract
+#           (0x0000F90827F1C53a10cb7A02335B175320002935) is deployed and returned the correct
+#           hash for blocks up to 8,000 back (8,191 is its window, about 27 min).
+#         - beacon_timeout_blocks = 600 keeps the earlier 120 s (60 blocks at 2 s). It is
+#           longer than the BLOCKHASH window, so a beacon design with that deadline must read
+#           older hashes through EIP-2935.
+#         - honest_provider_median_s = 15 is a PROXY, not a measurement of hash-chain calls
+#           (none exist yet). A beacon reply takes the same path as a reveal (node job, no
+#           inference, fulfill tx), and reveals measured a 15 s median, sigma 0.53, with the
+#           fastest at 4-8 s (N7). The earlier 4 s was an assumption.
 # =====================================================================================
 
 from __future__ import annotations
@@ -557,11 +576,11 @@ class Params:
     beacon_providers: int = 4
     beacon_fee_multiplier: float = 1.0
     beacon_seed_uses_response_block: bool = True  # False = entropy fixed at the request block
-    beacon_timeout_blocks: int = 60
+    beacon_timeout_blocks: int = 600      # 120 s at 0.2 s blocks; beyond 256 blocks it needs EIP-2935 (N8)
     beacon_quorum: int = 2                # S4: the seed uses the first q of beacon_providers values
 
     # ---------------- Chain / builder ----------------
-    block_time_s: float = 2.0
+    block_time_s: float = 0.2             # MEASURED: Base mainnet since block ~53,556,261, 2026-11-05 (N8)
     single_sequencer: bool = True         # Base: one bribe covers every block involved
     builder_grind_options: int = 256      # seeds a colluding builder can try
     builder_max_hold_s: float = 20.0      # how long it holds a fulfill tx without looking suspicious
@@ -587,7 +606,7 @@ class Params:
     colluder_commit_median_s: float = 3.0  # assumption: no inference, custom fast path (N7)
     colluder_reveal_median_s: float = 3.0
     colluder_latency_sigma: float = 0.3
-    honest_provider_median_s: float = 4.0
+    honest_provider_median_s: float = 15.0  # PROXY: measured reveal latency, the same node path (N7, N8)
     honest_provider_sigma: float = 0.5
     honest_provider_no_show_prob: float = 0.05
 

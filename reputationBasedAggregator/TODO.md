@@ -213,7 +213,9 @@ no-show.
 ### Problem
 Every input to `selectOracles` is known before the request is sent: `entropyBuf` and
 `selectionCounter` are public, `block.timestamp` is predictable, and on Base `PREVRANDAO`
-comes from the L1 origin block. The first stage (the 20-arbiter shortlist, see
+comes from the L1 origin block. Since Base moved to 0.2 s blocks (2026-11-05), about 60
+consecutive blocks share one `PREVRANDAO` and about 5 share one `block.timestamp` (whole seconds),
+so the seed changes about once a second. The first stage (the 20-arbiter shortlist, see
 `selectOracles`) uses only `block.timestamp` and `block.prevrandao`. So a requester can
 simulate selection locally and time the request so that colluding arbiters are selected
 (with P = 2, two colluders that agree form the winning cluster). Arbiter-supplied entropy
@@ -242,9 +244,11 @@ after the request is fixed, using values revealed from those chains.
 - **Trigger robustness.** Do the draw and dispatch in a gas-capped try/catch self-call so
   the beacon's reply always records even if the draw fails. Add a permissionless
   `startCommitPhase(aggId)` as the fallback (for an out-of-gas trigger, or a beacon
-  deadline that passed with no replies). Set the beacon deadline inside the 256-block
-  `blockhash` window (~8.5 min on Base); if it passes, fail and refund the round rather
-  than falling back to a later block's hash, which would let the caller choose timing.
+  deadline that passed with no replies). Read `blockhash(requestBlock)` through the EIP-2935
+  history contract, whose window is 8,191 blocks (about 27 min at 0.2 s blocks); the
+  `BLOCKHASH` opcode's 256 blocks are now only 51 s. Set the beacon deadline inside that window
+  (for example 120 s); if it passes, fail and refund the round rather than falling back to a
+  later block's hash, which would let the caller choose timing.
 - **Who pays.** The draw costs roughly what the request costs today (~3.1M gas, growing
   with the registry; see item 2). Reimburse whoever triggers from the requester's prepay:
   - Add a fixed, owner-set `triggerGasReserveWei` to `maxTotalFee`. It must be fixed,
@@ -279,6 +283,22 @@ redeploy of both contracts.
   chains, but on-chain verification costs more gas and BLS depends on precompile support
   on Base.
 - The hash-chain call is the same request as item 7's liveness test; build them together.
+- **Base block timing (checked 2026-11-17).**
+  - Base mainnet has made 0.2 s blocks since block ~53,556,261 (2026-11-05 18:00 UTC). The
+    EIP-2935 history contract (`0x0000F90827F1C53a10cb7A02335B175320002935`) is live and returned
+    the correct hash for blocks up to 8,000 back.
+  - Beacon reply time is not measured yet (no hash-chain calls exist). A reply takes the same
+    path as a reveal (node job, no inference, fulfill transaction), and mainnet reveals take a
+    median of 15 s (p90 30 s, fastest 4–8 s; item 14, "Real latency"). That fits a 120 s deadline
+    with room, but not by much inside 51 s during an outage, so use EIP-2935.
+  - **Risk model rerun** (`selection_randomness_risk.py`, 0.2 s blocks, planning defaults, $0.50
+    base fee). As written here, with `blockhash(requestBlock)`, the limit is about **$23**, the same
+    as on 2 s blocks: a submitter working with a colluding beacon knows its next value, so it
+    predicts the seed and grinds the request. Seeding from the reply's block instead
+    (`beacon_seed_uses_response_block`) falls from about $120 to about **$7**, because a
+    colluding beacon gets one re-roll per block until the first honest reply lands: about 2
+    blocks before, about 75 now. Both are far below item 9's ~$400, which is why item 9 replaces
+    this item.
 
 ---
 
@@ -445,12 +465,15 @@ simulates the draw for each coming block and submits only when it polls two coll
 Two colluders that report the same score are always the closest pair, so they decide the round.
 Waiting costs nothing, so raising the fee barely helps. `scripts/selection_randomness_risk.py`
 at its planning defaults (300 eligible arbiters, 3% colluders, SD 3) with a $0.50 base fee puts
-the most value one decision should carry at **$4.57**. A 10× higher fee raises that only 2.8×.
+the most value one decision should carry at **~$4.50** ($4.32–4.69 across seeds, rerun 2026-11-17).
+A 10× higher fee raises that only 2.8×.
 
 Item 6's first-responder beacon stops the requester from predicting the draw, but adds a
 colluding beacon that can. It knows its own next value, and `blockhash(requestBlock)` is public
-once the request is mined, so it answers only when its draw is good. In the model that limit is
-about $200 to $270.
+once the request is mined, so it answers only when its draw is good. In the model (rerun
+2026-11-17) the limit is about $23: a submitter working with a colluding beacon predicts the seed
+and grinds it. Seeding from the reply's block instead gives about $7 on Base's 0.2 s blocks (item 6,
+"Base block timing").
 
 ### Idea
 Split each request into two transactions in different blocks. The requester is committed before
@@ -460,13 +483,19 @@ the randomness exists.
   cannot cancel the round.
 - **Seed.** `seed = keccak256(aggId, blockhash(B+1))`. Nobody knows it when B's transaction is
   signed. Use B+1, not B: the requester's own transaction is in B, and Flashblocks show most of
-  B's contents before it closes. Do not use `prevrandao` or `timestamp`. On Base, the next
-  block's `prevrandao` is usually the same L1-origin value, and its timestamp is parent + 2 s.
+  B's contents before it closes. Do not use `prevrandao` or `timestamp`. On Base (0.2 s blocks
+  since 2026-11-05) about 60 consecutive blocks share one `prevrandao`, the L1-origin value, and
+  about 5 share one `timestamp`, which is in whole seconds.
 - **Enforcement.** `blockhash` returns 0 for the current and future blocks, so the draw must
   require `blockhash(B+1) != 0`, which means `block.number >= B+2`. No wrapper contract, bundle
   or batch can do both steps in one block.
+- **Read the hash through EIP-2935.** The `BLOCKHASH` opcode covers 256 blocks, which at 0.2 s
+  blocks is 51 s: less than a hunter takes to click "Start evaluation". Base has the EIP-2935
+  history contract (`0x0000F90827F1C53a10cb7A02335B175320002935`, checked 2026-11-17), which
+  returns hashes 8,191 blocks back, about 27 min. Read `blockhash(B+1)` with the opcode when it is
+  within 256 blocks and from the history contract otherwise.
 - **Seal.** Permissionless `sealSeed(aggId)` stores `blockhash(B+1)` (~30k gas) while it is
-  still within the 256-block window. The draw seals first if needed. Once sealed, the window no
+  still within the history window. The draw seals first if needed. Once sealed, the window no
   longer matters.
 - **Draw.** Permissionless `drawJury(aggId)` from block B+2 on. It must be a pure function of
   the seed and of state as of block B, so who draws, and when, cannot change the result:
@@ -484,8 +513,8 @@ the randomness exists.
   reimbursement.
   - `maxTotalFee = eff * (K + B*P + 2)`, which is 14 × `eff` with the default 6/3/2.
   - For the first **30 s** after the commit (by `block.timestamp`, not a block count; Base
-    Sepolia blocks are 0.2 s), only the requester's draw earns the reward, credited back to the
-    requester. After that, whoever draws is credited the reward in `ethOwed`. Anyone may draw
+    blocks are 0.2 s, on mainnet since 2026-11-05, so 30 s is about 150 blocks), only the
+    requester's draw earns the reward, credited back to the requester. After that, whoever draws is credited the reward in `ethOwed`. Anyone may draw
     earlier without the reward; the result is the same.
   - For now the hunter draws (bounty site, agent skill). Keepers, Chainlink Automation or
     market bots can take over later with no contract change.
@@ -493,17 +522,20 @@ the randomness exists.
   requester who abandons a bad draw leaves the prepay locked, and anyone can draw it after 30 s
   for the reward, so abandoning buys no re-roll. An honest requester whose client died loses
   nothing.
-- **The one exception.** If nobody sealed the seed within 256 blocks, the round can never be
-  drawn. A permissionless cancel then sends the prepay to the treasury. It must not refund the
+- **The one exception.** If nobody sealed or drew the round within the history window (8,191
+  blocks, about 27 min), the round can never be drawn. A permissionless cancel then sends the prepay to the treasury. It must not refund the
   requester: a refund would be a free re-roll.
 
 ### Expected payoff
 At the risk model's defaults (300 eligible arbiters, 3% colluders, SD 3) with a $0.50 base fee:
-- Requester prediction is gone. The limit becomes the blind re-submit bound, **~$428** (the
-  ideal-RNG row), up from $4.57. At today's $0.05 fee: $1.61 → ~$42.
+- Requester prediction is gone. The limit becomes the blind re-submit bound, **~$400** (the
+  ideal-RNG row; $374–420 across seeds), up from ~$4.50. At today's $0.046 fee: $1.51 → ~$37.
 - A bribed sequencer can still grind `blockhash(B+1)` by reordering or including transactions.
-  The builder rows are ~$1,100 to $1,200, above the re-submit bound, so the sequencer does not
+  The builder rows are ~$1,150 to $1,200, above the re-submit bound, so the sequencer does not
   bind at these parameters.
+- **Rerun 2026-11-17** with Base's 0.2 s blocks and the measured latencies: these figures are
+  unchanged beyond Monte Carlo noise. The design never counts blocks except for the hash window,
+  and it uses the timestamp for the 30 s reward window.
 
 ### Why it's deferred
 It adds a new round stage to the aggregator, checkpointed keeper state, a selection rewrite and a
@@ -531,10 +563,12 @@ updates for the second transaction.
   needs a different liveness call.
 - **Item 8.** With a fee floor, size the reward on the amount the escrow uses,
   `max(effMaxFee, minFee)`. Change the `maxTotalFee` signature once if both land together.
-- **EIP-2935**, if Base has it, makes 8,191 past block hashes readable, which largely removes
-  the need for the seal.
-- **Risk model.** Add an explicit two-phase scenario to `scripts/selection_randomness_risk.py`
-  (sequencer can grind B+1), so the table shows this design directly.
+- **EIP-2935 is live on Base** (checked 2026-11-17). Its 8,191-block window is about 27 min at
+  0.2 s blocks. Without it the 256-block `BLOCKHASH` window (51 s) would make the seal a race the
+  hunter's site could easily lose, and a lost seal sends the prepay to the treasury.
+- **Risk model.** `scripts/selection_randomness_risk.py` models this design as scenario S3
+  (the sequencer can grind B+1). Its block timing (`block_time_s` = 0.2) and chain facts are in its
+  section N8.
 
 ---
 
