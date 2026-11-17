@@ -976,7 +976,8 @@ round at 0.006 gwei.
   - Rounds per submission: a cap of 3 needs K ≥ 58.
   - Beacons: with no beacons the smallest feasible K is 45. Colluding beacons give the cartel a
     choice of seeds, which costs more in blocking than the beacons save against the sequencer.
-    Revisit whether to keep them.
+    Revisit whether to keep them. But without them a bribed sequencer chooses among ~256 seeds,
+    and option A's sequencer limit falls from $162K to about $25K (item 15).
 - **Margin.** For more margin over the sequencer, the alternative is 60/46/33 Q = 20 R = 16. It
   costs $17.46 per round at P = 2, $0.25. Its blocked pass is 77.0%, never-paid while blocked
   is 0.63%, and the sequencer limit is $641K. With Q = 21 the sequencer limit is $3.0M.
@@ -1309,8 +1310,10 @@ submission for K=6 / K=8 / option A) and the bonds lost on hard fails.
 | Option A | always | 0 | 0 | 47 | never wins (0 in ~1,900 tries) | 24% |
 | Option A | win | 0 | 0 | 49 | never wins | 0.1% |
 
-- **The attack loses money.** Break-even is more than 10× the maximum bounties sized for these
-  classes ($159 / $1.1K for K=6, $314 / $1.8K for K=8 at $25 / $250 bonds).
+- **The attack loses money.** Break-even is well above the class limits in item 15. At Small's
+  settings ($0.78 per round, $5 bond) the "always" and "win" rows break even at about $350 and
+  $1.8K, against Small's ~$100. At Medium's ($5.10 per round, $50 bond) "always" breaks even at
+  about $4.6K, against Medium's ~$1K. (Passes, hard fails and 48 submissions from the table.)
 - **First-M promotion makes it much cheaper.** Under first-M the hunter wins 2.4 (K=6) and 1.2–1.6
   (K=8) times per run, and break-even falls to about $0.3K / $2.0K (K=6) and $0.5K / $2.8K (K=8).
   This is the main reason to adopt random promotion.
@@ -1578,3 +1581,119 @@ Depends on item 7 (freeze) and the late-reveal recording change. Keeper and aggr
   `--compare --presets mix-v2,mix-v2-rnd,mix-v2-hyb --days 60 --attack-when win`, seeds 1–4.
 - Colluders are fast only in attack rounds (`--col-speed attack`). Always-fastest overstated the
   cartel's seat share (A-cur mimic 54% → 18%).
+
+---
+
+## 15. Bounty classes: jury, fee and bond for each bounty size
+
+**Status:** sized in the model (2026-11-17). Not started.
+**Scope:** class presets for BountyEscrow (jury config, Q, R, fee floor, bond), the bounty site, the
+agent skill and the docs. Depends on items 8 (fee floor), 9 (two-phase request), 11 and 12 (Q-of-N
+with re-runs), and item 14's M+ / T+ promotion; Jumbo also on items 6 and 13.
+
+### Classes
+| Class | Jury K/M/N | Q / R | Fee per arbiter | Bonus | Bond | Cost per round | Offered up to | Model: colluders always promoted / random promotion | Binding limit | Good work while a cartel blocks: pass per round / never paid |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Bondless Small | 6/5/4 | 3 / 1 | $0.046 (today's) | B = 3, P = 3 | $0 | $0.78 | **$15** | $17 / $28 | repeated submissions | 65% / 1.0–1.5% |
+| Small | 6/5/4 | 3 / 1 | $0.046 | B = 3, P = 3 | $5 | $0.78 | **~$100** | $56 / $99 | repeated submissions | 65% / 1.0–1.5% |
+| Medium | 8/6/5 | 4 / 2 | $0.25 | B = 3, P = 4 | $50 | $5.10 | **~$1K** | $1,013 / $1,013 | the sequencer | 55–64% / 1.6–5.8% |
+| Large | 26/21/16 | 11 / 6 | $0.25 | B = 3, P = 11 | $100 | $14.98 | **$10K** | $11.0K / $11.0K | the sequencer | 62% / 0.8–0.9% |
+| Jumbo | 50/38/27 | 17 / 12 | $0.25 | B = 3, P = 17 (P = 2 until clustering is decided) | $250 | $26.14 with beacons | **$100K** | item 13: sequencer $162K, repeated submissions $857K | the sequencer, with beacons | 73% / 0.61% (item 13) |
+
+- **"Offered up to"** is the bounty a class is sold for. Small's ~$100 relies on item 14's random
+  promotion; if colluders always won promotion it would be $56. The other classes hold under either
+  assumption.
+- **"Binding limit."** A bounty is safe while it is below both the repeated-submission limit (a
+  forcing hunter re-submitting until it passes) and the sequencer limit (a $1,000 bribe for a choice
+  of seeds). The figures are break-evens with no safety margin.
+- **Small and Medium are capped near $1K by the sequencer.** With 6–8 jurors a bribed sequencer
+  nearly always finds a seed that seats enough colluders. Beyond about $1K the class must be Large.
+- **Jumbo needs beacons.** Its figures are item 13's, with 4 beacons of which the first 2 are used,
+  leaving a sequencer about 40 usable seeds. Without beacons it gets ~256 and the sequencer limit is
+  about $25K, barely above Large. Its cost per round includes 2 beacon values; the other classes
+  have none.
+
+### Assumptions
+Items 12 and 13's: 300 eligible arbiters of which 15% collude; honest scores integer-rounded normal
+with SD 3; bad work 80, threshold T = 90, good work 95; 5% honest no-shows at commit and again at
+reveal; up to 5 rounds per submission; a $1,000 sequencer bribe per attempt; item 9's two-phase
+request with no beacons (256 seeds for a sequencer) except Jumbo; colluders reveal first. Costs per
+round are fee × (K + B × P + beacons) + gas (about $0.05 at K = 6, $0.39 at K = 50), at ETH $2,287.
+
+### Method
+`scripts/bounty_sizing.py` computes everything exactly (no Monte Carlo) and prints the table.
+- **Forcing hunter.** Colluders vote T on bad work. In each round the cartel may instead sink the
+  round (never commit, or commit and stay silent) so the hunter keeps the bond and re-runs; it forces
+  when enough colluders are seated and sinks otherwise, whichever minimises its cost per pass.
+  Repeated-submission limit = expected (rounds × cost + bond lost) per submission ÷ P(pass) per
+  submission.
+- **Sequencer.** It keeps the seed that seats the most colluders, and is assumed to steer the
+  promotion draw too, so its limit is the same under both promotion assumptions.
+- **Blocking cartel.** Against good work it picks, per round, whichever lever gives the lowest pass
+  rate: vote T − 1, commit and stay silent, never commit, or behave honestly.
+- **Promotion.** "Colluders always promoted" is items 12 and 13's assumption (they win the race).
+  "Random promotion" is item 14's M+ / T+ rule with entropy nobody can steer.
+- **Calibration.** For option A with 40 seeds the script gives a $164K sequencer limit against item
+  13's $162K. Item 13's blocking and repeated-submission figures also model the colluding beacons'
+  own seed choice, which the script doesn't, so Jumbo uses item 13's figures.
+
+### How the classes were chosen
+- **Small.** Each $1 of bond adds about $8 (colluders always promoted) to $14 (random promotion) to
+  the limit; the fee adds much less, because a forcing cartel passes about 3–5% of rounds and the
+  bond is lost on about a third of them. At today's fee, $5 reaches ~$100 under random promotion.
+  With no bond, $100 would need a fee of about $0.18 per arbiter ($2.80 per round). Bondless Small
+  keeps the same jury for bounties up to $15.
+- **Small with no bond at all (not chosen).** A slightly larger jury with a strict quota reaches $100
+  with no bond at today's fee: 9/7/6 Q = 5 with B = 1, P = 2 costs $0.62 per round and reaches $483
+  with random promotion ($126 if colluders always win promotion). The price is good work passing 56%
+  of rounds while a cartel blocks, and 1.6% never paid. The owner chose 6/5/4 with a $5 bond plus
+  the bondless variant (2026-11-17).
+- **Medium at today's fee.** At $0.046 per arbiter ($1.02 per round) and R = 1, Medium reaches
+  $699 / $1,009, so it loses little to a lower fee.
+- **Medium uses R = 2** (owner, 2026-11-17). With R = 1 bad work kept its bond in 72% / 65% of
+  rounds (colluders always promoted / random promotion); with R = 2, 42% / 34%. The limit rises from
+  $905 / $1,013 to $1,013 under both, now set by the sequencer. The cost: a cartel voting low can now
+  force a hard fail on good work with fewer seats, so good submissions never paid while it blocks
+  rise from 2.3% / 0.7% to 5.8% / 1.6%.
+- **Large: the smallest jury reaching $10K.** Every row meets good work passing at least 99% of
+  rounds without an attack, at most 1% of good submissions never paid, and bad work keeping its
+  bond in at most 40% of rounds (queue squatting):
+
+  | Good work's pass rate while blocked must be at least | Smallest config | Cost per round | Max bounty | Pass while blocked / never paid | Bad work keeps bond |
+  |---|---|---|---|---|---|
+  | 50% (item 12) | **26/21/16, Q = 11, R = 6** (chosen) | $14.98 | $11.0K | 62% / 0.95% | 38% |
+  | 50%, more margin | 29/23/17, Q = 12, R = 7 | $16.50 | $16.7K | 65% / 0.91% | 32% |
+  | 70% (item 13) | 37/29/21, Q = 14, R = 8 | $20.05 | $20.0K | 71% / 0.26% | 29% |
+
+  - The sequencer sets Large's limit, so the bond doesn't: $25 already gives the full limit, and the
+    repeated-submission limit is about $200K at $100. A larger bond still makes failed cartel
+    attempts dearer; R sets how often bad work keeps its bond.
+  - At K = 26 a blocking cartel makes good work need about 1.6 rounds instead of 1.4.
+  - The limit isn't monotonic in K (integer effects): under the 70% requirement K = 35 reaches $9.0K
+    but K = 36 only $6.6K.
+- **Accepting ~60–65% while blocked raises the limits a lot.** Without beacons, 30/24/18 Q = 13
+  reaches $59K and 35/28/21 Q = 15 reaches $227K, against option A's $25K without beacons, because
+  item 13's 70% requirement forces a lower Q relative to N. Revisit before relying on beacons for
+  Jumbo.
+
+### Open
+- **Noise.** Everything assumes honest SD 3, a target. The measured normal-SD equivalent is 7.1,
+  which lowers every limit; re-size once noise is re-measured (item 13's sensitivity).
+- **Cartel share and pool.** 15% of 300 eligible; 32 arbiters are registered today.
+- **Queue squatting in Small.** With R = 1, bad work keeps its bond in 57–60% of rounds (Medium
+  is 34–42% with R = 2). R = 2 for Small is not yet weighed against honest hard fails.
+- **Medium's honest cost under attack.** With R = 2, 5.8% of good submissions are never paid while a
+  cartel blocks if colluders always win promotion (1.6% with random promotion), above item 13's 1%
+  target. Random promotion is what keeps it acceptable.
+- **Configs per class.** K/M/N is per aggregator today (item 13), so five classes need several
+  aggregator deployments or a per-request config. Large needs `shortlistSize` ≥ 26 (60 is planned,
+  item 14).
+- **Promotion entropy.** Small's ~$100 needs the M+ / T+ draw to use entropy the hunter can't steer.
+
+### Notes / related
+- Reproduce: `python3 scripts/bounty_sizing.py` prints the class table;
+  `python3 scripts/bounty_sizing.py --config 26,21,16,11,6 --fee 0.25 --bond 100` checks one config
+  (add `--B`, `--P`, `--beacons`, `--seeds`). Jumbo's sequencer check:
+  `--config 50,38,27,17,12 --bond 250 --P 2 --beacons 2 --seeds 40`.
+- The earlier class figures ($159 / $1.1K for K=6, $314 / $1.8K for K=8 at $25 / $250 bonds,
+  2026-11-16) had no recorded method; this item replaces them.
