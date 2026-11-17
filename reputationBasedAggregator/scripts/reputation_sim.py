@@ -81,7 +81,7 @@ escrows a pool of B x P x fee; the cluster pays it to exactly P members, the ban
 evenly among the counted reveals within --agree-z of the median.
 
 Examples:
-    python3 scripts/reputation_sim.py --compare --presets today,mix-cur,mix-v2,mix-v2-rnd
+    python3 scripts/reputation_sim.py --compare --presets today,mix-cur,mix-v2,mix-v2-rnd,mix-v2-hyb
     python3 scripts/reputation_sim.py --preset A-v2 --strategy block --lever silent
     python3 scripts/reputation_sim.py --compare --days 60 --json out.json
 """
@@ -122,6 +122,8 @@ PRESETS = {
     "mix-v2":      dict(mix=NOMINAL_MIX, shortlist=60, policy="v2", liveness="freeze", late_window=1),
     "mix-v2-rnd":  dict(mix=NOMINAL_MIX, shortlist=60, policy="v2", liveness="freeze", late_window=1,
                         commit_select="random", commit_window=2.0),
+    "mix-v2-hyb":  dict(mix=NOMINAL_MIX, shortlist=60, policy="v2", liveness="freeze", late_window=1,
+                        commit_select="hybrid", commit_window=3.5),
 }
 
 
@@ -173,9 +175,9 @@ def build_parser():
            "that arrive within --commit-window (if fewer than M arrive in time, the earliest late ones fill up); "
            "hybrid: promote M drawn at random from the commits so far as soon as there are M+ commits, or "
            "once --commit-window (T+) has passed and there are at least M")
-    a("--m-plus-slack", type=int, default=0, help="hybrid: M+ = K - this (never below M + 1); 0 = every "
-                                                  "juror must commit for an early promotion")
-    a("--commit-window", type=float, default=None, help="commit window for --commit-select random, in "
+    a("--m-plus-slack", type=int, default=None, help="hybrid: M+ = K - this (never below M + 1); default "
+                                                     "M+ = M + ceil((K - M) / 2), halfway from M to K")
+    a("--commit-window", type=float, default=None, help="commit window for --commit-select random (T+ for hybrid), in "
                                                          "median-latency units (default --on-time)")
     a("--eps-commit", type=float, default=0.01, help="honest transient miss rate per commit")
     a("--eps-reveal", type=float, default=0.01, help="honest transient miss rate per reveal")
@@ -622,7 +624,8 @@ def run(p):
         need = {"force": Qq, "low": N - Qq + 1, "silent": M - N + 1, "abstain": K - M + 1}
         # what the cartel can count on before committing: under the race, every seated colluder is
         # promoted (they commit instantly); under random promotion about M/K of them are.
-        m_plus = min(K, max(M + 1, K - p["m_plus_slack"]))
+        m_plus = (M + -(-(K - M) // 2)) if p["m_plus_slack"] is None else K - p["m_plus_slack"]
+        m_plus = min(K, max(M + 1, m_plus))
         exp_prom = c_jury * M / (m_plus if hyb else K) if rnd else c_jury
         lever = p["lever"]
         act = "mimic"

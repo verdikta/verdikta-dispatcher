@@ -1067,11 +1067,11 @@ round at 0.006 gwei.
 ## 14. Reputation v2: two scores (timeliness, quality) with fixed points, plus the liveness freeze
 
 **Status:** design simulated (rules simplified 2026-11-15; no-commit penalty lowered to −400
-2026-11-16), not started in the contracts.
+2026-11-16; promotion rule M+ / T+ 2026-11-17), not started in the contracts.
 **Scope:** `ReputationKeeper.sol` (two scores, points, blocks, ban, selection weight, stake burns,
 unbonding) and
 `ReputationAggregator.sol` (record late reveals, classify each reveal as close / off / far, report
-which live arbiters failed to deliver, optional random promotion). Builds on item 7 (freeze) and
+which live arbiters failed to deliver, the M+ / T+ promotion rule). Builds on item 7 (freeze) and
 serves item 13. Simulator: `scripts/reputation_sim.py` (presets `mix-v2`, `mix-v2-rnd`; `--rules
 simple` is the default).
 
@@ -1220,17 +1220,20 @@ while the overall pool is healthy. Rules:
   requesters such as BountyEscrow and monitoring can see a shortage before submitting.
 
 **Also part of the design.**
-- **Random promotion (optional, recommended).** Promote M commits drawn at random from those arriving
-  within a commit window (2 units), instead of the first M. If fewer than M are on time, the earliest
-  late commits fill. Answering early then earns nothing. This is the main protection small rounds have
-  against forcing.
+- **Promotion rule M+ / T+ (recommended).** Instead of promoting the first M commits, wait until
+  either there are **M+** commits, or **T+** has passed and there are at least M. Then promote M
+  drawn at random from all commits received so far. M+ = M + ⌈(K − M) / 2⌉, and T+ is the mean plus
+  two SDs of honest commit latency. Answering early then earns nothing. This is the main protection
+  small rounds have against forcing. Details and results under "Promotion rule" below.
 - **Bonus.** Every round escrows a pool of B × P × fee. The cluster pays it to exactly P members. The
   alternative band rule splits it evenly among the close reveals.
 
 ### Expected results (simulator, nominal mix, 60 days, 15% cartel, no consumer feedback)
 Nominal mix: 80% 6/5/4/3/3, 16% 8/6/5/4/4, 4% option A (50/38/27/17/17, R = 12). Each range covers
 the cartel strategies and both attack modes (only when it can win, and every chance). Single runs, so
-differences of a few points are noise.
+differences of a few points are noise. "Random promotion" here and in the colluding-hunter section is
+plain random promotion (M at random from the commits within a 2-unit window), the rule that preceded
+M+ / T+. The M+ / T+ rule matched it within noise on every attack measure (see "Promotion rule").
 
 | | First-M promotion | Random promotion |
 |---|---|---|
@@ -1310,10 +1313,72 @@ The honest rows come from 30-day runs × 4 seeds. For K=8, R = 4 gives the same 
   sized maximum bounty. Under first-M, R = 2 only roughly doubles break-even, with honest bond losses
   of 6.3% at K=6.
 
+### Promotion rule: M+ or T+ (2026-11-17)
+**Rule.** Promotion happens at the first moment either holds:
+1. there are **M+** commits; or
+2. **T+** has passed since the commit requests went out, and there are at least **M** commits.
+
+Then M commits are drawn at random from all commits received so far, and reveal requests go to those
+M. Commits after promotion are only logged, as today.
+- **M+ = M + ⌈(K − M) / 2⌉**, halfway from M to K: 6 for K=6 (all must commit; with M = 5 it can't be
+  anything else), 7 for K=8, 44 for option A. Requiring all K is too strict in large rounds, because
+  one of 50 jurors is almost always slow or absent, so every round would wait for T+. A smaller M+
+  brings back some of the race: a fast cartel is always among the first M+ commits, so it is
+  promoted with probability M / M+ instead of M / K.
+- **T+ = mean + 2 SDs of honest commit latency.** Latency is right-skewed, so in the simulator's model
+  this is about 3.5 median latencies (mean 1.36, SD 1.06) and admits about 96% of honest commits. A
+  2-unit window admits 85%. On-chain T+ is in seconds, set from measured latencies, and well below
+  `responseTimeoutSeconds`.
+- **Why it beats a fixed window.** Plain random promotion always waits the whole window. With M+ / T+ a
+  round that is complete early promotes early, so T+ can be generous, which is fairer to slower
+  honest arbiters, without most rounds waiting for it.
+
+**Results** (nominal mix, 15% cartel attacking only when it can win, 60 days × 4 seeds; times in median
+latencies; K=6 / K=8 / option A where split):
+
+| | First-M | Plain random, 2-unit window | M+ / T+, T+ = 3.5 |
+|---|---|---|---|
+| Promoted at, mean | 1.62 | 2.12 | 2.33 |
+| Round finished, median / p90 | 2.73 / 3.96 | 3.30 / 4.12 | 3.60 / 5.12 |
+| Honest commits that arrive in time to be drawn | (race) | 85% | 96% |
+| Bad work forced through | 4.8% / 2.0% / 0% | 0.4% / 0% / 0% | 0.3% / 0.2% / 0% |
+| Good work passes, under-threshold blocking | 77% / 62% / 86% | 94% / 87% / 99% | 94% / 88% / 97% |
+| Good work passes, silent blocking | 84% / 71% / 96% | 83% / 76% / 100% | 84% / 78% / 99% |
+| Silent cartel blocked, median days | 94%, 11 d | 85%, 17 d | 83%, 13 d |
+| Abstain cartel blocked, median days | 78%, 14 d | 72%, 14 d | 73%, 13 d |
+| Mimic cartel: seats, cluster bonus, band bonus | 16%, 22%, 19% | 16%, 22%, 19% | 16%, 22%, 19% |
+| Honest blocks per arbiter-year | 0.04 | 0.04 | 0.02 |
+
+With the same 3.5-unit window, plain random promotion finishes at a median of 4.86; M+ / T+ with
+M+ = K finishes at 3.93, and with the halfway M+ at 3.60.
+
+**Choosing M+ in option A** (T+ = 3.5, option A only, 20 days × 2 seeds):
+
+| M+ | 50 (= K) | 47 | **44** | 41 | 39 (= M + 1) | First-M |
+|---|---|---|---|---|---|---|
+| Round finished, median | 4.84 | 4.19 | **3.37** | 2.98 | 2.79 | 2.72 |
+| Good work passes, under-threshold blocking | 100% | 99.6% | **98.4%** | 94.5% | 92.8% | 87.5% |
+
+Halfway (44) costs about 1.6 points of good-work passes over M+ = K and finishes 1.5 units sooner.
+Below it the race comes back quickly.
+
+**What the contracts need.**
+- **Condition 1** fires inside the M+-th commit's `fulfill`, as the M-th commit triggers promotion
+  today. No extra transaction.
+- **Condition 2 needs a trigger.** If at least M commits are in when T+ passes and no more arrive,
+  nothing calls the contract. Add a public `promote(aggId)` that anyone (the keeper, the requester, a
+  committed arbiter's node) may call once T+ has passed with at least M commits; a commit arriving
+  after T+ also triggers it. With fewer than M commits at T+, the M-th commit promotes all M.
+- **The draw needs entropy the trigger can't steer.** Whoever sends the M+-th commit or calls
+  `promote` chooses the block, so the draw must not come from that block alone. It must never come
+  from the commit hashes either: the last committer chooses its salt and could grind it. Use item 6
+  (arbiter hash chains) or item 9 (a later block hash).
+- **Reputation is unchanged.** Not being promoted earns 0, as in Table 1.
+
 ### Limits
 - **Score-manipulating cartels are invisible.** A cartel voting plausible scores just on the wrong
   side of T can't be told apart from honest variation without knowing T. The configuration has to
-  contain it (jury size, Q-of-N, random promotion). The bounty limits in items 12 and 13 already
+  contain it (jury size, Q-of-N, M+ / T+ promotion). The bounty limits in items 12 and 13 already
   assume the cartel is never removed, so they stand.
 - **A consumer-feedback (flip) score was tested and dropped.** It scored votes against the eventual
   outcome and did remove these cartels (89–98%), but it needs T and the outcome. If wanted later, add
@@ -1348,6 +1413,8 @@ The honest rows come from 30-day runs × 4 seeds. For K=8, R = 4 gives the same 
   revealed.
 - **Gas.** Median and MAD per round (sort N values) and one score update per scored reveal. Check at
   N = 27.
+- **T+ from real latencies.** Measure honest commit latency per class and set T+ to its mean plus two
+  SDs. The simulator's latency model (lognormal, 10% slow arbiters at 3×) is a guess.
 
 ### Why it's deferred
 Depends on item 7 (freeze) and the late-reveal recording change. Keeper and aggregator redeploy.
@@ -1361,5 +1428,8 @@ Depends on item 7 (freeze) and the late-reveal recording change. Keeper and aggr
 - Colluding hunter: `python3 scripts/reputation_sim.py --preset mix-v2-rnd --days 2 --hunter-per-day 24
   --hunter-class 6/5/4/3/3/1 --attack-when always` prints the timeline and every hunter submission.
   Change R through `--mix` (e.g. `6/5/4/3/3/2:80,...`).
+- Promotion rule: preset `mix-v2-hyb` (`--commit-select hybrid --commit-window 3.5`; T+ is
+  `--commit-window`, M+ defaults to halfway, `--m-plus-slack s` sets M+ = K − s). Compare with
+  `--compare --presets mix-v2,mix-v2-rnd,mix-v2-hyb --days 60 --attack-when win`, seeds 1–4.
 - Colluders are fast only in attack rounds (`--col-speed attack`). Always-fastest overstated the
   cartel's seat share (A-cur mimic 54% → 18%).
