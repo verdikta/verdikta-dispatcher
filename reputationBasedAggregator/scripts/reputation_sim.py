@@ -168,9 +168,13 @@ def build_parser():
     a("--slow-frac", type=float, default=0.10, help="honest arbiters with --slow-factor x latency")
     a("--slow-factor", type=float, default=3.0)
     a("--on-time", type=float, default=4.0, help="v2 absolute commit deadline, in median-latency units")
-    a("--commit-select", choices=["race", "random"], default=None,
+    a("--commit-select", choices=["race", "random", "hybrid"], default=None,
       help="race: the first M commits are promoted (today); random: M drawn at random from the commits "
-           "that arrive within --commit-window (if fewer than M arrive in time, the earliest late ones fill up)")
+           "that arrive within --commit-window (if fewer than M arrive in time, the earliest late ones fill up); "
+           "hybrid: promote M drawn at random from the commits so far as soon as there are M+ commits, or "
+           "once --commit-window (T+) has passed and there are at least M")
+    a("--m-plus-slack", type=int, default=0, help="hybrid: M+ = K - this (never below M + 1); 0 = every "
+                                                  "juror must commit for an early promotion")
     a("--commit-window", type=float, default=None, help="commit window for --commit-select random, in "
                                                          "median-latency units (default --on-time)")
     a("--eps-commit", type=float, default=0.01, help="honest transient miss rate per commit")
@@ -442,7 +446,8 @@ def run(p):
     attacks = 0
     round_time = []                   # complete rounds: promotion time + N-th reveal, latency units
     promote_time = []
-    rnd = p["commit_select"] == "random"
+    rnd = p["commit_select"] in ("random", "hybrid")
+    hyb = p["commit_select"] == "hybrid"
     down_events = []
     open_ev = {}
     pf = 1.0 / (p["mtbf_days"] * rpd) if p["mtbf_days"] > 0 else 0.0
@@ -617,7 +622,8 @@ def run(p):
         need = {"force": Qq, "low": N - Qq + 1, "silent": M - N + 1, "abstain": K - M + 1}
         # what the cartel can count on before committing: under the race, every seated colluder is
         # promoted (they commit instantly); under random promotion about M/K of them are.
-        exp_prom = c_jury * M / K if rnd else c_jury
+        m_plus = min(K, max(M + 1, K - p["m_plus_slack"]))
+        exp_prom = c_jury * M / (m_plus if hyb else K) if rnd else c_jury
         lever = p["lever"]
         act = "mimic"
         if p["strategy"] == "honest":
@@ -674,7 +680,16 @@ def run(p):
             clat[j] = (0.02 if fast_now[j] else lat[i]) * math.exp(rng.gauss(0, p["lat_noise"]))
         corder = sorted((j for j in range(K) if committed[j]), key=lambda j: clat[j])
         promoted = [False] * K
-        if rnd:
+        if hyb:
+            inf = float("inf")
+            t1 = clat[corder[m_plus - 1]] if len(corder) >= m_plus else inf
+            t2 = max(p["commit_window"], clat[corder[M - 1]]) if len(corder) >= M else inf
+            t_prom = min(t1, t2)
+            if t_prom == inf:
+                chosen, t_prom = corder[:M], None     # fewer than M commits: the round times out
+            else:
+                chosen = rng.sample([j for j in corder if clat[j] <= t_prom], M)
+        elif rnd:
             ontime = [j for j in corder if clat[j] <= p["commit_window"]]
             if len(ontime) >= M:
                 chosen = rng.sample(ontime, M)
@@ -963,6 +978,8 @@ def run(p):
     out["bad_work"] = {k: (v / bad["n"] if k != "n" and bad["n"] else v) for k, v in bad.items()}
     out["cartel_attack_rounds"] = attacks
     out["round_time"] = dict(promote_median=(median(promote_time) if promote_time else None),
+                             promote_mean=(sum(promote_time) / len(promote_time) if promote_time else None),
+                             promote_p90=(pctl(promote_time, 90) if promote_time else None),
                              median=(median(round_time) if round_time else None),
                              p90=(pctl(round_time, 90) if round_time else None))
 
