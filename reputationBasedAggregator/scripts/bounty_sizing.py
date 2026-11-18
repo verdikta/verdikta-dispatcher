@@ -30,7 +30,9 @@ an honest hunter, under the assumptions of TODO items 12 and 13:
   - Max bounty = the lower of the two limits, with no safety margin.
   - Blocking cartel (good work): per round it picks the lever with the lowest pass rate (vote T-1,
     commit and stay silent, never commit, or behave honestly).
-  - Cost per round = fee x (K + B x P + beacons) + gas, gas ~ $0.05 at K = 6 to ~$0.39 at K = 50.
+  - Cost per round = fee x (K + B x P + 1 + beacons) + gas, gas ~ $0.05 at K = 6 to ~$0.39 at K = 50.
+    The 1 is item 9's promote reward (adopted 2026-11-18): whoever calls promote() is paid one fee,
+    counted as a cost since a third party may call first. The draw reward goes back to the hunter.
   - Beacons (item 9's per-request flag; the class table sets it for Jumbo only): 4 beacons polled,
     the first 2 values mixed into the seed. The sequencer is left about 40 seeds. A cartel holding
     cp of the 4 beacon seats chooses among seed_options(cp) seeds by when its beacons reveal, and
@@ -121,6 +123,7 @@ def per_submission(p, h, rounds=ROUNDS):
 
 
 BEACONS_POLLED, BEACON_QUORUM = 4, 2
+PROMOTE_FEES = 1   # item 9: promote() pays its caller one fee
 
 
 def seed_options(cp, polled=BEACONS_POLLED, q=BEACON_QUORUM):
@@ -153,7 +156,7 @@ def evaluate(K, M, N, Q, R, fee, bond, B=3, P=None, beacons=False, seeds=None, p
     the cartel picks the best of its beacon seed options in every round (forcing and blocking)."""
     P = Q if P is None else P
     seeds = (40 if beacons else 256) if seeds is None else seeds
-    cost = fee * (K + B * P + (BEACON_QUORUM if beacons else 0)) + 0.05 + 0.34 * K / 50
+    cost = fee * (K + B * P + PROMOTE_FEES + (BEACON_QUORUM if beacons else 0)) + 0.05 + 0.34 * K / 50
     hy = chosen_seats(K) if beacons else seats(K)
     force = [round_outcome(K, M, N, Q, R, c, "force", promotion) for c in range(K + 1)]
     sink = [max(round_outcome(K, M, N, Q, R, c, m, promotion)[2] for m in ("silent", "abstain")) for c in range(K + 1)]

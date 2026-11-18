@@ -454,7 +454,8 @@ coordinated redeploy of the aggregator and keeper plus a bounty-program release.
 
 ## 9. Two-phase request: commit first, draw the jury from a later block hash
 
-**Status:** not started (design discussed 2026-11-07)
+**Status:** not started in the deployed contracts (design discussed 2026-11-07). Example
+implementation in `v2/` (with item 14), reviewed and updated 2026-11-18.
 **Scope:** `ReputationAggregator.sol` + `ReputationKeeper.sol` (selection inputs, checkpoints) +
 bounty program (`BountyEscrow.sol`, `EvaluationWallet.sol`, site, agent skill and docs). Breaking
 change to the request flow and `maxTotalFee`.
@@ -511,7 +512,8 @@ the randomness exists.
     the request.
 - **Trigger reward: 2 × `eff`**, the per-arbiter fee the escrow is sized on. No separate gas
   reimbursement.
-  - `maxTotalFee = eff * (K + B*P + 2)`, which is 14 × `eff` with the default 6/3/2.
+  - `maxTotalFee = eff * (K + B*P + 2 + 1)`, which is 15 × `eff` with the default 6/3/2. The 1 is
+    the `promote` reward (adopted 2026-11-18, below).
   - For the first **30 s** after the commit (by `block.timestamp`, not a block count; Base
     blocks are 0.2 s, on mainnet since 2026-11-05, so 30 s is about 150 blocks), only the
     requester's draw earns the reward, credited back to the requester. After that, whoever draws is credited the reward in `ethOwed`. Anyone may draw
@@ -525,7 +527,7 @@ the randomness exists.
   - **On:** `blockhash(B+1)` also picks 4 beacons from the registered, unfrozen arbiters, which are
     sent hash-chain calls. The draw waits for the first 2 valid values and uses
     `seed = keccak256(aggId, blockhash(B+1), v1, v2)`. The prepay adds 2 beacon fees
-    (`maxTotalFee = eff * (K + B*P + 2 + 2)`); the 2 replying beacons are paid.
+    (`maxTotalFee = eff * (K + B*P + 2 + 1 + 2)`); the 2 replying beacons are paid.
   - **Deadline.** If fewer than 2 values arrive by an owner-set deadline (for example 120 s, which
     needs the EIP-2935 window, not `BLOCKHASH`'s 51 s), the round ends with no result: the hunter
     may re-run (item 12) but gets no refund, which would be a free re-roll. 3 or 4 colluding
@@ -548,6 +550,36 @@ the randomness exists.
 - **The one exception.** If nobody sealed or drew the round within the history window (8,191
   blocks, about 27 min), the round can never be drawn. A permissionless cancel then sends the prepay to the treasury. It must not refund the
   requester: a refund would be a free re-roll.
+- **Lessons from the v2 example contracts** (`v2/`, reviewed 2026-11-18):
+  - **A sealed round can become undrawable.** A selected arbiter could revert the draw by burning all
+    gas in its operator or by returning malformed `owner()` data. Since the seed is fixed, the round
+    would then be stuck forever with its prepay. Fixes:
+    - Give each call to an arbiter contract a fixed stipend: 250k per request (an honest one needs
+      about 125k, or 175k at the largest payload) and 30k for `owner()`.
+    - Read `owner()` with a low-level call, so a bad answer skips the slot.
+    - Let a sealed round undrawn for a day be cancelled to the treasury.
+  - **Check the gas before every tolerated call.** Every call whose failure is tolerated must first
+    check that its stipend is really available, and settlement must revert rather than skip the
+    keeper call when it is starved. Otherwise a drawer or settler can pick a gas limit that drops the
+    last slots, or every score update.
+  - **Fewer than K eligible at B: fail the round with a refund.** No jury could be drawn, so it is no
+    re-roll. Never repeat slots: one arbiter would vote and be charged twice.
+  - **Fix every reward and fee count in the round at request.** An owner change before the draw
+    otherwise breaks the escrow arithmetic, and through the settlement queue blocks every request.
+  - **Checkpoint stake eligibility too** (a flag updated when the stake changes). A live stake read
+    lets an under-staked arbiter decide, after seeing the seed, whether to top up and re-roll the draw.
+- **Promotion (item 14's M+ / T+) has the same withholding problem** as the draw. The promotion seed
+  is `blockhash(C+1)`, so whoever can call `promote` sees the draw first. If only the requester
+  calls it, the requester can abort a draw it dislikes and pay only the base fees, which re-rolls
+  promotion. The v2 example:
+  - **Pays `promote`'s caller 1 × `eff`**, so third parties call it and it can't be withheld.
+    `maxTotalFee` becomes `eff * (K + B*P + 2 + 1)`, plus 2 with beacons. Adopted (owner,
+    2026-11-18); item 15's costs include it.
+  - **Sends a round that closed but was never promoted to the treasury.** The unspent prepay is not
+    refunded.
+  - **Gives promoted arbiters 120 s to reveal after `promote`**, extending the deadline if needed.
+    Otherwise calling `promote` late (or a colluder sending the M+-th commit late) leaves no time
+    to reveal, and the round fails with every honest promoted arbiter charged −500.
 
 ### Expected payoff
 At the risk model's defaults (300 eligible arbiters, 3% colluders, SD 3) with a $0.50 base fee:
@@ -1128,7 +1160,8 @@ round at 0.006 gwei.
 
 **Status:** design simulated (rules simplified 2026-11-15; no-commit penalty lowered to −400
 2026-11-16; promotion rule M+ / T+ 2026-11-17, adopted as the plan 2026-11-18), not started in the
-contracts.
+deployed contracts. Example implementation in `v2/`, updated and reviewed 2026-11-18 (see "v2 example
+contracts" below).
 **Scope:** `ReputationKeeper.sol` (two scores, points, blocks, ban, selection weight, stake burns,
 unbonding) and
 `ReputationAggregator.sol` (record late reveals, classify each reveal as close / off / far, report
@@ -1156,8 +1189,10 @@ event, the same for every configuration. Everything uses only what the contracts
 each reveal's distance from the round's median). The contracts don't know how results are used (for
 example a bounty's threshold T), so nothing depends on that.
 
-**Table 1: how scores change.** Only arbiters selected for the round are scored, and an arbiter
-frozen by the liveness check at round end is not scored.
+**Table 1: how scores change.** Only arbiters selected for the round are scored. An arbiter frozen by
+the liveness check at round end (the round's deadline, not settlement) is not scored, unless it
+committed in that round. A commit proves it was up, so freezing cannot be used to escape the −500
+for going silent.
 
 | Event in a round | Timeliness | Quality |
 |---|---|---|
@@ -1569,7 +1604,38 @@ M+ / T+ promotion, 15% cartel attacking only when it can win, 60 days × 3 seeds
 - **Commit-based timeliness** (credit per commit, an on-time-commit average): dropped, because it
   rewards fake commits. Rerunning without it changed nothing material.
 
+### v2 example contracts (2026-11-18)
+`v2/` implements Tables 1 and 2, the freeze, M+ / T+ promotion and item 9's two-phase request (no
+beacons). Its README lists the behaviour; the points below changed or sharpened the design.
+- **Scores are on the arbiters' 0..1,000,000 scale.** Mainnet reveals look like `[970000, 30000]`.
+  The spread floor is 30,000 (3 points). The first draft used 3, which would have scored almost every
+  honest reveal far (−200).
+- **Frozen arbiters that committed are scored.** Being frozen is judged at round end. Only an answer
+  to an outstanding call counts, so an arbiter that recovers before settlement isn't charged for an
+  outage.
+- **−400 only when commits fell short.** A round with M commits that timed out because nobody closed
+  the commit phase charges nobody.
+- **A score that reaches 0 while the arbiter is already blocked** restarts at 500 but adds no offense.
+  Several in-flight rounds failing together count as one incident, not as a quick path to a ban. The
+  simulator runs rounds one at a time, so this case doesn't occur there.
+- **A returning key keeps its scores, offenses and classes.** Exiting and re-registering no longer
+  resets a low score to 500. A new jobId still gives a fresh key, as noted under "Ban burn".
+- **Health calls use a pending flag, not a time comparison.** Base timestamps are whole seconds, so a
+  call sent in the same second as the last answer would otherwise look answered.
+- **Hash chains can be rotated** (`rotateChain`): the answer comes from the old chain, and the new
+  head applies to later calls only.
+- **Measured gas, 300-arbiter pool, one full round at 0.006 gwei:** Small $0.08, Medium $0.09, Large
+  $0.23, Jumbo (no beacons) $0.51. Jumbo's draw is 13.4M of the 16.8M per-transaction cap, and
+  `promote` is 5.8M. Selection is 2.9M at K = 50, and the same with 300 or 3,000 arbiters.
+
 ### Open
+- **The abstain dodge (found 2026-11-18, not fixed).** A cartel that blocks by never committing can
+  also ignore its health call. It is then frozen at round end and escapes the −400, at the cost of
+  being unselectable until it answers, a few minutes. The simulator always lets colluders answer
+  calls, so the abstain-cartel results above (72–82% blocked) assume this doesn't happen. Options, to
+  be simulated:
+  - a cooldown after a late answer (not selectable for some hours, growing with repeats);
+  - counting a freeze in a round that failed for lack of commits as an offense after a few repeats.
 - **Point values and cutoffs.** +20 / −50 / −200 / −400 / −500 and the 1.5 / 3 spread cutoffs were
   tuned on simulated normal noise (SD 3). Check them against real arbiter score distributions,
   especially heavy-tailed or bimodal tasks.
@@ -1632,11 +1698,11 @@ Every class assumes the planned design, which is what gives these figures:
 
 | Class | Jury K/M/N | Q / R | Beacons | Fee per arbiter | Bonus | Bond | Cost per round | Offered up to | Max bounty (model) | Binding limit | Good work while a cartel blocks: pass per round / never paid | Bad work keeps bond |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| Bondless Small | 6/5/4 | 3 / 1 | off | $0.046 (today's) | B = 3, P = 3 | $0 | $0.78 | **$25** | $28 | repeated submissions | 65% / 0.6% | 57% |
-| Small | 6/5/4 | 3 / 1 | off | $0.046 | B = 3, P = 3 | $5 | $0.78 | **~$100** | $99 | repeated submissions | 65% / 0.6% | 57% |
-| Medium | 8/5/4 | 3 / 2 | off | $0.25 | B = 3, P = 3 | $50 | $4.35 | **~$1K** | $1,004 | the sequencer | 73% / 0.3% | 23% |
-| Large | 21/16/13 | 10 / 8 | off | $0.25 | B = 3, P = 10 | $100 | $12.94 | **$10K** | $18.5K | the sequencer | 60% / 0.6% | 40% |
-| Jumbo | 50/38/27 | 17 / 12 | on | $0.25 | B = 3, P = 17 (P = 2 until clustering is decided) | $200 | $26.14 | **$100K** | $164K | the sequencer | 80% / 0.01% | 20% |
+| Bondless Small | 6/5/4 | 3 / 1 | off | $0.046 (today's) | B = 3, P = 3 | $0 | $0.83 | **$25** | $29 | repeated submissions | 65% / 0.6% | 57% |
+| Small | 6/5/4 | 3 / 1 | off | $0.046 | B = 3, P = 3 | $5 | $0.83 | **~$100** | $101 | repeated submissions | 65% / 0.6% | 57% |
+| Medium | 8/5/4 | 3 / 2 | off | $0.25 | B = 3, P = 3 | $50 | $4.60 | **~$1K** | $1,005 | the sequencer | 73% / 0.3% | 23% |
+| Large | 21/16/13 | 10 / 8 | off | $0.25 | B = 3, P = 10 | $100 | $13.19 | **$10K** | $18.6K | the sequencer | 60% / 0.6% | 40% |
+| Jumbo | 50/38/27 | 17 / 12 | on | $0.25 | B = 3, P = 17 (P = 2 until clustering is decided) | $200 | $26.39 | **$100K** | $165K | the sequencer | 80% / 0.01% | 20% |
 
 - **"Offered up to"** is the bounty a class is sold for.
 - **M+ / T+ is a launch requirement.** Medium and Large were sized for it (owner, 2026-11-18): with
@@ -1675,7 +1741,9 @@ with SD 3; bad work 80, threshold T = 90, good work 95; 5% honest no-shows at co
 reveal; up to 6 rounds per submission; a $1,000 sequencer bribe per attempt; item 9's two-phase
 request with no beacons (256 seeds for a sequencer) except Jumbo (4 beacons polled, the first 2
 used, about 40 seeds); colluders reveal first. Costs per
-round are fee × (K + B × P + beacons) + gas (about $0.05 at K = 6, $0.39 at K = 50), at ETH $2,287.
+round are fee × (K + B × P + 1 + beacons) + gas (about $0.05 at K = 6, $0.39 at K = 50), at ETH $2,287.
+The 1 is item 9's `promote` reward (adopted 2026-11-18), counted as a cost because a third party may
+call `promote` first; the draw reward goes back to the hunter.
 
 ### Method
 `scripts/bounty_sizing.py` computes everything exactly (no Monte Carlo) and prints the table.
@@ -1780,6 +1848,11 @@ round are fee × (K + B × P + beacons) + gas (about $0.05 at K = 6, $0.39 at K 
     and 44–46 (stopped for lack of memory).
   - Without beacons, K = 35–36 reaches $148K–227K (next bullet), so the beacons buy protection
     from the sequencer rather than a higher limit per juror.
+- **`promote` reward adopted** (owner, 2026-11-18; item 9). Paying `promote`'s caller one fee adds
+  $0.046 per round to Small and $0.25 to the others. The class table above includes it. The limits
+  rise slightly, since both limits grow with the cost per round: Small $99 → $101, Medium $1,004 →
+  $1,005, Large $18,546 → $18,551, Jumbo $164,481 → $164,520. The other tables in this section were
+  computed before it.
 - **Jumbo's bond is $200** (owner, 2026-11-18, down from $250). The sequencer sets Jumbo's limit,
   so the bond barely moves it: $166K at $250, $164K at $200, $162K at $100. The repeated-submission
   limit falls from $784K to $646K, still far above. The honest-hunter figures and the share of bad
@@ -1797,6 +1870,9 @@ round are fee × (K + B × P + beacons) + gas (about $0.05 at K = 6, $0.39 at K 
   the protection from the sequencer; a no-beacon Jumbo would need about K = 35 at this standard.
 
 ### Open
+- **Jumbo's draw size.** In `v2/` Jumbo's draw uses about 13.4M of the 16.8M per-transaction cap. A
+  gas-burning operator adds at most about 140k, so about 21 colluding jurors of 50 would make the draw
+  too large. The round could then only be cancelled to the treasury after a day.
 - **Noise.** Everything assumes honest SD 3, a target. The measured normal-SD equivalent is 7.1,
   which lowers every limit; re-size once noise is re-measured (item 13's sensitivity).
 - **Cartel share and pool.** 15% of 300 eligible; 32 arbiters are registered today.
