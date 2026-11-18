@@ -1632,7 +1632,7 @@ Every class assumes the planned design, which is what gives these figures:
 
 | Class | Jury K/M/N | Q / R | Beacons | Fee per arbiter | Bonus | Bond | Cost per round | Offered up to | Max bounty (model) | Binding limit | Good work while a cartel blocks: pass per round / never paid | Bad work keeps bond |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| Bondless Small | 6/5/4 | 3 / 1 | off | $0.046 (today's) | B = 3, P = 3 | $0 | $0.78 | **$15** | $28 | repeated submissions | 65% / 0.6% | 57% |
+| Bondless Small | 6/5/4 | 3 / 1 | off | $0.046 (today's) | B = 3, P = 3 | $0 | $0.78 | **$25** | $28 | repeated submissions | 65% / 0.6% | 57% |
 | Small | 6/5/4 | 3 / 1 | off | $0.046 | B = 3, P = 3 | $5 | $0.78 | **~$100** | $99 | repeated submissions | 65% / 0.6% | 57% |
 | Medium | 8/5/4 | 3 / 2 | off | $0.25 | B = 3, P = 3 | $50 | $4.35 | **~$1K** | $1,004 | the sequencer | 73% / 0.3% | 23% |
 | Large | 21/16/13 | 10 / 8 | off | $0.25 | B = 3, P = 10 | $100 | $12.94 | **$10K** | $18.5K | the sequencer | 60% / 0.6% | 40% |
@@ -1642,8 +1642,15 @@ Every class assumes the planned design, which is what gives these figures:
 - **M+ / T+ is a launch requirement.** Medium and Large were sized for it (owner, 2026-11-18): with
   random promotion a seated colluder is often not promoted, which lets M sit well below K. If
   colluders could win promotion (today's first-come promotion, or a steerable draw), good work
-  would never be paid in about 17% (Medium) and 20% (Large) of blocked submissions, and Small would
-  reach only $56. These classes must not launch before M+ / T+ with item 9's seed is live.
+  would never be paid in about 17% (Medium) and 20% (Large) of blocked submissions, and Small and
+  Bondless Small would reach only $56 and $17. These classes must not launch before M+ / T+ with
+  item 9's seed is live.
+- **"Bad work keeps bond"** is the share of a forcing attack's rounds that end in neither a pass nor
+  a hard fail (a soft fail, or no result because the cartel sank the round), so the hunter keeps the
+  bond and may re-run. It measures queue squatting: each such round keeps a bad submission ahead in
+  the payout order. Without a cartel, bad work keeps its bond only on honest no-shows (Small 5.8%,
+  Medium 2.3%, Large 0.7%, Jumbo under 0.1%). The sizing caps it at 50% (Medium) and 40%
+  (Large); Small is not capped (open item).
 - **The sequencer is assumed to steer promotion too**, since the promotion draw uses the same seed,
   so the sequencer limits are the same with or without M+ / T+.
 - **Good work with no attack** passes 93.9% (Small), 97.1% (Medium), 99.2% (Large) and 100% (Jumbo)
@@ -1722,7 +1729,7 @@ round are fee × (K + B × P + beacons) + gas (about $0.05 at K = 6, $0.39 at K 
   the limit; the fee adds much less, because a forcing cartel passes about 3–5% of rounds and the
   bond is lost on about a third of them. At today's fee, $5 reaches ~$100 under random promotion.
   With no bond, $100 would need a fee of about $0.18 per arbiter ($2.80 per round). Bondless Small
-  keeps the same jury for bounties up to $15.
+  keeps the same jury for bounties up to $25 (owner, 2026-11-18; was $15), against a $28 limit.
 - **Small with no bond at all (not chosen).** A slightly larger jury with a strict quota reaches $100
   with no bond at today's fee: 9/7/6 Q = 5 with B = 1, P = 2 costs $0.62 per round and reaches $483
   with random promotion ($126 if colluders always win promotion). The price is good work passing 56%
@@ -1794,7 +1801,13 @@ round are fee × (K + B × P + beacons) + gas (about $0.05 at K = 6, $0.39 at K 
   which lowers every limit; re-size once noise is re-measured (item 13's sensitivity).
 - **Cartel share and pool.** 15% of 300 eligible; 32 arbiters are registered today.
 - **Queue squatting in Small.** With R = 1, bad work keeps its bond in 57% of rounds (Medium is 23%
-  with R = 2; Large is at the 40% limit). R = 2 for Small is not yet weighed against honest hard fails.
+  with R = 2; Large is at the 40% limit). Small and Bondless Small keep R = 1 (owner, 2026-11-18).
+  R = 2 was weighed: bad work would keep its bond in 31% of rounds ($5 bond) or 18% (bondless), and
+  Small's limit would rise from $99 to $146 ($98 at a $3 bond); Bondless Small's stays $28. But good
+  submissions never paid while a cartel blocks would rise from 0.6% to 4.4%: with N = 4 a hard fail
+  needs only 3 counted colluders (or 2 plus one honest score below T), and a hard fail ends the
+  submission, so more rounds don't help. Squatting costs the attacker $0.78 a round and lasts at
+  most 6 rounds; if it matters in practice, revisit R = 2 or a shorter re-run window for Small.
 - **Medium's margin against repeated submissions.** 8/5/4's repeated-submission limit ($1,445) is
   close to its $1,004 sequencer limit, and both rest on assumptions (cartel share, SD 3, the $1,000
   bribe). Keep Medium offered at ~$1K, not above.
