@@ -31,22 +31,26 @@ an honest hunter, under the assumptions of TODO items 12 and 13:
   - Blocking cartel (good work): per round it picks the lever with the lowest pass rate (vote T-1,
     commit and stay silent, never commit, or behave honestly).
   - Cost per round = fee x (K + B x P + beacons) + gas, gas ~ $0.05 at K = 6 to ~$0.39 at K = 50.
+  - Beacons (item 9's per-request flag; the class table sets it for Jumbo only): 4 beacons polled,
+    the first 2 values mixed into the seed. The sequencer is left about 40 seeds. A cartel holding
+    cp of the 4 beacon seats chooses among seed_options(cp) seeds by when its beacons reveal, and
+    keeps the one seating the most colluders, for both forcing and blocking.
 
-Calibration: option A (50/38/27 Q17 R12, 40 seeds) gives a sequencer limit of $164K against item
-13's $162K. Item 13's blocking and repeated-submission figures also model the colluding beacons'
-own choice of seeds, which this script doesn't, so use item 13's figures for option A.
+Calibration: option A with beacons (50/38/27 Q17 R12, P = 2) gives a sequencer limit of $164K,
+good work passing 74% of rounds while blocked, 0.5% never paid and 24% of bad rounds keeping the
+bond, against item 13's $162K, 73.3%, 0.61% and 22.6%.
 
 Examples:
     python3 scripts/bounty_sizing.py                       # the class table in TODO item 15
-    python3 scripts/bounty_sizing.py --config 26,21,16,11,6 --fee 0.25 --bond 100
-    python3 scripts/bounty_sizing.py --config 50,38,27,17,12 --bond 250 --B 3 --P 2 --beacons 2 --seeds 40
+    python3 scripts/bounty_sizing.py --config 21,16,13,10,8 --fee 0.25 --bond 100
+    python3 scripts/bounty_sizing.py --config 50,38,27,17,12 --bond 250 --B 3 --P 2 --beacons
 """
 
 import argparse
 from functools import lru_cache
 from math import comb, erfc, sqrt
 
-E, X, SD, T, BAD, GOOD, NS, ROUNDS, BRIBE = 300, 0.15, 3.0, 90, 80, 95, 0.05, 5, 1000.0
+E, X, SD, T, BAD, GOOD, NS, ROUNDS, BRIBE = 300, 0.15, 3.0, 90, 80, 95, 0.05, 6, 1000.0
 
 
 def p_at_least_t(mu):
@@ -116,10 +120,41 @@ def per_submission(p, h, rounds=ROUNDS):
     return p * ev, h * ev, s ** rounds, ev
 
 
-def evaluate(K, M, N, Q, R, fee, bond, B=3, P=None, beacons=0, seeds=256, promotion="random", rounds=ROUNDS):
-    P = Q if P is None else P
-    cost = fee * (K + B * P + beacons) + 0.05 + 0.34 * K / 50
+BEACONS_POLLED, BEACON_QUORUM = 4, 2
+
+
+def seed_options(cp, polled=BEACONS_POLLED, q=BEACON_QUORUM):
+    """Seeds a cartel holding cp of the polled beacons can choose from when the seed mixes the first q
+    revealed values (risk script S4): its own q values before any honest one, (q - k) of its values
+    after k honest ones, or all-honest values if it withholds. Assumes honest values land in
+    distinct blocks (0.2 s blocks against ~15 s replies)."""
+    h = polled - cp
+    return sum(comb(cp, q - k) for k in range(q + 1) if k <= h and q - k <= cp)
+
+
+@lru_cache(None)
+def chosen_seats(K):
+    """Jury colluder count when the cartel picks the best of its beacon seed options."""
     hy = seats(K)
+    cdf = [sum(hy[:x + 1]) for x in range(K + 1)]
+    pool = round(E * X)
+    out = [0.0] * (K + 1)
+    for cp in range(BEACONS_POLLED + 1):
+        w = comb(pool, cp) * comb(E - pool, BEACONS_POLLED - cp) / comb(E, BEACONS_POLLED)
+        n = seed_options(cp)
+        for x in range(K + 1):
+            out[x] += w * (cdf[x] ** n - (cdf[x - 1] ** n if x else 0))
+    return tuple(out)
+
+
+def evaluate(K, M, N, Q, R, fee, bond, B=3, P=None, beacons=False, seeds=None, promotion="random", rounds=ROUNDS):
+    """beacons: item 9's per-request flag. On: 4 beacons polled, the first 2 values mixed into the
+    seed (2 paid values per round); a bribed sequencer is left about 40 usable seeds (item 13), and
+    the cartel picks the best of its beacon seed options in every round (forcing and blocking)."""
+    P = Q if P is None else P
+    seeds = (40 if beacons else 256) if seeds is None else seeds
+    cost = fee * (K + B * P + (BEACON_QUORUM if beacons else 0)) + 0.05 + 0.34 * K / 50
+    hy = chosen_seats(K) if beacons else seats(K)
     force = [round_outcome(K, M, N, Q, R, c, "force", promotion) for c in range(K + 1)]
     sink = [max(round_outcome(K, M, N, Q, R, c, m, promotion)[2] for m in ("silent", "abstain")) for c in range(K + 1)]
     resub = bad_pass = bad_hard = None
@@ -134,7 +169,7 @@ def evaluate(K, M, N, Q, R, fee, bond, B=3, P=None, beacons=0, seeds=256, promot
             resub, bad_pass, bad_hard = lim, p, h
     # sequencer: best of `seeds` jury draws by colluder count, then one forcing round (it also steers promotion)
     first = [round_outcome(K, M, N, Q, R, c, "force", "first") for c in range(K + 1)]
-    cdf = [sum(hy[:x + 1]) for x in range(K + 1)]
+    cdf = [sum(seats(K)[:x + 1]) for x in range(K + 1)]
     best = [cdf[x] ** seeds - (cdf[x - 1] ** seeds if x else 0) for x in range(K + 1)]
     sp = sum(b * f[0] for b, f in zip(best, first))
     sh = sum(b * f[1] for b, f in zip(best, first))
@@ -148,16 +183,18 @@ def evaluate(K, M, N, Q, R, fee, bond, B=3, P=None, beacons=0, seeds=256, promot
     gp = sum(w * b[0] for w, b in zip(hy, blk))
     gh = sum(w * b[1] for w, b in zip(hy, blk))
     paid, _, _, _ = per_submission(gp, gh, rounds)
-    return dict(cfg=f"{K}/{M}/{N} Q{Q} R{R}", cost=cost, bond=bond, fee=fee, resub=resub, seq=seq,
+    return dict(cfg=f"{K}/{M}/{N} Q{Q} R{R}" + (" +beacons" if beacons else ""), cost=cost, bond=bond, fee=fee,
+                resub=resub, seq=seq,
                 limit=min(resub, seq), good=round_outcome(K, M, N, Q, R, 0, "honest", promotion)[0],
                 blocked=gp, never_paid=1 - paid, bad_pass=bad_pass, bad_keeps=1 - bad_pass - bad_hard)
 
 
-CLASSES = [  # name, (K, M, N, Q, R), fee per arbiter (USD), bond (USD)
-    ("Bondless Small", (6, 5, 4, 3, 1), 0.046, 0),
-    ("Small", (6, 5, 4, 3, 1), 0.046, 5),
-    ("Medium", (8, 6, 5, 4, 2), 0.25, 50),
-    ("Large", (26, 21, 16, 11, 6), 0.25, 100),
+CLASSES = [  # name, (K, M, N, Q, R), fee per arbiter (USD), bond (USD), beacons
+    ("Bondless Small", (6, 5, 4, 3, 1), 0.046, 0, False),
+    ("Small", (6, 5, 4, 3, 1), 0.046, 5, False),
+    ("Medium", (8, 5, 4, 3, 2), 0.25, 50, False),
+    ("Large", (21, 16, 13, 10, 8), 0.25, 100, False),
+    ("Jumbo", (50, 38, 27, 17, 12), 0.25, 200, True),
 ]
 
 
@@ -181,8 +218,9 @@ def main():
     ap.add_argument("--bond", type=float, default=0.0, help="hunter's bond, USD")
     ap.add_argument("--B", type=int, default=3, help="bonus multiplier")
     ap.add_argument("--P", type=int, default=None, help="cluster size paid the bonus (default Q)")
-    ap.add_argument("--beacons", type=int, default=0, help="paid beacon values per round")
-    ap.add_argument("--seeds", type=int, default=256, help="seeds a bribed sequencer can choose from")
+    ap.add_argument("--beacons", action="store_true", help="item 9's beacon flag: 4 polled, first 2 used")
+    ap.add_argument("--seeds", type=int, default=None, help="seeds a bribed sequencer can choose from "
+                                                            "(default 40 with beacons, 256 without)")
     a = ap.parse_args()
     print(f"Assumptions: {E} eligible, {X:.0%} colluding, SD {SD:g}, bad {BAD} / T {T} / good {GOOD}, no-show {NS:.0%} "
           f"per stage, {ROUNDS} rounds per submission, ${BRIBE:,.0f} sequencer bribe. Columns: first-M / random promotion.")
@@ -191,9 +229,9 @@ def main():
         kw = dict(fee=a.fee, bond=a.bond, B=a.B, P=a.P, beacons=a.beacons, seeds=a.seeds)
         show("config", evaluate(K, M, N, Q, R, promotion="first", **kw), evaluate(K, M, N, Q, R, promotion="random", **kw))
         return
-    for name, (K, M, N, Q, R), fee, bond in CLASSES:
-        show(name, evaluate(K, M, N, Q, R, fee, bond, promotion="first"), evaluate(K, M, N, Q, R, fee, bond, promotion="random"))
-    print("Jumbo (option A, 50/38/27 Q17 R12, $250 bond): use TODO item 13's figures; it needs beacons (see item 15).")
+    for name, (K, M, N, Q, R), fee, bond, bea in CLASSES:
+        show(name, evaluate(K, M, N, Q, R, fee, bond, beacons=bea, promotion="first"),
+             evaluate(K, M, N, Q, R, fee, bond, beacons=bea, promotion="random"))
 
 
 if __name__ == "__main__":
