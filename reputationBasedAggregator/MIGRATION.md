@@ -27,8 +27,10 @@ comparing the two ABIs and the code that calls them.
     pulled from the caller, and the caller must be the keeper owner or the operator's `owner()`.
   - The node generates a hash chain (item 6: seed `s`, `v_{i-1} = keccak256(v_i)`) and registers the
     head.
-  - `requestExit` + `completeExit` (after 7 days) replace `deregisterOracle`. `completeExit` reverts
-    while a health call is outstanding, so answer it first. `setPaused` replaces `setOracleActive`.
+  - `requestExit` + `completeExit` (after the unbonding period: 2 days by default, never less)
+    replace `deregisterOracle`. Either the operator owner or the keeper owner may run both, also for
+    a frozen arbiter. `setPaused` replaces `setOracleActive`.
+  - A returning arbiter registers its classes again: exiting frees its slots.
 - **Health calls** (`HealthCall(key, sentAt)` from the keeper).
   - Answer with `answerHealthCall(key, nextPreimage)` within `callDeadline` (60 s), from an authorized
     sender of the operator or its owner. Otherwise the arbiter is frozen until it answers.
@@ -58,6 +60,8 @@ Behaviour BountyEscrow must allow for:
 
 - **The submission stays `PendingVerdikta` until drawn, and an undrawn round never times out.**
   `failTimedOutSubmission` must not treat it as failed.
+- **Draw within a day.** `drawJury` reverts with `DrawExpired` more than a day after the request; the
+  round can then only be cancelled (to the treasury, below).
 - **No refund when the round ends this way.** A refund would be a free re-roll, so the unspent prepay
   goes to the treasury:
   - a missed beacon quorum (phase 8, `EvaluationFailed(aggId, 2)`);
@@ -89,7 +93,7 @@ use `ethers.getContractAt("ReputationAggregator", …)` now get the v2 ABI.
 | Script | v1 calls it depends on | v2 replacement |
 |---|---|---|
 | `register-oracle(-cl).js` | `registerOracle`, `getOracleInfo` | `registerArbiter` with a chain head, `getArbiter(key)` |
-| `unregister-oracle*.js` | `deregisterOracle` | `requestExit`, then `completeExit` after 7 days |
+| `unregister-oracle*.js` | `deregisterOracle` | `requestExit`, then `completeExit` after the unbonding period (2 days) |
 | `reset-oracle.js`, `reset-reputations-cl.js` | `resetAllReputations` | none (no reset in v2) |
 | `oracle-poller(-cl).js`, `arbiter-noise.js`, `arbiter-stats.js` | `registeredOracles`, `getRegisteredOraclesCount`, `getOracleInfo`, `getOracleClasses` | the `ArbiterRegistered` events, `classSize(cls)`, `getArbiter(key)` |
 | `monitor-contracts(-cl).js`, `agg-history.js` | `getContractConfig`, `oraclesToPoll`, `getAggregationStatus`, v1 events | `K()`/`M()`/`N()`/`P()`, `getRoundInfo`, v2 events |

@@ -176,14 +176,49 @@ describe("ReputationKeeper rules (item 14)", function () {
       await apply([a0.key], [H.code(H.T.MISS_FAILED)]);      // still blocked during unbonding
       expect((await info(a0.key)).offenses).to.equal(1n);
       await expect(keeper.completeExit(a0.key)).to.be.revertedWithCustomError(keeper, "StillBonded");
-      await time.increase(7 * DAY + 1);
+      await time.increase(2 * DAY - 60);
+      await expect(keeper.completeExit(a0.key)).to.be.revertedWithCustomError(keeper, "StillBonded");
+      await time.increase(61);                                 // 2 days, the default
       const owner = await a0.op.owner();
       await keeper.completeExit(a0.key);
       expect(await token.balanceOf(owner)).to.equal(H.STAKE);
-      expect(await keeper.eligibleCount(1, H.MAX_FEE)).to.equal(11n);   // lists are append-only (item 9)
+      expect(await keeper.eligibleCount(1, H.MAX_FEE)).to.equal(11n);
     });
 
-    it("a returning key keeps its scores, offenses and classes", async () => {
+    it("the operator owner can exit a frozen arbiter (the call is dropped, the slot freed)", async () => {
+      const a = arbs[2];
+      await keeper.sendHealthCalls([a.key]);
+      await time.increase(61);
+      expect(await keeper.isFrozen(a.key)).to.equal(true);
+      const o = await a.op.owner();
+      await ethers.provider.send("hardhat_setBalance", [o, "0x56BC75E2D63100000"]);
+      await ethers.provider.send("hardhat_impersonateAccount", [o]);
+      const os = await ethers.getSigner(o);
+      await keeper.connect(os).requestExit(a.key);
+      await time.increase(2 * DAY + 1);
+      await keeper.connect(os).completeExit(a.key);
+      await ethers.provider.send("hardhat_stopImpersonatingAccount", [o]);
+      expect(await token.balanceOf(o)).to.equal(H.STAKE);
+      expect(await keeper.freeSlotCount(1)).to.equal(1n);
+      const stranger = (await ethers.getSigners())[5];                       // neither owner
+      await expect(keeper.connect(stranger).requestExit(arbs[3].key)).to.be.revertedWithCustomError(keeper, "NotArbiterOwner");
+    });
+
+    it("unbonding is owner-set, never below 2 days, and applies to exits requested afterwards", async () => {
+      expect(await keeper.unbondingPeriod()).to.equal(BigInt(2 * DAY));
+      const [lock, decay, dead] = [await keeper.lockDuration(), await keeper.decayPeriod(), await keeper.callDeadline()];
+      await expect(keeper.setTiming(lock, decay, dead, 2 * DAY - 1)).to.be.revertedWithCustomError(keeper, "BadParams");
+      await keeper.requestExit(arbs[0].key);                   // 2 days
+      await keeper.setTiming(lock, decay, dead, 5 * DAY);
+      await keeper.requestExit(arbs[1].key);                   // 5 days
+      await time.increase(2 * DAY + 1);
+      await keeper.completeExit(arbs[0].key);
+      await expect(keeper.completeExit(arbs[1].key)).to.be.revertedWithCustomError(keeper, "StillBonded");
+      await time.increase(3 * DAY);
+      await keeper.completeExit(arbs[1].key);
+    });
+
+    it("a returning key keeps its scores and offenses, and takes its classes from the new registration", async () => {
       const a0 = arbs[0];
       await apply([a0.key], [H.code(H.T.MISS_FINISHED, H.Q.FAR)]);           // 300 / 300
       await apply([a0.key], [H.code(H.T.MISS_FAILED)]);                       // offense 1
@@ -194,7 +229,10 @@ describe("ReputationKeeper rules (item 14)", function () {
       await keeper.registerArbiter(a0.opAddr, a0.jobId, H.FEE, [2], a0.ch.head);
       const v = await info(a0.key);
       expect([Number(v.timeliness), Number(v.quality), Number(v.offenses)]).to.deep.equal([500, 300, 1]);
-      expect(await keeper.classSize(1)).to.equal(12n);                       // still listed in class 1
+      expect(await keeper.slotIn(a0.key, 1)).to.equal(0n);                  // its class 1 slot was freed
+      expect(await keeper.freeSlotCount(1)).to.equal(1n);
+      expect(await keeper.classSize(1)).to.equal(12n);
+      expect(await keeper.slotIn(a0.key, 2)).to.equal(1n);
       expect(await keeper.classSize(2)).to.equal(1n);
     });
 
@@ -206,6 +244,75 @@ describe("ReputationKeeper rules (item 14)", function () {
       await keeper.completeExit(a0.key);
       await expect(keeper.registerArbiter(a0.opAddr, a0.jobId, H.FEE, [1], a0.ch.head))
         .to.be.revertedWithCustomError(keeper, "AlreadyRegistered");
+    });
+  });
+
+  describe("slot reuse", () => {
+    async function exit(a) {
+      await keeper.requestExit(a.key);
+      await time.increase(2 * DAY + 1);
+      await keeper.completeExit(a.key);
+    }
+
+    it("an exited arbiter's slot goes to the next registration, so exits and joins do not grow the list", async () => {
+      const slot = await keeper.slotIn(arbs[3].key, 1);
+      await exit(arbs[3]);
+      expect(await keeper.freeSlotCount(1)).to.equal(1n);
+      const [fresh] = await H.registerArbiters(core, 1);
+      expect(await keeper.slotIn(fresh.key, 1)).to.equal(slot);
+      expect(await keeper.freeSlotCount(1)).to.equal(0n);
+      expect(await keeper.classSize(1)).to.equal(12n);
+      expect(await selectedKeys(12)).to.include(fresh.key);    // all 12 eligible are drawn
+      // the same key leaving and returning three times, and a join with no free slot
+      const a = arbs[5];
+      for (let i = 0; i < 3; i++) {
+        await exit(a);
+        await keeper.registerArbiter(a.opAddr, a.jobId, H.FEE, [1], a.ch.head);
+      }
+      expect(await keeper.classSize(1)).to.equal(12n);
+      await H.registerArbiters(core, 1);
+      expect(await keeper.classSize(1)).to.equal(13n);
+    });
+
+    it("a freed slot is skipped by the walk and the beacon pick", async () => {
+      for (const a of arbs.slice(0, 6)) await exit(a);
+      expect(await keeper.freeSlotCount(1)).to.equal(6n);
+      const keys = await selectedKeys(6);
+      expect(new Set(keys).size).to.equal(6);
+      expect(keys).to.not.include(ethers.ZeroHash);
+      const [bn, ts] = await at();
+      const beacons = await keeper.connect(fakeAgg).pickBeacons.staticCall(rndSeed(), 1, bn, ts, 6);
+      expect([...beacons].sort()).to.deep.equal(arbs.slice(6).map((a) => a.key).sort());
+    });
+
+    it("a draw at B gives the same jury after slots are freed and reused since B", async () => {
+      // arbs[1] and arbs[2] were exiting at B; after B they leave and three arbiters join, two of them
+      // into the freed slots. Within the draw age limit, selection as of B must not change
+      await keeper.requestExit(arbs[1].key);
+      await keeper.requestExit(arbs[2].key);
+      await time.increase(2 * DAY + 1);
+      const B = await at();
+      const seed = rndSeed();
+      const all = await selectedKeys(10, seed, B);             // every arbiter eligible at B
+      const some = await selectedKeys(6, seed, B);
+      await keeper.completeExit(arbs[1].key);
+      await keeper.completeExit(arbs[2].key);
+      const joined = await H.registerArbiters(core, 3);
+      expect(await keeper.freeSlotCount(1)).to.equal(0n);
+      expect(await keeper.classSize(1)).to.equal(13n);
+      expect(await selectedKeys(10, seed, B)).to.deep.equal(all);
+      expect(await selectedKeys(6, seed, B)).to.deep.equal(some);
+      for (const j of joined) expect(all).to.not.include(j.key);
+      // the same seed now sees the joiners
+      expect(await selectedKeys(13, seed)).to.include.members(joined.map((j) => j.key));
+    });
+
+    it("selection refuses a request block older than a day", async () => {
+      const B = await at();
+      await time.increase(DAY + 1);
+      await expect(selectedKeys(6, rndSeed(), B)).to.be.revertedWithCustomError(keeper, "StaleBlock");
+      await expect(keeper.connect(fakeAgg).pickBeacons(rndSeed(), 1, B[0], B[1], 4))
+        .to.be.revertedWithCustomError(keeper, "StaleBlock");
     });
   });
 

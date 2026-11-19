@@ -163,6 +163,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
     error InvalidConfig();
     error TooEarly();
     error SeedExpired();
+    error DrawExpired();
     error OutOfGas();
 
     // ------------------------------------------------------------------ events
@@ -201,7 +202,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
     uint40 public responseTimeoutSeconds = 300;
     uint40 public tPlus = 155;                 // mean + 2 SD of honest commit latency (item 14, Oct-Nov 2026)
     uint40 public revealWindow = 120;          // reveal time guaranteed after promotion (reveal p90 54 s)
-    uint40 private constant DRAW_GRACE = 1 days; // a sealed round nobody could draw for this long is cancelled
+    uint40 private constant DRAW_GRACE = 1 days; // no draw after this; the round can then only be cancelled
     /// @dev stipend per oracle request (CBOR build + LINK transferAndCall + operator): an honest request
     ///      needs ~125k, ~175k at the largest payload (TestOperator); a gas-burning operator costs at most this
     uint32 public dispatchGas = 250_000;
@@ -335,6 +336,10 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
      *         a second call once the quorum is in; the 30 s priority then runs from the quorum-th value.
      *         A second call after the beacon deadline without the quorum ends the round: the beacons
      *         that answered are paid and the rest of the prepay goes to the treasury.
+     *
+     *         No draw more than DRAW_GRACE (1 day) after the request: such a round can only be cancelled
+     *         to the treasury (cancelUnsealed). That bounds how old a block a draw reads, which the
+     *         keeper's unbonding (at least 2 days) and slot reuse rely on.
      */
     function drawJury(bytes32 aggId) external nonReentrant {
         uint256 id = uint256(aggId);
@@ -342,6 +347,8 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         uint256 eff = r.effMaxFee;
         uint256 anchor = r.requestTime;
         bytes32 seed;
+        if (r.phase != PH_DRAW && r.phase != PH_BEACON) revert WrongPhase();
+        if (block.timestamp > anchor + DRAW_GRACE) revert DrawExpired();
         if (r.phase == PH_DRAW) {
             if (r.sealedHash == bytes32(0)) _seal(r, aggId);
             if (r.beaconFees != 0) {
@@ -358,7 +365,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
                 return;
             }
             seed = keccak256(abi.encodePacked(aggId, r.sealedHash));
-        } else if (r.phase == PH_BEACON) {
+        } else {
             (uint8 st, bytes32 mix, uint256 readyAt, address[] memory payees) = beacons.result(address(this), aggId);
             if (st != 2 && st != 3) revert TooEarly();
             for (uint256 i = 0; i < payees.length; i++) {
@@ -374,8 +381,6 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
             }
             seed = keccak256(abi.encodePacked(aggId, r.sealedHash, mix));
             anchor = readyAt;
-        } else {
-            revert WrongPhase();
         }
         ReputationKeeper.Selected[] memory sel;
         uint256 g = gasleft();
@@ -417,8 +422,9 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
 
     /// @notice A round that can never be drawn goes to the treasury, never back to the requester (a
     ///         refund would be a free re-roll): unsealed once blockhash(B+1) left the 8,191-block
-    ///         history, or sealed but undrawn for DRAW_GRACE (a draw that cannot fit in a transaction,
-    ///         or a beacon stage nobody concluded; its beacons are then not paid).
+    ///         history, or sealed but undrawn for DRAW_GRACE, after which drawJury refuses (a draw that
+    ///         cannot fit in a transaction, or a beacon stage nobody concluded; its beacons are then not
+    ///         paid).
     function cancelUnsealed(bytes32 aggId) external nonReentrant {
         Round storage r = rounds[uint256(aggId)];
         if (r.phase != PH_DRAW && r.phase != PH_BEACON) revert WrongPhase();

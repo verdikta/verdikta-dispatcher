@@ -113,7 +113,7 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
       expect((await agg.ethOwed(deployer.address)) - t0).to.equal(received);
       expect(await agg.ethOwed(requester.address)).to.equal(0n);
       await expect(agg.cancelUnsealed(y.aggId)).to.be.revertedWithCustomError(agg, "TooEarly");    // sealed, < 1 day
-      await drv.draw(y, { waitBlocks: 0 });                                   // sealed: drawable any time
+      await drv.draw(y, { waitBlocks: 0 });                                   // sealed: drawable for a day
       expect(Object.keys(y.slots).length).to.equal(6);
     });
 
@@ -128,12 +128,19 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
       expect(await agg.ethOwed(requester.address)).to.equal(received);
     });
 
-    it("a sealed round nobody could draw for a day goes to the treasury", async () => {
+    it("a sealed round undrawn for a day can no longer be drawn, and goes to the treasury", async () => {
+      // the draw age limit: no draw reads a request block more than a day old, which the keeper's
+      // unbonding (at least 2 days) and slot reuse rely on
       const r = await drv.requestOnly();
       await mine(2);
       await agg.sealSeed(r.aggId);
       await expect(agg.cancelUnsealed(r.aggId)).to.be.revertedWithCustomError(agg, "TooEarly");
-      await time.increase(24 * 3600 + 1);
+      await time.increase(24 * 3600 - 30);
+      const snap = await takeSnapshot();
+      await drv.draw(r, { waitBlocks: 0 });                                   // still drawable just before
+      await snap.restore();
+      await time.increase(31);
+      await expect(agg.drawJury(r.aggId)).to.be.revertedWithCustomError(agg, "DrawExpired");
       const [deployer] = await ethers.getSigners();
       const t0 = await agg.ethOwed(deployer.address);
       const [, , , , received] = await agg.getRoundInfo(r.aggId);

@@ -21,7 +21,7 @@ arbiter node, the operator contract and the scripts.
 ## Run
 
 ```
-npx hardhat test                       # all 102 tests, ~3 min
+npx hardhat test                       # all 107 tests, ~3 min
 npx hardhat test test/gas.test.js      # gas and cost report per class
 npx hardhat test test/beacons.test.js  # the beacon stage
 AGG_CLASS=jumbo npx hardhat deploy --tags aggregator,keeper,config   # in-process deploy check
@@ -32,7 +32,8 @@ network. `deploy.sh` runs the same three tags against `NET` (default `base_sepol
 
 Tests:
 - `size.test.js`: EIP-170 / 3860 limits.
-- `keeper.rules.test.js`: Tables 1 and 2, decay, burns, unbonding, re-registration, freeze,
+- `keeper.rules.test.js`: Tables 1 and 2, decay, burns, unbonding (the 2-day floor), re-registration,
+  slot reuse (a draw at B unchanged by later exits and joins; the 1-day age limit), freeze,
   same-second calls, chain rotation, selection (including a back-to-back cartel block against the
   random-sample tails, and a walk that must reach every entry), the operator gate.
 - `aggregator.flow.test.js`:
@@ -46,7 +47,7 @@ Tests:
   - the pick and the values, which depend only on the state as of B and B+1 (earlier answers and
     rotations change nothing; frozen, paused, exiting and blocked arbiters are excluded);
   - answers verified like any health answer; the B+1 anchor; the deadline second; concurrent
-    rounds; no exit with a call pending;
+    rounds; a frozen beacon can exit, after its stage is long over;
   - payment (an unreadable owner goes unpaid), index-order mixing, determinism, completed blocks
     only and same-block ties, the missed quorum and how cheap withholding is;
   - the pool shortage, a jury shortage after the stage, owner changes mid-round, the requester's
@@ -82,7 +83,22 @@ so each class is a separate deployment. Local networks get a `MockLinkToken` and
   `closeCommits` charges nobody.
 - **Hits while blocked** (several in-flight rounds settling at once) restart the score but add no
   offense, so one incident cannot escalate to a ban.
-- **A returning key** (after `completeExit`) keeps its scores, offenses and class memberships.
+- **A returning key** (after `completeExit`) keeps its scores and offenses. Its classes come from the
+  new registration, since its old slots were freed at the exit.
+- **Exited slots are reused.** `completeExit` frees the arbiter's slot in each of its classes, and the
+  next registration in that class takes it before the list grows, so exits and joins don't lengthen
+  the walk. A freed slot costs the walk ~2k gas, not ~8.5k. A draw still reads the state as of B: the
+  old occupant has been ineligible (exiting) since `requestExit`, at least the unbonding period
+  before its slot was freed, and the new one was not registered at B or was already exiting.
+  `freeSlotCount(cls)` and `slotIn(key, cls)` show the state. A node that dies without exiting holds
+  its slot until its owner or the keeper owner exits it (below).
+- **Unbonding is 2 days by default, owner-set (`setTiming`), never below 2 days.** A day covers the
+  latest draw that can read a B from before the exit, and a day covers that round finishing and
+  settling, so its penalties land before the stake is refunded. A new period applies to exits
+  requested afterwards.
+- **No draw more than a day after the request.** `drawJury` reverts with `DrawExpired`, and the round
+  can only be cancelled to the treasury (`cancelUnsealed`). Selection also refuses a request block
+  more than a day old (`StaleBlock`). Slot reuse and the unbonding floor rely on this bound.
 - **Selection visits the class list in random order.** The walk draws random positions without
   repeats (a bitmap of visited positions), so where an arbiter sits in the list does not matter: a
   cartel that registers back to back is drawn no more often than any other set. It stops at the
@@ -102,12 +118,16 @@ so each class is a separate deployment. Local networks get a `MockLinkToken` and
   settlement is not charged for the outage. Only an answer to an outstanding call counts.
 - **Stake eligibility is checkpointed** (`F_UNDERSTAKED`), so a top-up between B and the draw cannot
   re-roll it. A new `stakeRequirement` applies to an arbiter at its next stake change.
-- **An outstanding health call must be answered before `completeExit`.** Re-registering would
-  otherwise drop the call unanswered.
+- **A frozen arbiter can exit.** The operator owner or the keeper owner can run `requestExit` and,
+  2 days later, `completeExit` even with a health call unanswered. A freeze exists to get a broken
+  arbiter fixed or removed, and the dropped call can't matter: every round or beacon stage that
+  could have called the arbiter read a B from before its `requestExit`, so it ended long before. So
+  the keeper owner can clear dead arbiters and free their slots. The stake goes to the operator's
+  owner.
 - **Every answer is recorded.** Each health answer adds a head entry with its block and time; entries
   are never overwritten. A rotation records the revealed value, then the new head.
-- **A sealed round nobody can draw** (for example a draw too large for one transaction, or a beacon
-  stage nobody concluded) can be cancelled to the treasury after a day.
+- **A sealed round nobody drew** (for example a draw too large for one transaction, or a beacon stage
+  nobody concluded) can be cancelled to the treasury after a day, and can no longer be drawn.
 - **`owner()` is read with a low-level call** that copies only one word. A malformed answer skips the
   slot instead of reverting the draw, and a huge return buffer costs the draw no more than the 30k
   stipend.

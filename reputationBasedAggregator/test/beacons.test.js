@@ -387,18 +387,32 @@ describe("JuryBeacons (item 9's beacon flag)", function () {
     expect(await pending(common.key)).to.equal(false);
   });
 
-  it("an arbiter with a call pending cannot complete its exit (re-registering would drop the call unanswered)", async () => {
-    const [lock, decay, dead] = [await keeper.lockDuration(), await keeper.decayPeriod(), await keeper.callDeadline()];
-    await keeper.setTiming(lock, decay, dead, 0);                             // unbonding shorter than the stage
+  it("a frozen arbiter can exit, by its operator owner or the keeper owner; a beacon stage is long over by then", async () => {
+    // a beacon picked at B was not exiting at B, so its exit completes at least 2 days after B, and
+    // the stage (started within a day of B, 120 s long) has ended
     const r = await drv.requestOnly();
     await drv.beaconStage(r, { answering: 1 });
-    const b = r.beacons[1];
-    await keeper.requestExit(b.key);
-    await expect(keeper.completeExit(b.key)).to.be.revertedWithCustomError(keeper, "CallPending");
-    await drv.answerBeacon(r, 1);                                              // answering reveals the value
-    await keeper.completeExit(b.key);
-    await drv.draw(r, { waitBlocks: 0 });
-    expect(await phase(r)).to.equal(PH.COMMIT);
+    const b = r.beacons[1];                                                    // called, never answers
+    await keeper.requestExit(b.key);                                           // by the keeper owner
+    await time.increase(2 * 24 * 3600 + 1);
+    expect(await keeper.isFrozen(b.key)).to.equal(true);
+    await expect(drv.draw(r, { waitBlocks: 0 })).to.be.revertedWithCustomError(agg, "DrawExpired");
+    const opOwner = await b.arb.op.owner();
+    const before = await core.token.balanceOf(opOwner);
+    await keeper.completeExit(b.key);                                          // call still pending
+    expect((await core.token.balanceOf(opOwner)) - before).to.equal(H.STAKE);
+    expect(await keeper.slotIn(b.key, 1)).to.equal(0n);
+    // the operator owner re-registers with a fresh chain: no longer frozen
+    const ch = H.makeChain();
+    await ethers.provider.send("hardhat_setBalance", [opOwner, "0x56BC75E2D63100000"]);
+    await ethers.provider.send("hardhat_impersonateAccount", [opOwner]);
+    const ownerSigner = await ethers.getSigner(opOwner);
+    await core.token.transfer(opOwner, H.STAKE);
+    await core.token.connect(ownerSigner).approve(await keeper.getAddress(), H.STAKE);
+    await keeper.connect(ownerSigner).registerArbiter(b.arb.opAddr, b.arb.jobId, H.FEE, [1], ch.head);
+    await ethers.provider.send("hardhat_stopImpersonatingAccount", [opOwner]);
+    expect(await keeper.isFrozen(b.key)).to.equal(false);
+    expect(await keeper.isEligible(b.key, H.MAX_FEE)).to.equal(true);
   });
 
   it("a jury shortage after the beacon stage refunds only if selection walks the whole class list", async () => {
@@ -461,11 +475,12 @@ describe("JuryBeacons (item 9's beacon flag)", function () {
     expect(ev(agg, r.rcpt, "JuryDrawn")[0].reward).to.equal(2n * H.MAX_FEE);
   });
 
-  it("a beacon stage nobody concluded for a day goes to the treasury, unpaid", async () => {
+  it("a beacon stage nobody concluded for a day goes to the treasury, unpaid, and can no longer be drawn", async () => {
     const r = await drv.requestOnly();
     await drv.beaconStage(r);
     await expect(agg.cancelUnsealed(r.aggId)).to.be.revertedWithCustomError(agg, "TooEarly");
     await time.increase(24 * 3600 + 1);
+    await expect(agg.drawJury(r.aggId)).to.be.revertedWithCustomError(agg, "DrawExpired");
     const t0 = await agg.ethOwed(deployer.address);
     const [, , , , received] = await agg.getRoundInfo(r.aggId);
     await agg.connect(stranger).cancelUnsealed(r.aggId);

@@ -34,8 +34,16 @@ interface IBurnableToken { function burn(uint256 amount) external; }
  *         Item 9 (two-phase request): selection is a pure function of a seed and of the selection
  *         state as of the request block B. Everything selection reads (scores, flags, block, fee,
  *         health-call times) is checkpointed by block number in one storage word per change, and class
- *         lists are append-only with checkpointed lengths, so state changes between B and the draw
- *         cannot shift the result.
+ *         lists have checkpointed lengths, so state changes between B and the draw cannot shift the
+ *         result.
+ *
+ *         Slot reuse: completeExit frees the arbiter's slot in each of its classes, and the next
+ *         registration in that class takes a freed slot before appending. A draw reads a slot's current
+ *         occupant as of B, which is still the as-of-B answer: the old occupant has been ineligible
+ *         (exiting) since requestExit, at least `unbondingPeriod` (>= MIN_UNBONDING, 2 days) before its
+ *         slot was freed, and a new occupant was not registered at B, or was exiting or gone. Both hold
+ *         for any B less than `unbondingPeriod` old, and no draw reads a B older than MAX_DRAW_AGE
+ *         (1 day; the aggregator stops draws then, and selection refuses an older B).
  *
  * @dev Selection visits the requested class's list (as of B) in a seed-derived random order (random
  *      positions without repeats, see _nextPos) and stops once the shortlist is full or after `maxScan`
@@ -141,7 +149,7 @@ contract ReputationKeeper is Ownable {
     error TransferFailed();
     error FutureBlock();
     error NotEnoughEligible();
-    error CallPending();
+    error StaleBlock();
 
     // ------------------------------------------------------------------ events
     event ArbiterRegistered(bytes32 indexed key, address indexed oracle, bytes32 jobId, uint256 fee);
@@ -161,10 +169,11 @@ contract ReputationKeeper is Ownable {
     mapping(bytes32 => Ck[]) internal cks;
     mapping(bytes32 => Meta) internal metas;
     mapping(bytes32 => HeadCk[]) internal heads;
-    mapping(uint64 => bytes32[]) internal classList;     // append-only
+    mapping(uint64 => bytes32[]) internal classList;     // slots: 0 = freed by an exit, reused by the next join
     mapping(uint64 => LenCk[]) internal classLen;
+    mapping(uint64 => uint32[]) internal freeSlots;      // freed slot indices per class
     mapping(bytes32 => uint64[]) internal classesOf;
-    mapping(bytes32 => mapping(uint64 => bool)) internal inClass;
+    mapping(bytes32 => mapping(uint64 => uint32)) internal slotOf;   // slot index + 1 (0 = not listed)
     mapping(address => bool) public approvedContracts;
 
     Points public points = Points(20, 50, 200, 500, 400, 500, 1000);
@@ -172,7 +181,13 @@ contract ReputationKeeper is Ownable {
     uint40 public lockDuration = 24 hours;
     uint40 public decayPeriod = 90 days;
     uint40 public callDeadline = 60;          // D, seconds
-    uint40 public unbondingPeriod = 7 days;
+    uint40 public unbondingPeriod = 2 days;   // owner-set, at least MIN_UNBONDING
+    /// @notice Shortest unbonding: a day for the latest draw that can still read a B from before the exit
+    ///         (MAX_DRAW_AGE), then a day for that round to finish and settle, so its penalties land
+    ///         before the stake is refunded. Slot reuse also needs it to be at least MAX_DRAW_AGE.
+    uint40 public constant MIN_UNBONDING = 2 days;
+    /// @notice Oldest request block a selection may read (the aggregator's DRAW_GRACE).
+    uint40 public constant MAX_DRAW_AGE = 1 days;
     uint8 public maxOffenses = 3;
     uint96 public burnPerBlock = 0;           // VDKA wei, doubled per earlier offense
     bool public burnOnBan = false;
@@ -247,9 +262,9 @@ contract ReputationKeeper is Ownable {
 
     // ================================================================== registration, stake, exit
     /// @param chainHead hash-chain head H^n(seed); health answers reveal successive preimages.
-    /// @dev A returning key (after completeExit) keeps its scores, offenses and class memberships: only a
-    ///      new key starts at `start`. Class lists are append-only (item 9), so a membership is permanent;
-    ///      `classes` may add classes but cannot remove one.
+    /// @dev A returning key (after completeExit) keeps its scores and offenses: only a new key starts at
+    ///      `start`. Its slots were freed at the exit, so `classes` sets its classes afresh, each taking a
+    ///      freed slot if one is waiting (see the contract notes on slot reuse).
     function registerArbiter(address oracle, bytes32 jobId, uint64 fee, uint64[] calldata classes, bytes32 chainHead)
         external
     {
@@ -281,18 +296,29 @@ contract ReputationKeeper is Ownable {
         c.callSentAt = 0;
         c.callAnsweredAt = 0;
         _write(key, c);
-        // class lists are append-only: a returning arbiter keeps its old entries
+        // a freed slot first (see the contract notes), else append. A returning arbiter's slots were
+        // freed at its exit, so it takes its classes from this registration like a new one
         for (uint256 i = 0; i < classes.length; i++) {
             uint64 cl = classes[i];
-            if (inClass[key][cl]) continue;
+            if (slotOf[key][cl] != 0) continue;
             classesOf[key].push(cl);
-            inClass[key][cl] = true;
             bytes32[] storage list = classList[cl];
-            list.push(key);
-            LenCk[] storage lc = classLen[cl];
-            uint256 n = lc.length;
-            if (n > 0 && lc[n - 1].fromBlock == block.number) lc[n - 1].len = uint224(list.length);
-            else lc.push(LenCk(uint32(block.number), uint224(list.length)));
+            uint32[] storage free = freeSlots[cl];
+            uint256 nf = free.length;
+            uint256 pos;
+            if (nf > 0) {
+                pos = free[nf - 1];
+                free.pop();
+                list[pos] = key;
+            } else {
+                pos = list.length;
+                list.push(key);
+                LenCk[] storage lc = classLen[cl];
+                uint256 n = lc.length;
+                if (n > 0 && lc[n - 1].fromBlock == block.number) lc[n - 1].len = uint224(list.length);
+                else lc.push(LenCk(uint32(block.number), uint224(list.length)));
+            }
+            slotOf[key][cl] = uint32(pos + 1);
         }
         emit ArbiterRegistered(key, oracle, jobId, fee);
     }
@@ -340,20 +366,31 @@ contract ReputationKeeper is Ownable {
     }
 
     /// @notice Finish unbonding: refund the remaining stake to the arbiter's owner. A banned key keeps
-    ///         its record (a tombstone), so it can never register again. An outstanding health call
-    ///         must be answered first: re-registering would otherwise drop it unanswered, so a beacon
-    ///         could clear its call without revealing its value.
+    ///         its record (a tombstone), so it can never register again. Frees the arbiter's slot in each
+    ///         of its classes for the next registration (see the contract notes). The operator owner or
+    ///         the keeper owner can do it, also for a frozen arbiter: a freeze exists to get a broken
+    ///         arbiter fixed or removed. An outstanding call is dropped, which cannot matter: unbonding is
+    ///         at least MIN_UNBONDING (2 days), and every round or beacon stage that could have called
+    ///         the arbiter read a B from before its requestExit, so it ended long before.
     function completeExit(bytes32 key) external {
         Meta storage m = _onlyArbiterOwner(key);
         Ck memory c = _cur(key);
         if (c.flags & F_EXITING == 0 || block.timestamp < m.exitAt) revert StillBonded();
-        if (c.flags & F_CALL_PENDING != 0) revert CallPending();
         if (c.blockedUntil > block.timestamp) revert Blocked();
         uint256 refund = m.stake;
         address to = IOracleOwner(m.oracle).owner();
         m.stake = 0;
         if (c.flags & F_BANNED == 0) c.flags = 0;     // unregistered; may register again later
         _write(key, c);
+        uint64[] storage cs = classesOf[key];
+        for (uint256 i = 0; i < cs.length; i++) {
+            uint64 cl = cs[i];
+            uint256 pos = slotOf[key][cl] - 1;
+            classList[cl][pos] = bytes32(0);
+            freeSlots[cl].push(uint32(pos));
+            delete slotOf[key][cl];
+        }
+        delete classesOf[key];
         if (refund > 0 && !verdiktaToken.transfer(to, refund)) revert TransferFailed();
         emit ArbiterRemoved(key, refund);
     }
@@ -504,6 +541,7 @@ contract ReputationKeeper is Ownable {
         if (sp.alpha > 1000 || sp.count == 0 || sp.estimatedBaseCost >= sp.maxFee || sp.maxFeeBasedScalingFactor < 1)
             revert BadParams();
         if (atBlock >= block.number) revert FutureBlock();
+        if (atTime + MAX_DRAW_AGE < block.timestamp) revert StaleBlock();
         bytes32[] storage list = classList[sp.requestedClass];
         uint256 n = _lenAt(sp.requestedClass, atBlock);
         if (n == 0) revert NoEligibleArbiters();
@@ -519,6 +557,7 @@ contract ReputationKeeper is Ownable {
         uint256 total;
         for (uint256 i = 0; i < scanLimit && m < cap; i++) {
             bytes32 key = list[_nextPos(wk)];
+            if (key == bytes32(0)) continue;          // a freed slot (counts as a visit)
             Ck memory c = _at(key, atBlock);
             if (_eligibleAt(c, sp.maxFee, atTime)) {
                 sk[m] = key;
@@ -577,6 +616,7 @@ contract ReputationKeeper is Ownable {
         returns (bytes32[] memory keys)
     {
         if (atBlock >= block.number) revert FutureBlock();
+        if (atTime + MAX_DRAW_AGE < block.timestamp) revert StaleBlock();
         keys = new bytes32[](count);
         uint256 n = _lenAt(cls, atBlock);
         uint256 m;
@@ -586,6 +626,7 @@ contract ReputationKeeper is Ownable {
             Walk memory wk = _walk(seed, n, scanLimit);
             for (uint256 i = 0; i < scanLimit && m < count; i++) {
                 bytes32 key = list[_nextPos(wk)];
+                if (key == bytes32(0)) continue;      // a freed slot (counts as a visit)
                 Ck memory c = _at(key, atBlock);
                 if (c.flags & (F_REGISTERED | F_PAUSED | F_BANNED | F_EXITING | F_UNDERSTAKED) == F_REGISTERED
                     && c.blockedUntil <= atTime && !_frozenAt(c, atTime)) {
@@ -794,12 +835,24 @@ contract ReputationKeeper is Ownable {
         }
     }
 
+    /// @notice Slots in the class list, including freed ones (what a selection walks)
     function classSize(uint64 cls) external view returns (uint256) {
         return classList[cls].length;
     }
 
+    /// @notice Freed slots waiting for the next registration in `cls`
+    function freeSlotCount(uint64 cls) external view returns (uint256) {
+        return freeSlots[cls].length;
+    }
+
+    /// @notice The arbiter's slot index in `cls` plus one (0 = not listed)
+    function slotIn(bytes32 key, uint64 cls) external view returns (uint256) {
+        return slotOf[key][cls];
+    }
+
     /// @notice Whether a selection walks the whole class list, so that whether it finds enough
-    ///         eligible arbiters does not depend on the seed (lists only grow, so this holds as of B too)
+    ///         eligible arbiters does not depend on the seed (lists never shrink, freed slots are reused,
+    ///         so this holds as of B too)
     function scansAll(uint64 cls) external view returns (bool) {
         return classList[cls].length <= maxScan;
     }
@@ -822,8 +875,9 @@ contract ReputationKeeper is Ownable {
         points = p;
     }
 
+    /// @dev `unbonding` applies to exits requested from now on, and must be at least MIN_UNBONDING
     function setTiming(uint40 lock, uint40 decay, uint40 deadline, uint40 unbonding) external onlyOwner {
-        if (decay == 0) revert BadParams();
+        if (decay == 0 || unbonding < MIN_UNBONDING) revert BadParams();
         lockDuration = lock;
         decayPeriod = decay;
         callDeadline = deadline;

@@ -586,6 +586,27 @@ the randomness exists.
     - `keeper.rules.test.js` checks a 10-of-40 block against the hypergeometric tails (the stride
       walk put 51 of 1,000 seeds in them; the random walk 5, against 8.4 expected) and that the walk
       reaches every entry.
+  - **Reuse exited slots, with 2-day unbonding and a 1-day draw age limit (2026-11-19).** Lists were
+    append-only, so exits and dead entries built up and the walk paid ~8.5k gas for each one it
+    visited. At 15% eligible, Jumbo's draw reached the per-transaction cap. Now:
+    - `completeExit` frees the arbiter's slot in each class; the next registration in the class
+      takes a freed slot before appending. A returning arbiter takes its classes from the new
+      registration. A freed slot costs the walk ~2k gas.
+    - Why a draw at B is unchanged: the old occupant has been exiting (ineligible, checkpointed)
+      since `requestExit`, at least the unbonding period before the slot was freed. A new occupant
+      was not registered at B, or was exiting or gone. Both hold for any B younger than the
+      unbonding period.
+    - So draws are limited to a day after the request (`DrawExpired`; then only `cancelUnsealed`),
+      and the keeper refuses an older B (`StaleBlock`). Before this, a sealed round could be drawn
+      at any age, which also let an arbiter drawn long after its `requestExit` leave before the
+      round's penalties landed.
+    - Unbonding is 2 days by default, owner-set, never below 2 days (`MIN_UNBONDING`): a day for the
+      latest draw, a day for that round to finish and settle. It was 7 days, never derived.
+    - Gas: registering in one class 0.36M appending, 0.33M into a freed slot; `completeExit` 0.13M.
+      The aggregator grew 48 B (254 B of headroom left).
+    - Dead nodes: the operator owner or the keeper owner can exit a frozen arbiter (`requestExit`,
+      then `completeExit` 2 days later), which frees its slot. A permissionless `evict(key)` after
+      30 days frozen or paused would only matter if removal shouldn't depend on the owner.
 - **Promotion (item 14's M+ / T+) has the same withholding problem** as the draw. The promotion seed
   is `blockhash(C+1)`, so whoever can call `promote` sees the draw first. If only the requester
   calls it, the requester can abort a draw it dislikes and pay only the base fees, which re-rolls
@@ -642,8 +663,10 @@ the randomness exists.
     - A jury shortage after the beacon stage is refunded only if selection walks the whole class list
       (`scansAll`). Otherwise the outcome depended on the seed, and a beacon's timing could buy a
       refunded re-roll, so it goes to the treasury.
-    - `completeExit` refuses while a health call is pending: exit and re-registration could drop a
-      beacon call unanswered.
+    - `completeExit` refused while a health call was pending: with an unbonding period shorter than
+      the stage, exit and re-registration could drop a beacon call unanswered. Superseded
+      (2026-11-19): unbonding is now at least 2 days, longer than any stage or round that could
+      call an exiting arbiter, so a frozen arbiter may exit (item 9, "Reuse exited slots").
     - The stage picks at least the round's fixed quorum when the owner has lowered `polled`.
     - The owner() stipend check counts the cold-account cost.
     - Swapping the beacon contract mid-stage remains an owner constraint (documented).
@@ -1367,7 +1390,8 @@ start disabled and can be turned on by the owner once real block rates are known
 - **Nothing is burned for freezing.** Being down is not misbehaviour.
 - **Full stake to be selected.** An arbiter whose stake is below `STAKE_REQUIREMENT` after a burn is
   not eligible until it tops up. Otherwise a burn that reaches 0 means nothing.
-- **Unbonding on exit.** Deregistering starts a delay (e.g. 7 days, owner-set) during which the
+- **Unbonding on exit.** Deregistering starts a delay (2 days by default, owner-set, at least 2 days:
+  item 9, "Reuse exited slots") during which the
   arbiter is not selected but blocks and bans still apply. The stake is refunded only after the
   delay. Deregistering while blocked stays forbidden. This closes the leave-before-punishment route.
 - **What burns can and can't do.** They hit only what reputation sees: cartels that fail rounds,
@@ -1697,8 +1721,9 @@ The README lists the behaviour; the points below changed or sharpened the design
 - **A score that reaches 0 while the arbiter is already blocked** restarts at 500 but adds no offense.
   Several in-flight rounds failing together count as one incident, not as a quick path to a ban. The
   simulator runs rounds one at a time, so this case doesn't occur there.
-- **A returning key keeps its scores, offenses and classes.** Exiting and re-registering no longer
-  resets a low score to 500. A new jobId still gives a fresh key, as noted under "Ban burn".
+- **A returning key keeps its scores and offenses.** Exiting and re-registering no longer resets a
+  low score to 500. A new jobId still gives a fresh key, as noted under "Ban burn". Its classes come
+  from the new registration (its slots were freed at the exit, item 9).
 - **Health calls use a pending flag, not a time comparison.** Base timestamps are whole seconds, so a
   call sent in the same second as the last answer would otherwise look answered.
 - **Hash chains can be rotated** (`rotateChain`): the answer comes from the old chain, and the new
