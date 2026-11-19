@@ -1,14 +1,14 @@
 // deploy/01_aggregator.js
 // -----------------------------------------------------------------------------
-// Deploys ReputationAggregator with a **dummy keeper address**. The real keeper
-// is wired up later in deploy/003_config.js.
+// Deploys the two external libraries and ReputationAggregator with a placeholder
+// keeper. 02_keeper.js deploys the keeper and JuryBeacons and wires all three.
 // -----------------------------------------------------------------------------
 //   • Skips deployment entirely when the SKIP_MIGRATIONS env var is set
-//   • Maps LINK token addresses by network name (same as the old Truffle script)
-//   • Tagged "aggregator" so you can run: npx hardhat deploy --tags aggregator
+//   • LINK token by network; local networks get a MockLinkToken
+//   • Tagged "aggregator":  npx hardhat deploy --tags aggregator
 // -----------------------------------------------------------------------------
 
-const { verifyContract } = require("./helpers");
+const { verifyContract, isLocal } = require("./helpers");
 
 module.exports = async ({ deployments, getNamedAccounts, network }) => {
   if (process.env.SKIP_MIGRATIONS) {
@@ -16,65 +16,49 @@ module.exports = async ({ deployments, getNamedAccounts, network }) => {
     return;
   }
 
-  const { deploy }   = deployments;
+  const { deploy } = deployments;
   const { deployer } = await getNamedAccounts();
-  const isBaseFamily = /^base(_|$)/.test(network.name); // base, base_sepolia, base_goerli
-  const CONFIRMATIONS = isBaseFamily ? 2 : 1;
+  const CONFIRMATIONS = /^base(_|$)/.test(network.name) ? 2 : 1;
 
-  // LINK token address lookup (per network)
   const LINK_TOKEN_ADDRESS = {
-    base:          "0x88Fb150BDc53A65fe94Dea0c9BA0a6dAf8C6e196",
-    base_goerli:   "0xd886e2286fd1073df82462ea1822119600af80b6",
-    base_sepolia:  "0xE4aB69C077896252FAFBD49EFD26B5D171A32410",
-    development:   "0x0000000000000000000000000000000000000000",
-    hardhat:       "0x0000000000000000000000000000000000000000",
-    localhost:     "0x0000000000000000000000000000000000000000",
+    base:         "0x88Fb150BDc53A65fe94Dea0c9BA0a6dAf8C6e196",
+    base_sepolia: "0xE4aB69C077896252FAFBD49EFD26B5D171A32410",
   };
 
-  const linkAddr = LINK_TOKEN_ADDRESS[network.name];
-  if (!linkAddr) {
-    throw new Error(`No LINK token address configured for network: ${network.name}`);
+  let linkAddr = LINK_TOKEN_ADDRESS[network.name];
+  if (!linkAddr && isLocal(network.name)) {
+    // the aggregator sends requests with transferAndCall(operator, 0, data), so a local chain
+    // needs an ERC-677 token that fires onTokenTransfer
+    linkAddr = (await deploy("MockLinkToken", { from: deployer, args: [10n ** 27n], log: true })).address;
+  }
+  if (!linkAddr) throw new Error(`No LINK token address configured for network: ${network.name}`);
+
+  // AggregatorLib (CID / hex / payload helpers) and ScoringLib (cluster, classes, promotion draw)
+  // are linked (DELEGATECALL) so the aggregator stays under the 24 KB code-size limit.
+  const libs = {};
+  for (const name of ["AggregatorLib", "ScoringLib"]) {
+    const lib = await deploy(name, { from: deployer, log: true, waitConfirmations: CONFIRMATIONS });
+    libs[name] = lib.address;
+    if (lib.newlyDeployed) await verifyContract(lib.address, [], `contracts/${name}.sol:${name}`);
   }
 
-  const ZERO = "0x0000000000000000000000000000000000000000"; // placeholder keeper
-
-  // AggregatorLib holds the pure clustering/cid/hex helpers; the aggregator
-  // links against it (DELEGATECALL) to stay under the 24 KB code-size limit.
-  const lib = await deploy("AggregatorLib", {
-    from: deployer,
-    log: true,
-    waitConfirmations: CONFIRMATIONS
-  });
-
-  if (lib.newlyDeployed) {
-    await verifyContract(
-      lib.address,
-      [],
-      "contracts/AggregatorLib.sol:AggregatorLib"
-    );
-  }
-
-  // NOTE: `ReputationAggregator` is the ETH-funded contract. It still takes the LINK
-  // token address because the Chainlink request rail dispatches via transferAndCall(
-  // operator, 0, data) (0 juel) and ChainlinkClient needs the token wired. Do NOT drop
-  // the linkAddr arg — only the *consumer* (DemoClient) drops LINK. See docs section 7 step 16.
+  // The aggregator is ETH-funded. It still takes the LINK token because the Chainlink request rail
+  // dispatches via transferAndCall(operator, 0, data) (0 juel).
+  const ZERO = "0x0000000000000000000000000000000000000000";   // keeper, set by 02_keeper.js
   const result = await deploy("ReputationAggregator", {
     from: deployer,
     args: [linkAddr, ZERO],
-    libraries: { AggregatorLib: lib.address },
+    libraries: libs,
     log: true,
-    waitConfirmations: CONFIRMATIONS
+    waitConfirmations: CONFIRMATIONS,
   });
 
   if (result.newlyDeployed) {
-    await verifyContract(
-      result.address,
-      [linkAddr, ZERO],
-      "contracts/ReputationAggregator.sol:ReputationAggregator",
-      { "contracts/AggregatorLib.sol:AggregatorLib": lib.address }
-    );
+    await verifyContract(result.address, [linkAddr, ZERO], "contracts/ReputationAggregator.sol:ReputationAggregator", {
+      "contracts/AggregatorLib.sol:AggregatorLib": libs.AggregatorLib,
+      "contracts/ScoringLib.sol:ScoringLib": libs.ScoringLib,
+    });
   }
 };
 
 module.exports.tags = ["aggregator"];
-

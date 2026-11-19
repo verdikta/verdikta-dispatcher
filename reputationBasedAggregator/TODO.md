@@ -454,8 +454,9 @@ coordinated redeploy of the aggregator and keeper plus a bounty-program release.
 
 ## 9. Two-phase request: commit first, draw the jury from a later block hash
 
-**Status:** not started in the deployed contracts (design discussed 2026-11-07). Example
-implementation in `v2/` (with item 14), reviewed and updated 2026-11-18.
+**Status:** not started in the deployed contracts (design discussed 2026-11-07). Implemented in this
+folder's v2 contracts with item 14, including the beacon flag (`JuryBeacons`). The v2 contracts replaced
+v1 here on 2026-11-18; v1 is tag `aggregator-v0.1.0`.
 **Scope:** `ReputationAggregator.sol` + `ReputationKeeper.sol` (selection inputs, checkpoints) +
 bounty program (`BountyEscrow.sol`, `EvaluationWallet.sol`, site, agent skill and docs). Breaking
 change to the request flow and `maxTotalFee`.
@@ -550,7 +551,7 @@ the randomness exists.
 - **The one exception.** If nobody sealed or drew the round within the history window (8,191
   blocks, about 27 min), the round can never be drawn. A permissionless cancel then sends the prepay to the treasury. It must not refund the
   requester: a refund would be a free re-roll.
-- **Lessons from the v2 example contracts** (`v2/`, reviewed 2026-11-18):
+- **Lessons from the v2 example contracts** (reviewed 2026-11-18):
   - **A sealed round can become undrawable.** A selected arbiter could revert the draw by burning all
     gas in its operator or by returning malformed `owner()` data. Since the seed is fixed, the round
     would then be stuck forever with its prepay. Fixes:
@@ -580,6 +581,55 @@ the randomness exists.
   - **Gives promoted arbiters 120 s to reveal after `promote`**, extending the deadline if needed.
     Otherwise calling `promote` late (or a colluder sending the M+-th commit late) leaves no time
     to reveal, and the round fails with every honest promoted arbiter charged −500.
+
+- **Beacon flag as implemented (2026-11-18).** `JuryBeacons` is a separate contract, to keep the
+  aggregator under the 24,576-byte limit (24,076 bytes). Decisions the design left open:
+  - **Everything as of B.** The keeper picks the 4 beacons from the class's state as of B. An
+    independent review found that the first version, which skipped arbiters whose chain had moved
+    since B, let whoever started the stage steer it. Health calls from another round move honest
+    heads but not the cartel's, and pushing out enough candidates bought a refund. Now nothing after
+    B changes the pick or the values.
+  - **A beacon call is a health call (2026-11-19).** The beacon answers it like any arbiter, with its
+    next chain value, which the keeper verifies. Its beacon value is its first value revealed after B
+    (`revealAfter`): normally its answer to the beacon call, or its answer to an earlier call if it
+    answered one after B.
+    - So the value was fixed at B. A rotation after B reveals that value first, so it cannot choose
+      the value.
+    - Answering is revealing, so a live beacon cannot keep its value back. Withholding means leaving
+      the call unanswered, and the beacon is then frozen like any silent arbiter. This closes the
+      review's open item, where a beacon could answer at the keeper and never submit its value.
+    - There is no separate submission, so the node needs no beacon-specific code.
+    - Head entries are never overwritten and record the block and time of each reveal. A rotation
+      writes the revealed value, then the new head.
+  - **Who may be a beacon:** registered, and not paused, banned, exiting, under-staked, blocked or
+    frozen at B. Only the arbiter (operator owner or authorized sender) can answer, so no relayer
+    chooses which values arrive first.
+  - **Order:** the first 2 reveals by block are used, with ties going to the lower beacon index, and
+    they are mixed in beacon-index order. Arrival decides which values are used but not their order,
+    which halves a cartel's choices. `result` reads only completed blocks, so transaction order within
+    a block cannot change it, and a ready result is final.
+  - **Starting the stage:** the first `drawJury` seals and starts it, unrewarded. The second draws and
+    earns the reward, with the requester's 30 s priority counted from the quorum.
+  - **Missed quorum:** a draw after the 120 s deadline fails the round. The answering beacon is paid
+    and the rest goes to the treasury. If fewer than 2 candidates exist at B, the round is refunded
+    (pool shortage).
+  - **Payment:** each used beacon's operator owner is read with a 30k stipend at the draw. An owner that
+    cannot be read goes unpaid, and the draw goes ahead.
+  - **Cost:** about 0.39M gas to start. A beacon answer is an ordinary health answer (123k). Jumbo is
+    about $0.57 a round in gas with beacons, $0.56 without.
+  - **Silent beacons are only frozen**, as for any missed health call: no score change. If freezing is
+    too cheap for a cartel that forces no-result rounds, the option is −400 timeliness for a beacon
+    that stayed silent when the stage missed its quorum. Not modelled.
+- **Other fixes from the 2026-11-18 review** (all with tests):
+  - A requester could skip `closeCommits` (with one colluding juror not committing) for a refund. A
+    round with M commits that was never promoted now sends its prepay to the treasury.
+  - `owner()` return data is no longer copied: a 64 KB answer made every later slot pay for memory
+    (about 10 such jurors put Jumbo's draw over the cap).
+  - The settlement-queue walk counts already-settled entries, so ~2,900 holes can no longer make
+    every request run out of gas.
+  - A close in the deadline's last second extends the deadline by 30 s so `promote` can still run.
+  - Credit no longer pays for what `msg.value` covers, so the escrow is exactly `maxTotalFee`.
+  - Only an arbiter's owner can top up its stake.
 
 ### Expected payoff
 At the risk model's defaults (300 eligible arbiters, 3% colluders, SD 3) with a $0.50 base fee:
@@ -1160,8 +1210,8 @@ round at 0.006 gwei.
 
 **Status:** design simulated (rules simplified 2026-11-15; no-commit penalty lowered to −400
 2026-11-16; promotion rule M+ / T+ 2026-11-17, adopted as the plan 2026-11-18), not started in the
-deployed contracts. Example implementation in `v2/`, updated and reviewed 2026-11-18 (see "v2 example
-contracts" below).
+deployed contracts. Implemented in this folder's v2 contracts (which replaced v1 here on 2026-11-18),
+updated and reviewed 2026-11-18 (see "v2 example contracts" below).
 **Scope:** `ReputationKeeper.sol` (two scores, points, blocks, ban, selection weight, stake burns,
 unbonding) and
 `ReputationAggregator.sol` (record late reveals, classify each reveal as close / off / far, report
@@ -1605,8 +1655,9 @@ M+ / T+ promotion, 15% cartel attacking only when it can win, 60 days × 3 seeds
   rewards fake commits. Rerunning without it changed nothing material.
 
 ### v2 example contracts (2026-11-18)
-`v2/` implements Tables 1 and 2, the freeze, M+ / T+ promotion and item 9's two-phase request (no
-beacons). Its README lists the behaviour; the points below changed or sharpened the design.
+The v2 contracts (in `v2/` until they replaced v1 in this folder on 2026-11-18) implement Tables 1 and
+2, the freeze, M+ / T+ promotion and item 9's two-phase request, including its beacon flag (item 9).
+The README lists the behaviour; the points below changed or sharpened the design.
 - **Scores are on the arbiters' 0..1,000,000 scale.** Mainnet reveals look like `[970000, 30000]`.
   The spread floor is 30,000 (3 points). The first draft used 3, which would have scored almost every
   honest reveal far (−200).
@@ -1624,9 +1675,15 @@ beacons). Its README lists the behaviour; the points below changed or sharpened 
   call sent in the same second as the last answer would otherwise look answered.
 - **Hash chains can be rotated** (`rotateChain`): the answer comes from the old chain, and the new
   head applies to later calls only.
-- **Measured gas, 300-arbiter pool, one full round at 0.006 gwei:** Small $0.08, Medium $0.09, Large
-  $0.23, Jumbo (no beacons) $0.51. Jumbo's draw is 13.4M of the 16.8M per-transaction cap, and
-  `promote` is 5.8M. Selection is 2.9M at K = 50, and the same with 300 or 3,000 arbiters.
+- **Measured gas, 300-arbiter pool, one full round, all transactions, at 0.006 gwei** (re-measured
+  2026-11-18 with the operators' keeper gate and checkpointed chain heads):
+  - Small $0.087, Medium $0.099, Large $0.248, Jumbo $0.558 without beacons and $0.569 with them
+    (2026-11-19, beacon values from health answers).
+  - Jumbo's draw is 13.6M of the 16.8M per-transaction cap, and `promote` is 5.9M.
+  - Selection is 2.9M at K = 50, and the same with 300 or 3,000 arbiters.
+  - A health answer is 123k, up from 77k, for the head checkpoint.
+  - These are a little above `bounty_sizing.py`'s gas term (0.05 + 0.34 × K / 50: $0.09 at K = 6,
+    $0.39 at K = 50). The Jumbo gap (about $0.17 a round) is too small to move item 15's limits.
 
 ### Open
 - **The abstain dodge (found 2026-11-18, not fixed).** A cartel that blocks by never committing can
@@ -1870,9 +1927,9 @@ call `promote` first; the draw reward goes back to the hunter.
   the protection from the sequencer; a no-beacon Jumbo would need about K = 35 at this standard.
 
 ### Open
-- **Jumbo's draw size.** In `v2/` Jumbo's draw uses about 13.4M of the 16.8M per-transaction cap. A
-  gas-burning operator adds at most about 140k, so about 21 colluding jurors of 50 would make the draw
-  too large. The round could then only be cancelled to the treasury after a day.
+- **Jumbo's draw size.** In the v2 contracts Jumbo's draw uses about 13.6M of the 16.8M per-transaction
+  cap (with the operators' keeper gate). A gas-burning operator adds at most about 140k, so about 23
+  colluding jurors of 50 would make the draw too large. The round could then only be cancelled to the treasury after a day.
 - **Noise.** Everything assumes honest SD 3, a target. The measured normal-SD equivalent is 7.1,
   which lowers every limit; re-size once noise is re-measured (item 13's sensitivity).
 - **Cartel share and pool.** 15% of 300 eligible; 32 arbiters are registered today.

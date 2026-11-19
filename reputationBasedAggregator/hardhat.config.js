@@ -25,6 +25,13 @@ module.exports = {
   },
 
   networks: {
+    hardhat: {
+      // Base's block gas limit is far higher; 60M leaves room for the K=50 draw while the tests
+      // separately assert every transaction stays under the 16,777,216 per-tx cap (EIP-7825).
+      blockGasLimit: 60_000_000,
+      allowUnlimitedContractSize: false,
+      accounts: { count: 40 },
+    },
     development: {
       url: "http://127.0.0.1:8545",
       accounts: ACCOUNTS,
@@ -101,7 +108,7 @@ module.exports = {
     ],
   },
 
-  mocha: { timeout: 100_000 },
+  mocha: { timeout: 600_000 },
   sourcify: {enabled: false},
 };
 

@@ -80,4 +80,9 @@ async function verifyContract(address, constructorArgs, contractFQN, libraries) 
   }
 }
 
-module.exports = { verifyContract };
+/** In-process or local node: the deploy scripts create stand-in tokens there. */
+function isLocal(network) {
+  return LOCAL_NETWORKS.has(network);
+}
+
+module.exports = { verifyContract, isLocal };

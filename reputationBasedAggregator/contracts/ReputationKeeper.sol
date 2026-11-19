@@ -4,876 +4,782 @@ pragma solidity ^0.8.23;
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-import "@openzeppelin/contracts/utils/introspection/IERC165.sol";
-import "./IArbiterOperator.sol";   // same interface as above
-
-/// @notice Minimal interface to query an oracle contract's owner.
-interface IOracleOwner {
-    function owner() external view returns (address);
-}
+interface IOracleOwner { function owner() external view returns (address); }
+interface IAuthorizedSenders { function isAuthorizedSender(address sender) external view returns (bool); }
+interface IBurnableToken { function burn(uint256 amount) external; }
 
 /**
- * @title ReputationKeeper
- * @author Verdikta Team
- * @notice Manages oracle registration, reputation tracking, and selection for the Verdikta network
- * @dev Central registry for oracle reputation management using composite keys (oracle address + jobID).
- *      Implements staking, slashing, reputation scoring, and weighted oracle selection algorithms.
+ * @title ReputationKeeper (example implementation of TODO items 14 and 9)
+ * @notice Arbiter registry, stake, two-score reputation, blocks / bans / decay, liveness freeze and
+ *         reputation-weighted selection.
+ *
+ *         Table 1 (points) is applied through applyOutcomes(): the aggregator reports one byte per
+ *         polled slot (low nibble = timeliness event, bits 4-5 = quality class, bit 7 = the arbiter
+ *         committed in this round) and the keeper maps it to points, so the point values live in one
+ *         place and are owner-settable.
+ *
+ *         Table 2 (consequences):
+ *           - scores are integers 0..cap (default 1000), start at `start` (default 500);
+ *           - a score that reaches 0 blocks the arbiter for lock x 2^offenses and restarts at `start`;
+ *           - one offense is forgiven per `decayPeriod` clean days (lazy, applied at the next block);
+ *           - the `maxOffenses`-th block is a permanent ban;
+ *           - burns: burnPerBlock x 2^offenses on a block (default 0), whole stake on a ban if burnOnBan
+ *             (default off);
+ *           - an unanswered hash-chain (health) call older than `callDeadline` freezes the arbiter until
+ *             it answers. A frozen arbiter is not scored, unless it committed in the round: a commit
+ *             proves it was up, so freezing cannot be used to dodge the penalty for going silent;
+ *           - a score that reaches 0 while the arbiter is already blocked restarts at `start` but adds
+ *             no offense (several in-flight rounds failing together count as one incident).
+ *
+ *         Item 9 (two-phase request): selection is a pure function of a seed and of the selection
+ *         state as of the request block B. Everything selection reads (scores, flags, block, fee,
+ *         health-call times) is checkpointed by block number in one storage word per change, and class
+ *         lists are append-only with checkpointed lengths, so state changes between B and the draw
+ *         cannot shift the result.
+ *
+ * @dev Selection walks the requested class's list (as of B) with a seed-derived coprime stride and
+ *      stops once the shortlist is full or after `maxScan` entries, so its cost does not grow with the
+ *      pool. Whether the stake meets the requirement is checkpointed too (F_UNDERSTAKED, updated when
+ *      the stake changes), so a top-up after B cannot re-roll the draw; a new stakeRequirement applies
+ *      to an arbiter at its next stake change.
  */
 contract ReputationKeeper is Ownable {
-    
-    /**
-     * @notice Composite identifier for an oracle instance
-     * @dev Uniquely identifies an oracle by address, job ID, and supported evaluation classes
-     */
-    struct OracleIdentity {
-        address oracle;     /// @dev Address of the oracle contract
-        bytes32 jobId;      /// @dev Chainlink job ID for this oracle
-        uint64[] classes;   /// @dev List of evaluation classes (up to 5) supported by this oracle
+    // ------------------------------------------------------------------ types
+    uint8 private constant F_REGISTERED = 1;
+    uint8 private constant F_PAUSED = 2;
+    uint8 private constant F_BANNED = 4;
+    uint8 private constant F_EXITING = 8;
+    uint8 private constant F_CALL_PENDING = 16;   // a health call is outstanding
+    uint8 private constant F_UNDERSTAKED = 32;    // stake below the requirement (checkpointed, item 9)
+
+    uint8 public constant T_NONE = 0;
+    uint8 public constant T_DELIVERED = 1;      // promoted and the reveal arrived (even late)
+    uint8 public constant T_MISS_FINISHED = 2;  // promoted, no reveal, round still finished
+    uint8 public constant T_MISS_FAILED = 3;    // promoted, no reveal, round failed
+    uint8 public constant T_NOCOMMIT_FAILED = 4; // no commit, and the round failed for lack of commits
+    uint8 public constant C_COMMITTED = 0x80;   // code flag: committed in this round, so scored even if frozen
+    uint8 public constant Q_NONE = 0;
+    uint8 public constant Q_CLOSE = 1;
+    uint8 public constant Q_OFF = 2;
+    uint8 public constant Q_FAR = 3;
+
+    /// @dev selection state, one word per change (checkpointed by block number)
+    struct Ck {
+        uint32 fromBlock;
+        uint16 quality;
+        uint16 timeliness;
+        uint8 flags;
+        uint40 blockedUntil;
+        uint64 fee;
+        uint40 callSentAt;
+        uint40 callAnsweredAt;
     }
 
-    bytes4 private constant ARBITERIFACE = type(IArbiterOperator).interfaceId;
-    uint256 public selectionCounter;
-    bytes16[2] public entropyBuf;    // updated by aggregators - 0=latest, 1=prev-block
-    uint256 public entropyBlock;     // block.number when last updated
-
-    /**
-     * @notice Historical score record for tracking oracle performance trends
-     * @dev Used to detect consistent performance degradation over time
-     */
-    struct ScoreRecord {
-        int256 qualityScore;        /// @dev Quality score at this point in time
-        int256 timelinessScore;     /// @dev Timeliness score at this point in time
+    /// @dev state selection never reads
+    struct Meta {
+        address oracle;
+        uint8 offenses;
+        uint40 cleanFrom;       // decay anchor: end of the last block (or registration)
+        uint40 exitAt;          // unbonding release time (0 = not exiting)
+        uint96 stake;
+        bytes32 jobId;
     }
 
-    /**
-     * @notice Complete information about a registered oracle
-     * @dev Stores all oracle metadata, scores, staking, and status information
-     */
-    struct OracleInfo {
-        int256 qualityScore;        /// @dev Score based on clustering accuracy and response quality
-        int256 timelinessScore;     /// @dev Score based on response timeliness and availability
-        uint256 stakeAmount;        /// @dev Amount of VDKA tokens currently staked by this oracle
-        bool isActive;              /// @dev Whether the oracle is available (true) or paused (false)
-        bytes32 jobId;              /// @dev The job ID (redundant but stored for convenience)
-        uint256 fee;                /// @dev LINK fee required for this job
-        uint256 callCount;          /// @dev Number of times this oracle has been called
-        ScoreRecord[] recentScores; /// @dev Rolling history of recent score snapshots
-        uint256 lockedUntil;        /// @dev Timestamp until which the oracle is locked (cannot be unregistered)
-        bool blocked;               /// @dev If true, oracle is blocked from selection due to poor performance
-        uint64[] classes;           /// @dev Evaluation classes supported by this oracle
-    }
-    
-    /**
-     * @notice Contract approval and usage tracking data
-     * @dev Tracks which contracts are approved to use oracles and which oracles they've used
-     */
-    struct ContractInfo {
-        bool isApproved;            /// @dev Whether this contract is approved to use oracles
-        mapping(bytes32 => bool) usedOracles; /// @dev Mapping from oracle key to usage status
-    }
-    
-    /**
-     * @notice Parameters for oracle selection algorithm
-     * @dev Groups selection parameters to reduce stack usage in complex functions
-     */
-    struct SelectionParams {
-        uint256 alpha;                      /// @dev Reputation weight factor (0-1000)
-        uint256 maxFee;                     /// @dev Maximum fee willing to pay per oracle
-        uint256 estimatedBaseCost;          /// @dev Estimated base cost for the evaluation
-        uint256 maxFeeBasedScalingFactor;   /// @dev Maximum scaling factor for fee-based weighting
+    /// @dev hash-chain head, one entry per change (never overwritten): the next answer must hash to the
+    ///      latest one. An answer's entry holds the revealed value, so the first entry after a block B
+    ///      is the arbiter's next value as of B and when it was revealed (item 9's beacons read it)
+    struct HeadCk {
+        uint32 fromBlock;
+        uint40 at;
+        bytes32 head;
     }
 
-    IERC20 public verdiktaToken;
-
-    // Composite key (oracle, jobID) → OracleInfo.
-    mapping(bytes32 => OracleInfo) public oracles;
-    // Approved external contracts (for example, reputation aggregators).
-    mapping(address => ContractInfo) public approvedContracts;
-    // List of all registered oracle identities.
-    OracleIdentity[] public registeredOracles;
-    
-    // The maximum number of historical score records to keep for each oracle.
-    uint256 public maxScoreHistory = 25;
-
-    // The caps on the reputation score as used for selection
-    uint256 public maxScoreForSelection = 6000;
-    uint256 public minScoreForSelection = 60;
-
-    uint256 public constant STAKE_REQUIREMENT = 100 * 10**18;  // 100 VDKA tokens
-    
-    // Configuration for slashing and locking.
-    uint256 public slashAmountConfig = 0 * 10**18;     // 0 VDKA tokens (configurable)
-    uint256 public lockDurationConfig = 24 hours;      // Lock period (configurable)
-    int256 public severeThreshold = -900;              // Severe threshold (configurable)
-    int256 public mildThreshold = -300;                // Mild threshold (configurable)
-    
-    // The maximum number of oracles to weight in the second-stage selection.
-    uint256 public shortlistSize = 20;
-    
-    event OracleRegistered(address indexed oracle, bytes32 jobId, uint256 fee);
-    event OracleDeregistered(address indexed oracle, bytes32 jobId);
-    event ScoreUpdated(address indexed oracle, int256 newQualityScore, int256 newTimelinessScore);
-    event OracleSlashed(address indexed oracle, bytes32 jobId, uint256 slashAmount, uint256 lockedUntil, bool blocked);
-    event ContractApproved(address indexed contractAddress);
-    event ContractRemoved(address indexed contractAddress);
-    // Optional event for pausing/unpausing an oracle.
-    event OracleActiveStatusUpdated(address indexed oracle, bytes32 jobId, bool isActive);
-    event EntropyPushed(bytes16 entropy, uint256 blockNumber);
-    
-    /// @dev Generates a composite key from an oracle address and its job ID.
-    function _oracleKey(address _oracle, bytes32 _jobId) internal pure returns (bytes32) {
-        return keccak256(abi.encodePacked(_oracle, _jobId));
+    struct LenCk {
+        uint32 fromBlock;
+        uint224 len;
     }
-    
-    constructor(address _verdiktaToken) Ownable(msg.sender) {
-        verdiktaToken = IERC20(_verdiktaToken);
-        entropyBuf[0] = 0x0;
-        entropyBuf[1] = 0x0;
-        entropyBlock  = block.number;
-    }
-    
-    /**
-     * @notice Register an oracle with the reputation system
-     * @dev Requires VDKA token staking and oracle contract compliance. Only oracle owner or contract owner can register.
-     * @param _oracle Address of the oracle contract (must implement IArbiterOperator)
-     * @param _jobId Chainlink job ID for this oracle instance
-     * @param fee LINK fee required for using this oracle
-     * @param _classes Array of evaluation classes this oracle supports (1-5 classes allowed)
-     */
-    function registerOracle(
-        address _oracle,
-        bytes32 _jobId,
-        uint256 fee,
-        uint64[] memory _classes
-    ) external {
-        require(_oracle != address(0), "Oracle is a zero address");
-        require(_oracle.code.length > 0, "Oracle address has no code");
-        require(IERC165(_oracle).supportsInterface(ARBITERIFACE), "Oracle not ArbiterOperator type");
-        IArbiterOperator op = IArbiterOperator(_oracle);
-        require(op.isReputationKeeperListEmpty() || op.isReputationKeeper(address(this)), "Oracle does not support Reputation Keeper");
 
-        bytes32 key = _oracleKey(_oracle, _jobId);
-        // Ensure the oracle is not already registered.
-        require(oracles[key].stakeAmount == 0, "Oracle is already registered");
-        require(fee > 0, "Fee must be greater than 0");
-        require(_classes.length > 0, "At least one class must be provided");
-        require(_classes.length <= 5, "A maximum of 5 classes are allowed");
-        
-        require(
-            msg.sender == owner() || msg.sender == IOracleOwner(_oracle).owner(),
-            "Not authorized to register oracle"
-        );
-        
-        // Transfer the stake from the registering party.
-        require(
-            verdiktaToken.transferFrom(msg.sender, address(this), STAKE_REQUIREMENT),
-            "Stake transfer failed"
-        );
-        
-        // Initialize the oracle info.
-        OracleInfo storage info = oracles[key];
-        info.qualityScore = 0;
-        info.timelinessScore = 0;
-        info.stakeAmount = STAKE_REQUIREMENT;
-        info.isActive = true; // Available by default
-        info.jobId = _jobId;
-        info.fee = fee;
-        info.callCount = 0;
-        info.lockedUntil = 0;
-        info.blocked = false;
-        info.classes = _classes;
-        
-        // Record the identity if not already present.
-        bool exists = false;
-        for (uint256 i = 0; i < registeredOracles.length; i++) {
-            if (registeredOracles[i].oracle == _oracle && registeredOracles[i].jobId == _jobId) {
-                exists = true;
-                break;
+    struct Points {
+        uint16 gain;   // +20  delivered / close
+        uint16 minor;  // -50  off
+        uint16 major;  // -200 far / promoted miss in a finished round
+        uint16 fail;   // -500 promoted, no reveal, round failed
+        uint16 nocommit; // -400 no commit, round failed for lack of commits
+        uint16 start;  // 500
+        uint16 cap;    // 1000
+    }
+
+    struct Selected {
+        address oracle;
+        bytes32 key;
+        uint256 fee;
+    }
+
+    struct SelectParams {
+        uint256 count;
+        uint256 alpha;
+        uint256 maxFee;
+        uint256 estimatedBaseCost;
+        uint256 maxFeeBasedScalingFactor;
+        uint64 requestedClass;
+    }
+
+    // ------------------------------------------------------------------ errors
+    error NotApproved();
+    error NotArbiterOwner();
+    error AlreadyRegistered();
+    error NotRegistered();
+    error BadClasses();
+    error BadParams();
+    error NoEligibleArbiters();
+    error BadPreimage();
+    error NotAuthorizedResponder();
+    error StillBonded();
+    error Blocked();
+    error TransferFailed();
+    error FutureBlock();
+    error NotEnoughEligible();
+
+    // ------------------------------------------------------------------ events
+    event ArbiterRegistered(bytes32 indexed key, address indexed oracle, bytes32 jobId, uint256 fee);
+    event ArbiterRemoved(bytes32 indexed key, uint256 refunded);
+    event HealthCall(bytes32 indexed key, uint256 sentAt);
+    event HealthAnswered(bytes32 indexed key, uint256 answeredAt);
+    event ScoresUpdated(bytes32 indexed key, uint256 quality, uint256 timeliness);
+    event ArbiterBlocked(bytes32 indexed key, uint256 until, uint256 offenses, uint256 burned);
+    event ArbiterBanned(bytes32 indexed key, uint256 burned);
+    event OutcomeSkippedFrozen(bytes32 indexed key);
+    event ExitRequested(bytes32 indexed key, uint256 exitAt);
+    event ContractApproval(address indexed aggregator, bool approved);
+
+    // ------------------------------------------------------------------ storage
+    IERC20 public immutable verdiktaToken;
+
+    mapping(bytes32 => Ck[]) internal cks;
+    mapping(bytes32 => Meta) internal metas;
+    mapping(bytes32 => HeadCk[]) internal heads;
+    mapping(uint64 => bytes32[]) internal classList;     // append-only
+    mapping(uint64 => LenCk[]) internal classLen;
+    mapping(bytes32 => uint64[]) internal classesOf;
+    mapping(bytes32 => mapping(uint64 => bool)) internal inClass;
+    mapping(address => bool) public approvedContracts;
+
+    Points public points = Points(20, 50, 200, 500, 400, 500, 1000);
+    uint256 public stakeRequirement = 100e18;
+    uint40 public lockDuration = 24 hours;
+    uint40 public decayPeriod = 90 days;
+    uint40 public callDeadline = 60;          // D, seconds
+    uint40 public unbondingPeriod = 7 days;
+    uint8 public maxOffenses = 3;
+    uint96 public burnPerBlock = 0;           // VDKA wei, doubled per earlier offense
+    bool public burnOnBan = false;
+    uint16 public shortlistSize = 60;
+    uint16 public maxScan = 400;              // bound on entries walked per selection
+    uint8 public liveRandom = 3;              // extra random health calls per selection
+    address public constant DEAD = 0x000000000000000000000000000000000000dEaD;
+
+    constructor(address token) Ownable(msg.sender) {
+        verdiktaToken = IERC20(token);
+    }
+
+    modifier onlyApproved() {
+        if (!approvedContracts[msg.sender]) revert NotApproved();
+        _;
+    }
+
+    function keyOf(address oracle, bytes32 jobId) public pure returns (bytes32) {
+        return keccak256(abi.encodePacked(oracle, jobId));
+    }
+
+    // ================================================================== checkpoints
+    function _cur(bytes32 key) internal view returns (Ck memory c) {
+        Ck[] storage a = cks[key];
+        uint256 n = a.length;
+        if (n > 0) c = a[n - 1];
+    }
+
+    /// @dev write the current state: overwrite this block's checkpoint, or append a new one
+    function _write(bytes32 key, Ck memory c) internal {
+        Ck[] storage a = cks[key];
+        uint256 n = a.length;
+        c.fromBlock = uint32(block.number);
+        if (n > 0 && a[n - 1].fromBlock == block.number) a[n - 1] = c;
+        else a.push(c);
+    }
+
+    /// @dev state as of the end of block `b` (latest checkpoint with fromBlock <= b)
+    function _at(bytes32 key, uint256 b) internal view returns (Ck memory c) {
+        Ck[] storage a = cks[key];
+        uint256 hi = a.length;
+        if (hi == 0) return c;
+        if (a[hi - 1].fromBlock <= b) return a[hi - 1];
+        uint256 lo = 0;
+        while (lo < hi) {
+            uint256 mid = (lo + hi) / 2;
+            if (a[mid].fromBlock > b) hi = mid;
+            else lo = mid + 1;
+        }
+        if (lo > 0) c = a[lo - 1];
+    }
+
+    function _lenAt(uint64 cls, uint256 b) internal view returns (uint256) {
+        LenCk[] storage a = classLen[cls];
+        uint256 hi = a.length;
+        if (hi == 0) return 0;
+        if (a[hi - 1].fromBlock <= b) return a[hi - 1].len;
+        uint256 lo = 0;
+        while (lo < hi) {
+            uint256 mid = (lo + hi) / 2;
+            if (a[mid].fromBlock > b) hi = mid;
+            else lo = mid + 1;
+        }
+        return lo > 0 ? a[lo - 1].len : 0;
+    }
+
+    function _onlyArbiterOwner(bytes32 key) internal view returns (Meta storage m) {
+        m = metas[key];
+        if (_cur(key).flags & F_REGISTERED == 0) revert NotRegistered();
+        if (msg.sender != owner() && msg.sender != IOracleOwner(m.oracle).owner()) revert NotArbiterOwner();
+    }
+
+    // ================================================================== registration, stake, exit
+    /// @param chainHead hash-chain head H^n(seed); health answers reveal successive preimages.
+    /// @dev A returning key (after completeExit) keeps its scores, offenses and class memberships: only a
+    ///      new key starts at `start`. Class lists are append-only (item 9), so a membership is permanent;
+    ///      `classes` may add classes but cannot remove one.
+    function registerArbiter(address oracle, bytes32 jobId, uint64 fee, uint64[] calldata classes, bytes32 chainHead)
+        external
+    {
+        if (oracle.code.length == 0 || fee == 0) revert BadParams();
+        if (classes.length == 0 || classes.length > 5) revert BadClasses();
+        if (msg.sender != owner() && msg.sender != IOracleOwner(oracle).owner()) revert NotArbiterOwner();
+        bytes32 key = keyOf(oracle, jobId);
+        Ck memory c = _cur(key);
+        if (c.flags & F_REGISTERED != 0) revert AlreadyRegistered();
+
+        uint256 req = stakeRequirement;
+        if (!verdiktaToken.transferFrom(msg.sender, address(this), req)) revert TransferFailed();
+
+        Meta storage m = metas[key];
+        bool returning = cks[key].length > 0;
+        m.oracle = oracle;
+        if (!returning) m.cleanFrom = uint40(block.timestamp);
+        m.exitAt = 0;
+        m.stake = uint96(req);
+        m.jobId = jobId;
+        _setHead(key, chainHead);
+        if (!returning) {
+            uint16 st = points.start;
+            c.quality = st;
+            c.timeliness = st;
+        }
+        c.flags = F_REGISTERED;
+        c.fee = fee;
+        c.callSentAt = 0;
+        c.callAnsweredAt = 0;
+        _write(key, c);
+        // class lists are append-only: a returning arbiter keeps its old entries
+        for (uint256 i = 0; i < classes.length; i++) {
+            uint64 cl = classes[i];
+            if (inClass[key][cl]) continue;
+            classesOf[key].push(cl);
+            inClass[key][cl] = true;
+            bytes32[] storage list = classList[cl];
+            list.push(key);
+            LenCk[] storage lc = classLen[cl];
+            uint256 n = lc.length;
+            if (n > 0 && lc[n - 1].fromBlock == block.number) lc[n - 1].len = uint224(list.length);
+            else lc.push(LenCk(uint32(block.number), uint224(list.length)));
+        }
+        emit ArbiterRegistered(key, oracle, jobId, fee);
+    }
+
+    function setPaused(bytes32 key, bool paused) external {
+        _onlyArbiterOwner(key);
+        Ck memory c = _cur(key);
+        c.flags = paused ? (c.flags | F_PAUSED) : (c.flags & ~F_PAUSED);
+        _write(key, c);
+    }
+
+    function setFee(bytes32 key, uint64 fee) external {
+        _onlyArbiterOwner(key);
+        if (fee == 0) revert BadParams();
+        Ck memory c = _cur(key);
+        c.fee = fee;
+        _write(key, c);
+    }
+
+    /// @dev arbiter owner only: a top-up re-applies the current stakeRequirement, which nobody else
+    ///      should be able to trigger
+    function topUpStake(bytes32 key, uint96 amount) external {
+        _onlyArbiterOwner(key);
+        Ck memory c = _cur(key);
+        if (!verdiktaToken.transferFrom(msg.sender, address(this), amount)) revert TransferFailed();
+        uint96 st = metas[key].stake + amount;
+        metas[key].stake = st;
+        _stakeFlag(c, st);
+        _write(key, c);
+    }
+
+    function _stakeFlag(Ck memory c, uint256 st) internal view {
+        if (st < stakeRequirement) c.flags |= F_UNDERSTAKED;
+        else c.flags &= ~F_UNDERSTAKED;
+    }
+
+    /// @notice Start unbonding. The arbiter is no longer selected but blocks and bans still apply.
+    function requestExit(bytes32 key) external {
+        Meta storage m = _onlyArbiterOwner(key);
+        Ck memory c = _cur(key);
+        c.flags |= F_EXITING;
+        _write(key, c);
+        m.exitAt = uint40(block.timestamp) + unbondingPeriod;
+        emit ExitRequested(key, m.exitAt);
+    }
+
+    /// @notice Finish unbonding: refund the remaining stake to the arbiter's owner. A banned key keeps
+    ///         its record (a tombstone), so it can never register again.
+    function completeExit(bytes32 key) external {
+        Meta storage m = _onlyArbiterOwner(key);
+        Ck memory c = _cur(key);
+        if (c.flags & F_EXITING == 0 || block.timestamp < m.exitAt) revert StillBonded();
+        if (c.blockedUntil > block.timestamp) revert Blocked();
+        uint256 refund = m.stake;
+        address to = IOracleOwner(m.oracle).owner();
+        m.stake = 0;
+        if (c.flags & F_BANNED == 0) c.flags = 0;     // unregistered; may register again later
+        _write(key, c);
+        if (refund > 0 && !verdiktaToken.transfer(to, refund)) revert TransferFailed();
+        emit ArbiterRemoved(key, refund);
+    }
+
+    // ================================================================== liveness (items 6, 7)
+    /// @notice Answer the outstanding health call by revealing the next hash-chain preimage (exactly one
+    ///         step). Sent by the node (an authorized sender of its operator) or the arbiter's owner.
+    ///         Answering at any time after a freeze unfreezes the arbiter.
+    function answerHealthCall(bytes32 key, bytes32 preimage) external {
+        if (!_answer(key, preimage, preimage, msg.sender)) revert BadPreimage();
+    }
+
+    /// @notice Answer (as above) and replace the hash chain in the same transaction, before the current
+    ///         one runs out. The answer comes from the old chain; the new head applies to later calls
+    ///         only, so a rotation cannot choose the value of a call already sent.
+    function rotateChain(bytes32 key, bytes32 preimage, bytes32 newHead) external {
+        if (!_answer(key, preimage, newHead, msg.sender)) revert BadPreimage();
+    }
+
+    /// @dev returns false, changing nothing, if `preimage` does not hash to the current head
+    function _answer(bytes32 key, bytes32 preimage, bytes32 nextHead, address responder) internal returns (bool) {
+        Meta storage m = metas[key];
+        Ck memory c = _cur(key);
+        if (c.flags & F_REGISTERED == 0) revert NotRegistered();
+        if (responder != IOracleOwner(m.oracle).owner()) {
+            try IAuthorizedSenders(m.oracle).isAuthorizedSender(responder) returns (bool ok) {
+                if (!ok) revert NotAuthorizedResponder();
+            } catch {
+                revert NotAuthorizedResponder();
             }
         }
-        if (!exists) {
-            registeredOracles.push(OracleIdentity({
-                oracle: _oracle, 
-                jobId: _jobId,
-                classes: _classes
-            }));
+        if (keccak256(abi.encodePacked(preimage)) != _headAt(key, block.number)) return false;
+        _setHead(key, preimage);                         // the revealed value, readable by revealAfter
+        if (nextHead != preimage) _setHead(key, nextHead);   // a rotation: the new chain applies from here
+        // only an answer to an outstanding call moves callAnsweredAt (round-end freeze checks rely on it)
+        if (c.flags & F_CALL_PENDING != 0) {
+            c.callAnsweredAt = uint40(block.timestamp);
+            c.flags &= ~F_CALL_PENDING;
+            _write(key, c);
         }
-        
-        emit OracleRegistered(_oracle, _jobId, fee);
+        emit HealthAnswered(key, block.timestamp);
+        return true;
     }
-    
-    /**
-     * @notice Deregister an oracle and remove it from the reputation system
-     * @dev Completely removes oracle record and returns staked tokens. Only callable by oracle owner or contract owner.
-     * @param _oracle Address of the oracle contract to deregister
-     * @param _jobId Job ID of the oracle instance to deregister
-     */
-    function deregisterOracle(address _oracle, bytes32 _jobId) external {
-        bytes32 key = _oracleKey(_oracle, _jobId);
-        OracleInfo storage info = oracles[key];
 
-        // Check that the oracle is registered by ensuring stakeAmount is nonzero.
-        uint256 refundAmount = info.stakeAmount;
-        require(refundAmount > 0 || info.isActive || info.blocked,  "Oracle not registered");
-        require(
-            msg.sender == owner() || msg.sender == IOracleOwner(_oracle).owner(),
-            "Not authorized to deregister oracle"
-        );
-        require(block.timestamp >= info.lockedUntil, "Oracle is locked and cannot be unregistered");
+    /// @notice Owner: send health calls to many arbiters at once (e.g. after a wide outage).
+    function _setHead(bytes32 key, bytes32 h) internal {
+        heads[key].push(HeadCk(uint32(block.number), uint40(block.timestamp), h));
+    }
 
-        // Funds go to the owner of the arbiter
-        address oracleOwner = IOracleOwner(_oracle).owner();
-        require(oracleOwner != address(0), "Oracle owner is zero");
-        
-        // Remove the oracle record completely.
-        delete oracles[key];
-        
-        // Remove the oracle identity from the registeredOracles array using swap and pop.
-        for (uint256 i = 0; i < registeredOracles.length; i++) {
-            if (registeredOracles[i].oracle == _oracle && registeredOracles[i].jobId == _jobId) {
-                registeredOracles[i] = registeredOracles[registeredOracles.length - 1];
-                registeredOracles.pop();
-                break;
-            }
+    /// @dev index of the first head entry after block `b` (the array length if none)
+    function _headIdxAfter(HeadCk[] storage a, uint256 b) internal view returns (uint256 lo) {
+        uint256 hi = a.length;
+        if (hi == 0 || a[hi - 1].fromBlock <= b) return hi;
+        while (lo < hi) {
+            uint256 mid = (lo + hi) / 2;
+            if (a[mid].fromBlock > b) hi = mid;
+            else lo = mid + 1;
         }
-
-        // refund the stake
-        if (refundAmount > 0) {
-            require(
-                verdiktaToken.transfer(oracleOwner, refundAmount),
-                "Stake refund failed"
-            ); 
-        }
-
-        emit OracleDeregistered(_oracle, _jobId);
     }
-    
-    /**
-     * @notice Set an oracle's active status (pause/unpause)
-     * @dev Only the contract owner can perform this action. Paused oracles are excluded from selection.
-     * @param _oracle Address of the oracle contract
-     * @param _jobId Job ID of the oracle instance
-     * @param _active True to activate/unpause, false to deactivate/pause
-     */
-    function setOracleActive(address _oracle, bytes32 _jobId, bool _active) external onlyOwner {
-        bytes32 key = _oracleKey(_oracle, _jobId);
-        OracleInfo storage info = oracles[key];
-        require(info.stakeAmount > 0, "Oracle not registered");
-        info.isActive = _active;
-        emit OracleActiveStatusUpdated(_oracle, _jobId, _active);
+
+    /// @dev head as of the end of block `b` (0 if the key had none yet)
+    function _headAt(bytes32 key, uint256 b) internal view returns (bytes32) {
+        HeadCk[] storage a = heads[key];
+        uint256 i = _headIdxAfter(a, b);
+        return i > 0 ? a[i - 1].head : bytes32(0);
     }
-    
+
     /**
-     * @notice Get comprehensive information about a registered oracle
-     * @dev Returns all oracle metadata, scores, staking, and status information
-     * @param _oracle Address of the oracle contract
-     * @param _jobId Job ID of the oracle instance
-     * @return isActive Whether the oracle is currently active and available for selection
-     * @return qualityScore Current quality score based on response accuracy
-     * @return timelinessScore Current timeliness score based on response speed
-     * @return callCount Total number of times this oracle has been called
-     * @return jobId The job ID (returned for convenience)
-     * @return fee LINK fee required for using this oracle
-     * @return stakeAmount Amount of VDKA tokens currently staked
-     * @return lockedUntil Timestamp until which oracle is locked (0 if not locked)
-     * @return blocked Whether oracle is blocked from selection due to poor performance
+     * @notice The arbiter's first hash-chain value revealed after block `b` (by any answer to a health
+     *         call, or a rotation), with the block and time of the reveal; zeros if none yet. The value
+     *         is the preimage of the head as of `b`, so it was fixed at `b` and only its timing is the
+     *         arbiter's choice. Item 9's beacons use it as the beacon value.
      */
-    function getOracleInfo(address _oracle, bytes32 _jobId)
+    function revealAfter(bytes32 key, uint256 b)
         external
         view
-        returns (
-            bool isActive,
-            int256 qualityScore,
-            int256 timelinessScore,
-            uint256 callCount,
-            bytes32 jobId,
-            uint256 fee,
-            uint256 stakeAmount,
-            uint256 lockedUntil,
-            bool blocked
-        )
+        returns (bytes32 value, uint256 blk, uint256 at, address oracle)
     {
-        bytes32 key = _oracleKey(_oracle, _jobId);
-        OracleInfo storage info = oracles[key];
-        return (
-            info.isActive,
-            info.qualityScore,
-            info.timelinessScore,
-            info.callCount,
-            info.jobId,
-            info.fee,
-            info.stakeAmount,
-            info.lockedUntil,
-            info.blocked
-        );
+        HeadCk[] storage a = heads[key];
+        uint256 i = _headIdxAfter(a, b);
+        oracle = metas[key].oracle;
+        // the keccak check skips a re-registration's new head (no reveal)
+        if (i == 0 || i == a.length || keccak256(abi.encodePacked(a[i].head)) != a[i - 1].head) return (0, 0, 0, oracle);
+        return (a[i].head, a[i].fromBlock, a[i].at, oracle);
     }
-    
-    /**
-     * @notice Update reputation scores for an oracle after evaluation completion
-     * @dev Called by approved aggregator contracts to reward/penalize oracle performance.
-     *      Automatically applies slashing and blocking for poor performance.
-     * @param _oracle Address of the oracle contract
-     * @param _jobId Job ID of the oracle instance
-     * @param qualityChange Change to apply to quality score (positive = reward, negative = penalty)
-     * @param timelinessChange Change to apply to timeliness score (positive = reward, negative = penalty)
-     */
-    function updateScores(
-        address _oracle, 
-        bytes32 _jobId,
-        int8 qualityChange,
-        int8 timelinessChange
-    ) external {
-        bytes32 key = _oracleKey(_oracle, _jobId);
-        require(approvedContracts[msg.sender].usedOracles[key], "Oracle not used by this contract");
-        
-        OracleInfo storage info = oracles[key];
-        info.callCount++;
-        info.qualityScore += qualityChange;
-        info.timelinessScore += timelinessChange;
 
-        // Record score history.
-        info.recentScores.push(ScoreRecord({
-            qualityScore: info.qualityScore,
-            timelinessScore: info.timelinessScore
-        }));
-        if (info.recentScores.length > maxScoreHistory) {
-            for (uint256 i = 0; i < info.recentScores.length - 1; i++) {
-                info.recentScores[i] = info.recentScores[i + 1];
-            }
-            info.recentScores.pop();
-        }
-        
-        // Apply penalties if necessary. Auto-unblock if appropriate.
-        if (block.timestamp >= info.lockedUntil) {
-            if (info.blocked) info.blocked = false;   // auto-unblock
-            if (info.qualityScore < severeThreshold || info.timelinessScore < severeThreshold) {
-                if (info.stakeAmount >= slashAmountConfig) {
-                    info.stakeAmount -= slashAmountConfig;
-                } else {
-                    info.stakeAmount = 0;
-                }
-                info.lockedUntil = block.timestamp + lockDurationConfig;
-                info.blocked = true;
-                if(info.qualityScore < severeThreshold) {
-                    info.qualityScore = mildThreshold;
-                }
-                if(info.timelinessScore < severeThreshold) {
-                    info.timelinessScore = mildThreshold;
-                }
-                emit OracleSlashed(_oracle, _jobId, slashAmountConfig, info.lockedUntil, true);
-            }
-            else if (info.qualityScore < mildThreshold || info.timelinessScore < mildThreshold) {
-                info.lockedUntil = block.timestamp + lockDurationConfig;
-                info.blocked = false;
-                emit OracleSlashed(_oracle, _jobId, 0, info.lockedUntil, false);
-            }
-        }
-        
-        if (info.recentScores.length == maxScoreHistory) {
-            bool worsening = true;
-            for (uint256 i = 1; i < maxScoreHistory; i++) {
-                if (info.recentScores[i].qualityScore >= info.recentScores[i - 1].qualityScore &&
-                    info.recentScores[i].timelinessScore >= info.recentScores[i - 1].timelinessScore) {
-                    worsening = false;
-                }
-            }
-            if (worsening) {
-                if (info.stakeAmount >= slashAmountConfig) {
-                    info.stakeAmount -= slashAmountConfig;
-                } else {
-                    info.stakeAmount = 0;
-                }
-                info.lockedUntil = block.timestamp + lockDurationConfig;
-                info.blocked = true;
-                emit OracleSlashed(_oracle, _jobId, slashAmountConfig, info.lockedUntil, true);
-                delete info.recentScores;
-            }
-        }
-        
-        emit ScoreUpdated(_oracle, info.qualityScore, info.timelinessScore);
+    function sendHealthCalls(bytes32[] calldata keys) external onlyOwner {
+        for (uint256 i = 0; i < keys.length; i++) _call(keys[i]);
     }
-    
-    /**
-     * @notice Calculate the weighted selection score for an oracle
-     * @dev Combines reputation scores with fee weighting to determine selection probability.
-     *      Blocked or inactive oracles return score of 0.
-     * @param _oracle Address of the oracle contract
-     * @param _jobId Job ID of the oracle instance
-     * @param params Selection parameters including alpha, fees, and scaling factors
-     * @return Weighted selection score (higher = more likely to be selected)
-     */
-    function getSelectionScore(
-        address _oracle,
-        bytes32 _jobId,
-        SelectionParams memory params
-    ) public view returns (uint256) {
-        bytes32 key = _oracleKey(_oracle, _jobId);
-        OracleInfo storage info = oracles[key];
-        
-        // If the oracle is paused (isActive false), it won't be selected.
-        if (!info.isActive) return 0;
-        if (info.blocked && block.timestamp < info.lockedUntil) return 0;
-        
-        int256 weightedScore = (int256(1000 - params.alpha) * info.qualityScore +
-                                 int256(params.alpha) * info.timelinessScore) / 1000;
-        if (weightedScore < int256(minScoreForSelection)) {
-            weightedScore = int256(minScoreForSelection);
+
+    function _call(bytes32 key) internal {
+        Ck memory c = _cur(key);
+        // keep the earlier deadline if a call is already outstanding. A pending flag, not a time
+        // comparison: Base timestamps are whole seconds, so a call sent in the same second as the last
+        // answer would otherwise look answered.
+        if (c.flags & F_CALL_PENDING == 0) {
+            c.callSentAt = uint40(block.timestamp);
+            c.flags |= F_CALL_PENDING;
+            _write(key, c);
+            emit HealthCall(key, block.timestamp);
         }
-        if (weightedScore > int256(maxScoreForSelection)) {
-            weightedScore = int256(maxScoreForSelection);
-        }
-        
-        uint256 oracleFee = info.fee;
-        uint256 feeWeightingFactor = 1e18;
-        if (oracleFee > params.estimatedBaseCost && params.maxFee > params.estimatedBaseCost) {
-            uint256 numerator = (params.maxFee - params.estimatedBaseCost) * 1e18;
-            uint256 denominator = oracleFee - params.estimatedBaseCost;
-            uint256 ratio = numerator / denominator;
-            uint256 maxScaling = params.maxFeeBasedScalingFactor * 1e18;
-            if (ratio > maxScaling) {
-                feeWeightingFactor = maxScaling;
-            } else if (ratio > 1e18) {
-                feeWeightingFactor = ratio;
-            }
-        }
-        
-        uint256 finalScore = uint256(weightedScore) * feeWeightingFactor / 1e18;
-        return finalScore;
     }
-    
-    /**
-     * @notice Select oracles for evaluation using reputation-weighted algorithm
-     * @dev Uses two-stage selection: eligibility filtering, optional shortlisting, then weighted selection.
-     *      Selection is based on reputation scores, fees, and availability.
-     * @param count Number of oracles to select
-     * @param alpha Reputation weight factor (0-1000, where 1000 = 100% reputation-based)
-     * @param maxFee Maximum fee willing to pay per oracle (in LINK wei)
-     * @param estimatedBaseCost Estimated base cost for the evaluation
-     * @param maxFeeBasedScalingFactor Maximum scaling factor for fee-based selection weighting
-     * @param requestedClass Evaluation class required (oracles must support this class)
-     * @return Array of selected oracle identities
-     */
-    function selectOracles(
-        uint256 count,
-        uint256 alpha,
-        uint256 maxFee,
-        uint256 estimatedBaseCost,
-        uint256 maxFeeBasedScalingFactor,
-        uint64 requestedClass
-    ) external returns (OracleIdentity[] memory) {
-        require(approvedContracts[msg.sender].isApproved, "Not approved to select oracles");
-        require(estimatedBaseCost < maxFee, "Base cost must be less than max fee");
-        require(maxFeeBasedScalingFactor >= 1, "Max scaling factor must be at least 1");
-        selectionCounter++; // bump once per call 
-        uint256 eligibleCount = 0;
-        for (uint256 i = 0; i < registeredOracles.length; i++) {
-            OracleIdentity storage id = registeredOracles[i];
-            bytes32 key = _oracleKey(id.oracle, id.jobId);
-            if (
-                oracles[key].isActive &&
-                oracles[key].fee <= maxFee &&
-                (!(oracles[key].blocked && block.timestamp < oracles[key].lockedUntil)) &&
-                _hasClass(id.classes, requestedClass)
-            ) {
-                eligibleCount++;
-            }
-        }
-        require(eligibleCount > 0, "No active oracles available with fee <= maxFee and requested class");
-        
-        OracleIdentity[] memory eligibleOracles = new OracleIdentity[](eligibleCount);
-        uint256 idx = 0;
-        for (uint256 i = 0; i < registeredOracles.length; i++) {
-            OracleIdentity storage id = registeredOracles[i];
-            bytes32 key = _oracleKey(id.oracle, id.jobId);
-            if (
-                oracles[key].isActive &&
-                oracles[key].fee <= maxFee &&
-                (!(oracles[key].blocked && block.timestamp < oracles[key].lockedUntil)) &&
-                _hasClass(id.classes, requestedClass)
-            ) {
-                eligibleOracles[idx] = id;
-                idx++;
-            }
-        }
-        
-        // Determine the shortlist.
-        OracleIdentity[] memory shortlist;
-        if (eligibleCount > shortlistSize) {
-            shortlist = new OracleIdentity[](shortlistSize);
-            for (uint256 i = 0; i < shortlistSize; i++) {
-                uint256 randIndex = i + (uint256(keccak256(abi.encodePacked(block.timestamp, block.prevrandao, i))) % (eligibleCount - i));
-                OracleIdentity memory temp = eligibleOracles[i];
-                eligibleOracles[i] = eligibleOracles[randIndex];
-                eligibleOracles[randIndex] = temp;
-                shortlist[i] = eligibleOracles[i];
-            }
-        } else {
-            shortlist = eligibleOracles;
-        }
-        
-        SelectionParams memory params = SelectionParams({
-            alpha: alpha,
-            maxFee: maxFee,
-            estimatedBaseCost: estimatedBaseCost,
-            maxFeeBasedScalingFactor: maxFeeBasedScalingFactor
-        });
-        
-        return _weightedSelect(shortlist, params, count);
+
+    /// @dev frozen at a past time t: a call sent more than D before t and not answered by t. Lossy if a
+    ///      later call has replaced it, but a later call means the arbiter was selectable, so unfrozen.
+    function _frozenWhen(Ck memory c, uint256 t) internal view returns (bool) {
+        if (uint256(c.callSentAt) + callDeadline >= t) return false;
+        return c.flags & F_CALL_PENDING != 0 || c.callAnsweredAt > t;
     }
-    
-    /**
-     * @dev Internal helper to perform weighted selection on a given shortlist (while avoiding duplicates if possible).
-     */
-    function _weightedSelect(
-        OracleIdentity[] memory shortlist,
-        SelectionParams memory params,
-        uint256 count
-    ) internal view returns (OracleIdentity[] memory) {
 
-        // Pick arbiter-provided entropy from earlier block to prevent manipulation
-        bytes16 chosenEntropy =
-            (block.number == entropyBlock) ? entropyBuf[1] : entropyBuf[0];
+    function _frozenAt(Ck memory c, uint256 t) internal view returns (bool) {
+        return c.flags & F_CALL_PENDING != 0 && t > uint256(c.callSentAt) + callDeadline;
+    }
 
-        uint256 n = shortlist.length;
+    // ================================================================== selection
+    function _eligibleAt(Ck memory c, uint256 maxFee, uint256 t) internal view returns (bool) {
+        uint8 f = c.flags;
+        if (f & (F_PAUSED | F_BANNED | F_EXITING) != 0 || f & F_REGISTERED == 0) return false;
+        if (f & F_UNDERSTAKED != 0 || c.blockedUntil > t || c.fee > maxFee) return false;
+        return !_frozenAt(c, t);
+    }
 
-        // Pre-compute weights once
-        uint256[] memory weights = new uint256[](n);
-        uint256 totalWeight = 0;
-        for (uint256 i; i < n; ++i) {
-            weights[i] = getSelectionScore(
-                shortlist[i].oracle,
-                shortlist[i].jobId,
-                params
-            );
-            totalWeight += weights[i];
+    function _weight(Ck memory c, SelectParams calldata sp) internal view returns (uint256) {
+        uint256 rep = ((1000 - sp.alpha) * c.quality + sp.alpha * c.timeliness) / 1000;  // 0..cap
+        uint256 w = 1000 + rep * 1000 / points.cap;                                       // 1000..2000
+        uint256 fee = c.fee;
+        if (fee > sp.estimatedBaseCost && sp.maxFee > sp.estimatedBaseCost) {
+            uint256 ratio = (sp.maxFee - sp.estimatedBaseCost) * 1e18 / (fee - sp.estimatedBaseCost);
+            uint256 maxScaling = sp.maxFeeBasedScalingFactor * 1e18;
+            if (ratio > maxScaling) ratio = maxScaling;
+            if (ratio > 1e18) w = w * ratio / 1e18;
         }
+        return w;
+    }
 
-        // Keep a copy of the *full* total for later reuse
-        uint256 fullWeight = totalWeight;
+    /**
+     * @notice Select `count` arbiters from the state as of block `atBlock` (timestamp `atTime`), using
+     *         only `seed` for randomness, then send health calls to the jurors and `liveRandom` other
+     *         shortlisted arbiters.
+     * @dev Reverts with fewer eligible (shortlisted) arbiters than `count`: repeated slots would count one
+     *      arbiter's vote twice and charge it twice. The aggregator then fails the round with a refund.
+     */
+    function selectArbiters(SelectParams calldata sp, bytes32 seed, uint256 atBlock, uint256 atTime)
+        external
+        onlyApproved
+        returns (Selected[] memory sel)
+    {
+        if (sp.alpha > 1000 || sp.count == 0 || sp.estimatedBaseCost >= sp.maxFee || sp.maxFeeBasedScalingFactor < 1)
+            revert BadParams();
+        if (atBlock >= block.number) revert FutureBlock();
+        bytes32[] storage list = classList[sp.requestedClass];
+        uint256 n = _lenAt(sp.requestedClass, atBlock);
+        if (n == 0) revert NoEligibleArbiters();
 
-        OracleIdentity[] memory selected = new OracleIdentity[](count);
-        bool[] memory taken = new bool[](n);
+        uint256 s = uint256(seed);
+        uint256 idx = s % n;
+        uint256 step = n == 1 ? 1 : 1 + (s >> 128) % (n - 1);
+        while (_gcd(step, n) != 1) step = step % n + 1;
 
-        /* ---------- 1st pass: unique selections ---------- */
-        uint256 uniqueDraws = count > n ? n : count;
-        for (uint256 k; k < uniqueDraws; ++k) {
-            bytes32 seed = keccak256(
-                abi.encodePacked(chosenEntropy, block.prevrandao, block.timestamp, selectionCounter, k)
-            );
-            uint256 pivot = uint256(seed) % totalWeight;
+        uint256 cap = shortlistSize;
+        uint256 scanLimit = maxScan < n ? maxScan : n;
+        bytes32[] memory sk = new bytes32[](cap);
+        uint256[] memory w = new uint256[](cap);
+        uint256[] memory fees = new uint256[](cap);   // fee as of B: a later fee change cannot break the draw
+        uint256 m;
+        uint256 total;
+        for (uint256 i = 0; i < scanLimit && m < cap; i++) {
+            bytes32 key = list[idx];
+            Ck memory c = _at(key, atBlock);
+            if (_eligibleAt(c, sp.maxFee, atTime)) {
+                sk[m] = key;
+                fees[m] = c.fee;
+                uint256 wi = _weight(c, sp);
+                w[m] = wi;
+                total += wi;
+                m++;
+            }
+            idx = (idx + step) % n;
+        }
+        if (m == 0) revert NoEligibleArbiters();
+        if (m < sp.count) revert NotEnoughEligible();
 
-            uint256 acc = 0;
-            uint256 j;
-            for (j = 0; j < n; ++j) {
-                if (taken[j]) continue;
-                acc += weights[j];
+        sel = new Selected[](sp.count);
+        bool[] memory taken = new bool[](m);
+        uint256 remaining = total;
+        for (uint256 k = 0; k < sp.count; k++) {
+            uint256 pick;
+            uint256 pivot = uint256(keccak256(abi.encodePacked(seed, k))) % remaining;
+            uint256 acc;
+            for (pick = 0; pick < m; pick++) {
+                if (taken[pick]) continue;
+                acc += w[pick];
                 if (acc > pivot) break;
             }
-            selected[k] = shortlist[j];
-            taken[j] = true;
-
-            // Burn this weight so it can’t be drawn again in the unique phase
-            totalWeight -= weights[j];
+            taken[pick] = true;
+            remaining -= w[pick];
+            sel[k] = Selected(metas[sk[pick]].oracle, sk[pick], fees[pick]);
+            _call(sk[pick]);                       // every juror gets a health call
         }
-
-        /* ---------- 2nd pass: duplicates allowed (only if needed) ---------- */
-        if (count > n) {
-            for (uint256 k = uniqueDraws; k < count; ++k) {
-                bytes32 seed = keccak256(
-                    abi.encodePacked(chosenEntropy, block.prevrandao, block.timestamp, k)
-                );
-                uint256 pivot = uint256(seed) % fullWeight;   // use *full* weight
-
-                uint256 acc = 0;
-                for (uint256 j; j < n; ++j) {
-                    acc += weights[j];
-                    if (acc > pivot) {
-                        selected[k] = shortlist[j];
-                        break;              // duplicates now permitted
-                    }
-                }
+        uint256 probes = liveRandom;
+        uint256 p0 = (s >> 8) % m;
+        for (uint256 j = 0; j < m && probes > 0; j++) {
+            uint256 p = (p0 + j) % m;
+            if (!taken[p]) {
+                _call(sk[p]);
+                probes--;
             }
         }
-        return selected;
-    }
-    
-    /**
-     * @notice Record that specific oracles were used by an approved contract
-     * @dev Enables these oracles to have their scores updated by the calling contract later.
-     *      Must be called before updateScores can be used.
-     * @param _oracleIdentities Array of oracle identities that were used for evaluation
-     */
-    function recordUsedOracles(OracleIdentity[] calldata _oracleIdentities) external {
-        require(approvedContracts[msg.sender].isApproved, "Not approved to record oracles");
-        for (uint256 i = 0; i < _oracleIdentities.length; i++) {
-            bytes32 key = _oracleKey(_oracleIdentities[i].oracle, _oracleIdentities[i].jobId);
-            approvedContracts[msg.sender].usedOracles[key] = true;
-        }
-    }
-    
-    /**
-     * @notice Set the maximum number of historical score records to maintain per oracle
-     * @dev Controls memory usage and affects trend analysis for performance degradation detection
-     * @param _maxScoreHistory Maximum number of score records to keep (must be > 0)
-     */
-    function setMaxScoreHistory(uint256 _maxScoreHistory) external onlyOwner {
-        require(_maxScoreHistory > 0, "maxScoreHistory must be > 0");
-        maxScoreHistory = _maxScoreHistory;
     }
 
     /**
-     * @notice Set the maximum score used for arbiter random selection probabilities
-     * @dev Affects selection likelihood
-     * @param _maxScoreForSelection Maximum score used for selection (must be > 0)
+     * @notice Pick up to `count` beacons for a draw (item 9's beacon flag) from `cls`, entirely from the
+     *         state as of block `atBlock` (time `atTime`): registered, and not paused, banned, exiting,
+     *         under-staked, blocked or frozen. Each beacon gets a health call, and its beacon value is
+     *         its next hash-chain value as of `atBlock` (revealAfter): its answer to that call, or to
+     *         an earlier one if it answered after `atBlock`. The value was fixed before blockhash(B+1)
+     *         existed, so nothing after B (who starts the stage, when, or a chain rotation) changes the
+     *         pick or the values.
+     * @dev Walks the class list with a seed-derived coprime stride, at most `maxScan` entries. Fewer
+     *      than `count` are returned only if the walk finds fewer.
      */
-    function setMaxScoreForSelection(uint256 _maxScoreForSelection) external onlyOwner {
-        require(_maxScoreForSelection > 0, "maxScoreForSelection must be > 0");
-        maxScoreForSelection = _maxScoreForSelection;
-    }
-
-    /**
-     * @notice Set the minimum score used for arbiter random selection probabilities
-     * @dev Affects selection likelihood
-     * @param _minScoreForSelection Maximum score used for selection (must be > 0)
-     */
-    function setMinScoreForSelection(uint256 _minScoreForSelection) external onlyOwner {
-        require(_minScoreForSelection > 0, "minScoreForSelection must be > 0");
-        minScoreForSelection = _minScoreForSelection;
-    }
-
-    /**
-     * @notice Get the recent score history for an oracle
-     * @dev Returns historical performance data used for trend analysis
-     * @param _oracle Address of the oracle contract
-     * @param _jobId Job ID of the oracle instance
-     * @return Array of recent score records showing performance over time
-     */
-    function getRecentScores(address _oracle, bytes32 _jobId)
+    function pickBeacons(bytes32 seed, uint64 cls, uint256 atBlock, uint256 atTime, uint256 count)
         external
-        view
-        returns (ScoreRecord[] memory)
+        onlyApproved
+        returns (bytes32[] memory keys)
     {
-        bytes32 key = _oracleKey(_oracle, _jobId);
-        OracleInfo storage info = oracles[key];
-        uint256 len = info.recentScores.length;
-        ScoreRecord[] memory scores = new ScoreRecord[](len);
-        for (uint256 i = 0; i < len; i++) {
-            scores[i] = info.recentScores[i];
-        }
-        return scores;
-    }
-    
-    /**
-     * @notice Set the amount of VDKA tokens to slash for poor performance
-     * @dev Amount slashed when oracles fall below performance thresholds
-     * @param _slashAmount Amount of VDKA tokens to slash (in wei)
-     */
-    function setSlashAmount(uint256 _slashAmount) external onlyOwner {
-        slashAmountConfig = _slashAmount;
-    }
-    
-    /**
-     * @notice Set the duration for which poorly performing oracles are locked
-     * @dev Locked oracles cannot be unregistered and may be blocked from selection
-     * @param _lockDuration Lock duration in seconds
-     */
-    function setLockDuration(uint256 _lockDuration) external onlyOwner {
-        lockDurationConfig = _lockDuration;
-    }
-    
-    /**
-     * @notice Set the severe performance threshold for slashing and blocking
-     * @dev Oracles below this threshold are slashed and blocked from selection
-     * @param _threshold Severe threshold value (negative number)
-     */
-    function setSevereThreshold(int256 _threshold) external onlyOwner {
-        severeThreshold = _threshold;
-    }
-    
-    /**
-     * @notice Set the mild performance threshold for temporary locking
-     * @dev Oracles below this threshold are temporarily locked but not slashed
-     * @param _threshold Mild threshold value (negative number)  
-     */
-    function setMildThreshold(int256 _threshold) external onlyOwner {
-        mildThreshold = _threshold;
-    }
-
-    /**
-     * @notice Update the VDKA token contract address used for staking
-     * @dev Changes the token contract used for oracle staking and slashing
-     * @param _newVerdiktaToken Address of the new VDKA token contract
-     */
-    function setVerdiktaToken(address _newVerdiktaToken) external onlyOwner {
-        require(_newVerdiktaToken != address(0), "Invalid token address");
-        verdiktaToken = IERC20(_newVerdiktaToken);
-    }
-
-    /**
-     * @notice Manually block a specific oracle for a given duration
-     * @dev    Only callable by the contract owner.
-     *         While blocked, the oracle is excluded from selection
-     *         (`selectOracles`, `getSelectionScore`) exactly the same way
-     *         as when it is auto-blocked for poor performance.
-     *
-     * @param _oracle   The oracle contract address
-     * @param _jobId    The job-ID of that oracle instance
-     * @param _duration How long to block it, **in seconds**.
-     *                  Pass 0 to use the current `lockDurationConfig`.
-     */
-    function manualBlockOracle(
-        address _oracle,
-        bytes32 _jobId,
-        uint256 _duration
-    ) external onlyOwner {
-        bytes32 key = _oracleKey(_oracle, _jobId);
-        OracleInfo storage info = oracles[key];
-        require(info.stakeAmount > 0, "Oracle not registered");
-
-        uint256 duration = _duration == 0 ? lockDurationConfig : _duration;
-        require(duration > 0, "Duration must be > 0");
-
-        info.blocked     = true;
-        info.lockedUntil = block.timestamp + duration;
-    }
-
-    /**
-     * @notice Hard-reset all reputation data.
-     *         Callable only by the contract owner.
-     *
-     *         This walks the whole `registeredOracles` array and can run
-     *         out of gas if there are “many” oracles.  
-     */
-    function resetAllReputations() external onlyOwner {
-        // 1. Reset the global counter that shows up in oracle selection.
-        selectionCounter = 0;
-
-        // 2. Loop through every registered identity and zero out its data.
-        uint256 len = registeredOracles.length;
-        for (uint256 i; i < len; ++i) {
-            OracleIdentity storage id = registeredOracles[i];
-            bytes32 key = _oracleKey(id.oracle, id.jobId);
-            OracleInfo storage info = oracles[key];
-
-            info.qualityScore     = 0;
-            info.timelinessScore  = 0;
-            info.callCount        = 0;
-
-            // clear the sliding window completely
-            delete info.recentScores;
-
-            // unblock & unlock so the oracle can be picked again immediately
-            info.blocked     = false;
-            info.lockedUntil = 0;
-        }
-    }
-
-    /**
-     * @notice Get the total number of registered oracles
-     * @dev Returns the count of all oracle identities in the system
-     * @return Total number of registered oracle identities
-     */
-    function getRegisteredOraclesCount() external view returns (uint256) {
-        return registeredOracles.length;
-    }
-
-    /**
-     * @dev Check if an oracle supports a specific evaluation class
-     * @param classes Array of classes supported by the oracle
-     * @param requestedClass The class being requested
-     * @return bool True if the oracle supports the requested class
-     */
-    function _hasClass(uint64[] memory classes, uint64 requestedClass) internal pure returns (bool) {
-        for (uint256 i = 0; i < classes.length; i++) {
-            if (classes[i] == requestedClass) {
-                return true;
+        if (atBlock >= block.number) revert FutureBlock();
+        keys = new bytes32[](count);
+        uint256 n = _lenAt(cls, atBlock);
+        uint256 m;
+        if (n > 0) {
+            bytes32[] storage list = classList[cls];
+            uint256 s = uint256(seed);
+            uint256 idx = s % n;
+            uint256 step = n == 1 ? 1 : 1 + (s >> 128) % (n - 1);
+            while (_gcd(step, n) != 1) step = step % n + 1;
+            uint256 scanLimit = maxScan < n ? maxScan : n;
+            for (uint256 i = 0; i < scanLimit && m < count; i++) {
+                bytes32 key = list[idx];
+                Ck memory c = _at(key, atBlock);
+                if (c.flags & (F_REGISTERED | F_PAUSED | F_BANNED | F_EXITING | F_UNDERSTAKED) == F_REGISTERED
+                    && c.blockedUntil <= atTime && !_frozenAt(c, atTime)) {
+                    keys[m] = key;
+                    m++;
+                    _call(key);
+                }
+                idx = (idx + step) % n;
             }
         }
-        return false;
+        assembly ("memory-safe") {   // shrink in place (lengths only decrease)
+            mstore(keys, m)
+        }
     }
 
-    /**
-     * @notice Get the evaluation classes supported by an oracle at a specific index
-     * @dev Returns classes for oracle at given index in registeredOracles array
-     * @param index Index in the registeredOracles array
-     * @return Array of evaluation classes supported by the oracle
-     */
-    function getOracleClasses(uint256 index) public view returns (uint64[] memory) {
-        require(index < registeredOracles.length, "Index out of bounds");
-        return registeredOracles[index].classes;
+    function _gcd(uint256 a, uint256 b) internal pure returns (uint256) {
+        while (b != 0) (a, b) = (b, a % b);
+        return a;
     }
 
+    // ================================================================== scoring (Table 1 -> Table 2)
     /**
-     * @notice Get the evaluation classes supported by a specific oracle identity
-     * @dev Returns classes for oracle identified by address and job ID
-     * @param _oracle Address of the oracle contract
-     * @param _jobId Job ID of the oracle instance
-     * @return Array of evaluation classes supported by the oracle
+     * @notice Apply one round's outcomes. codes[i]: low nibble timeliness event, bits 4-5 quality
+     *         class, bit 7 committed. Frozen arbiters that did not commit are skipped (being down is
+     *         handled by the freeze, never by points); a commit proves the arbiter was up.
      */
-    function getOracleClassesByKey(address _oracle, bytes32 _jobId) public view returns (uint64[] memory) {
-        for (uint256 i = 0; i < registeredOracles.length; i++) {
-            if (registeredOracles[i].oracle == _oracle && registeredOracles[i].jobId == _jobId) {
-                return registeredOracles[i].classes;
+    /// @param roundEnd the round's deadline: being frozen is judged then, not at settlement, so an arbiter
+    ///        that recovers before settlement is not charged for the outage, and one that stays frozen
+    ///        past settlement gains nothing it would not have had at round end
+    function applyOutcomes(bytes32[] calldata keys, uint8[] calldata codes, uint256 roundEnd) external onlyApproved {
+        if (keys.length != codes.length) revert BadParams();
+        Points memory pt = points;
+        uint256 burnTotal;
+        for (uint256 i = 0; i < keys.length; i++) {
+            uint8 code = codes[i];
+            if (code == 0) continue;
+            bytes32 key = keys[i];
+            Ck memory c = _cur(key);
+            if (c.flags & F_REGISTERED == 0 || c.flags & F_BANNED != 0) continue;
+            if (code & C_COMMITTED == 0 && _frozenWhen(c, roundEnd)) {
+                emit OutcomeSkippedFrozen(key);
+                continue;
             }
+            int256 t = int256(uint256(c.timeliness));
+            int256 q = int256(uint256(c.quality));
+            uint8 te = code & 0x0F;
+            uint8 qe = (code >> 4) & 0x03;
+            if (te == T_DELIVERED) t += int256(uint256(pt.gain));
+            else if (te == T_MISS_FINISHED) t -= int256(uint256(pt.major));
+            else if (te == T_MISS_FAILED) t -= int256(uint256(pt.fail));
+            else if (te == T_NOCOMMIT_FAILED) t -= int256(uint256(pt.nocommit));
+            if (qe == Q_CLOSE) q += int256(uint256(pt.gain));
+            else if (qe == Q_OFF) q -= int256(uint256(pt.minor));
+            else if (qe == Q_FAR) q -= int256(uint256(pt.major));
+            int256 capI = int256(uint256(pt.cap));
+            if (t > capI) t = capI;
+            if (q > capI) q = capI;
+            bool hit = false;
+            if (t <= 0) { t = int256(uint256(pt.start)); hit = true; }
+            if (q <= 0) { q = int256(uint256(pt.start)); hit = true; }
+            c.timeliness = uint16(uint256(t));
+            c.quality = uint16(uint256(q));
+            if (hit) burnTotal += _block(key, c);
+            _write(key, c);
+            emit ScoresUpdated(key, uint256(q), uint256(t));
         }
-        revert("Oracle not found");
+        if (burnTotal > 0) _burn(burnTotal);
     }
 
-    /**
-     * @notice Set the maximum number of oracles to consider in second-stage selection
-     * @dev Controls the shortlist size for weighted selection when many oracles are available
-     * @param newSize Maximum shortlist size (must be > 0)
-     */
-    function setShortlistSize(uint256 newSize) external onlyOwner {
-        require(newSize > 0, "Shortlist size must be > 0");
-        shortlistSize = newSize;
-    }
-    
-    /**
-     * @notice Approve a contract to select and use oracles from the reputation system
-     * @dev Only approved contracts can call selectOracles, recordUsedOracles, and updateScores
-     * @param contractAddress Address of the contract to approve (typically an aggregator contract)
-     */
-    function approveContract(address contractAddress) external onlyOwner {
-        approvedContracts[contractAddress].isApproved = true;
-        emit ContractApproved(contractAddress);
-    }
-
-    /**
-     * @notice Check if a contract is approved to use the reputation system
-     * @dev Lightweight getter for contract approval status
-     * @param contractAddress Address of the contract to check
-     * @return bool True if the contract is approved, false otherwise
-     */
-    function isContractApproved(address contractAddress) external view returns (bool) {
-        return approvedContracts[contractAddress].isApproved;
-    }
-    
-    /**
-     * @notice Revoke a contract's approval to use oracles
-     * @dev Removes the contract's ability to select oracles and update scores
-     * @param contractAddress Address of the contract to remove approval from
-     */
-    function removeContract(address contractAddress) external onlyOwner {
-        approvedContracts[contractAddress].isApproved = false;
-        emit ContractRemoved(contractAddress);
-    }
-
-    /**
-     * @notice Update entropy buffer with new randomness from aggregator contracts
-     * @dev Called by approved aggregators to provide entropy for oracle selection randomization.
-     *      Maintains a 2-slot buffer to prevent manipulation from same-block calls.
-     * @param e New entropy value to add to the buffer
-     */
-    function pushEntropy(bytes16 e) external {
-        require(approvedContracts[msg.sender].isApproved, "not aggregator");
-
-        if (block.number > entropyBlock) {
-            entropyBuf[1] = entropyBuf[0];   // shift
-            entropyBuf[0] = e;               // store newest
-            entropyBlock  = block.number;
-            emit EntropyPushed(e, entropyBlock);
+    /// @dev Block with lazy offense decay (updates `c` in memory); returns the VDKA to burn. A hit while
+    ///      already blocked (another in-flight round settling) adds no offense and no burn.
+    function _block(bytes32 key, Ck memory c) internal returns (uint256 burned) {
+        if (c.blockedUntil > block.timestamp) return 0;
+        Meta storage m = metas[key];
+        uint256 offenses = m.offenses;
+        if (offenses > 0 && block.timestamp > m.cleanFrom) {
+            uint256 forgiven = (block.timestamp - m.cleanFrom) / decayPeriod;
+            offenses = forgiven >= offenses ? 0 : offenses - forgiven;
         }
+        uint256 dur = uint256(lockDuration) << offenses;
+        uint40 until = uint40(block.timestamp + dur);
+        c.blockedUntil = until;
+        m.cleanFrom = until;
+        uint256 b = uint256(burnPerBlock) << offenses;
+        offenses += 1;
+        m.offenses = uint8(offenses);
+        bool ban = offenses >= maxOffenses;
+        if (ban) {
+            c.flags |= F_BANNED;
+            if (burnOnBan) b = m.stake;
+        }
+        if (b > m.stake) b = m.stake;
+        m.stake -= uint96(b);
+        _stakeFlag(c, m.stake);
+        burned = b;
+        emit ArbiterBlocked(key, until, offenses, b);
+        if (ban) emit ArbiterBanned(key, b);
+    }
+
+    function _burn(uint256 amount) internal {
+        try IBurnableToken(address(verdiktaToken)).burn(amount) {} catch {
+            if (!verdiktaToken.transfer(DEAD, amount)) revert TransferFailed();
+        }
+    }
+
+    // ================================================================== views
+    struct ArbiterView {
+        address oracle;
+        uint256 quality;
+        uint256 timeliness;
+        uint256 offenses;
+        uint256 flags;
+        uint256 blockedUntil;
+        uint256 fee;
+        uint256 callSentAt;
+        uint256 callAnsweredAt;
+        uint256 stake;
+        uint256 checkpoints;
+    }
+
+    function getArbiter(bytes32 key) external view returns (ArbiterView memory v) {
+        Ck memory c = _cur(key);
+        Meta storage m = metas[key];
+        v = ArbiterView(m.oracle, c.quality, c.timeliness, m.offenses, c.flags, c.blockedUntil, c.fee,
+            c.callSentAt, c.callAnsweredAt, m.stake, cks[key].length);
+    }
+
+    function jobIdOf(bytes32 key) external view returns (bytes32) {
+        return metas[key].jobId;
+    }
+
+    function isFrozen(bytes32 key) external view returns (bool) {
+        return _frozenAt(_cur(key), block.timestamp);
+    }
+
+    function isEligible(bytes32 key, uint256 maxFee) external view returns (bool) {
+        return _eligibleAt(_cur(key), maxFee, block.timestamp);
+    }
+
+    /// @notice Number of arbiters currently eligible for `cls` at fee ceiling `maxFee` (off-chain view).
+    function eligibleCount(uint64 cls, uint256 maxFee) external view returns (uint256 c) {
+        bytes32[] storage list = classList[cls];
+        for (uint256 i = 0; i < list.length; i++) {
+            bytes32 k = list[i];
+            if (_eligibleAt(_cur(k), maxFee, block.timestamp)) c++;
+        }
+    }
+
+    function classSize(uint64 cls) external view returns (uint256) {
+        return classList[cls].length;
+    }
+
+    // ================================================================== owner configuration
+    /// @notice v1 name for approvedContracts, kept because every deployed ArbiterOperator gates requests
+    ///         with rk.isContractApproved(requester) for each keeper on its list (and checks the function
+    ///         exists when the keeper is added). Without it every dispatch to a real operator reverts.
+    function isContractApproved(address c) external view returns (bool) {
+        return approvedContracts[c];
+    }
+
+    function setApproved(address aggregator, bool ok) external onlyOwner {
+        approvedContracts[aggregator] = ok;
+        emit ContractApproval(aggregator, ok);
+    }
+
+    function setPoints(Points calldata p) external onlyOwner {
+        if (p.cap == 0 || p.start == 0 || p.start > p.cap) revert BadParams();
+        points = p;
+    }
+
+    function setTiming(uint40 lock, uint40 decay, uint40 deadline, uint40 unbonding) external onlyOwner {
+        if (decay == 0) revert BadParams();
+        lockDuration = lock;
+        decayPeriod = decay;
+        callDeadline = deadline;
+        unbondingPeriod = unbonding;
+    }
+
+    function setPenalties(uint8 _maxOffenses, uint96 _burnPerBlock, bool _burnOnBan) external onlyOwner {
+        if (_maxOffenses == 0 || _maxOffenses > 16) revert BadParams();
+        maxOffenses = _maxOffenses;
+        burnPerBlock = _burnPerBlock;
+        burnOnBan = _burnOnBan;
+    }
+
+    function setSelection(uint16 _shortlist, uint16 _maxScan, uint8 _liveRandom) external onlyOwner {
+        if (_shortlist == 0 || _maxScan < _shortlist) revert BadParams();
+        shortlistSize = _shortlist;
+        maxScan = _maxScan;
+        liveRandom = _liveRandom;
+    }
+
+    function setStakeRequirement(uint256 s) external onlyOwner {
+        stakeRequirement = s;
     }
 }
-

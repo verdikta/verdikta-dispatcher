@@ -1,13 +1,10 @@
 // deploy/03_config.js
 // -----------------------------------------------------------------------------
-// Post‑deployment wiring & parameters
-//   • Set Verdikta token address inside ReputationKeeper (defensive)
-//   • Configure ReputationAggregator (cluster, responses, fee, timeout)
-//   • Set max oracle fee (0.0004 ETH — the ETH-funded aggregator's hard ceiling)
-//
-// NOTE: `ReputationAggregator` now refers to the ETH-funded contract; maxOracleFee
-//       is denominated in ETH wei and is ENFORCED in selection (the clamp), so it
-//       must sit strictly below any LINK-scale arbiter fee. See docs section 4.6.
+// Sets the aggregator's jury for one bounty class (TODO item 15). K/M/N/P, T+ and the
+// timeout are per aggregator, so each class is its own deployment. Choose it with
+// AGG_CLASS (small, medium, large, jumbo; default small). Bondless Small uses the
+// small jury. Jumbo requests set the beacon flag per request (BountyEscrow's class
+// preset), so the beacon contract keeps its defaults: 4 polled, first 2 used, 120 s.
 //
 // Tags:    config
 // Depends: aggregator, keeper
@@ -15,82 +12,42 @@
 
 require("dotenv").config();
 
-module.exports = async ({ ethers, getNamedAccounts, deployments }) => {
+// item 15 (2026-11-18): K/M/N/P, response timeout (s), T+ (s, item 14's measured 155 s)
+const CLASSES = {
+  small:  { K: 6,  M: 5,  N: 4,  P: 3,  timeout: 300, tPlus: 155 },
+  medium: { K: 8,  M: 5,  N: 4,  P: 3,  timeout: 300, tPlus: 155 },
+  large:  { K: 21, M: 16, N: 13, P: 10, timeout: 300, tPlus: 155 },
+  jumbo:  { K: 50, M: 38, N: 27, P: 17, timeout: 600, tPlus: 155 },
+};
+
+module.exports = async ({ ethers, getNamedAccounts, deployments, network }) => {
   if (process.env.SKIP_MIGRATIONS) {
     console.log("[deploy/03_config] SKIP_MIGRATIONS set → skipping");
     return;
   }
 
+  const { execute, read } = deployments;
   const { deployer } = await getNamedAccounts();
-  const CONFIRMATIONS =
-    (network.name === "base_sepolia" || network.name === "base") ? 2 : 1;
+  const CONFIRMATIONS = /^base(_|$)/.test(network.name) ? 2 : 1;
+  const tx = { from: deployer, log: true, waitConfirmations: CONFIRMATIONS };
 
-  /* ----------------------------------------------------------------------- */
-  /* Contracts                                                                */
-  /* ----------------------------------------------------------------------- */
+  const name = (process.env.AGG_CLASS || "small").toLowerCase();
+  const c = CLASSES[name];
+  if (!c) throw new Error(`AGG_CLASS must be one of ${Object.keys(CLASSES).join(", ")}`);
+  console.log(`Configuring aggregator for class ${name}: ${c.K}/${c.M}/${c.N}, P = ${c.P}, timeout ${c.timeout} s, T+ ${c.tPlus} s`);
 
-const aggInfo  = await deployments.get("ReputationAggregator");
-const keepInfo = await deployments.get("ReputationKeeper");
-const signer   = await ethers.getSigner(deployer);
+  // Jumbo's selection walk must fill a 50-juror shortlist: shortlistSize >= K (keeper default 60)
+  const shortlist = Number(await read("ReputationKeeper", "shortlistSize"));
+  if (shortlist < c.K) throw new Error(`keeper shortlistSize ${shortlist} < K = ${c.K}`);
 
-const aggregator = await ethers.getContractAt(
-  "ReputationAggregator",
-  aggInfo.address,
-  signer
-);
+  await execute("ReputationAggregator", tx, "setConfig", c.K, c.M, c.N, c.P, c.timeout, c.tPlus);
 
-const keeper = await ethers.getContractAt(
-  "ReputationKeeper",
-  keepInfo.address,
-  signer
-);
-
-console.log("Keeper      :", keeper.target);      // ethers v6 uses .target
-console.log("Aggregator  :", aggregator.target);
-
-if (keeper.target === aggregator.target) {
-  throw new Error(
-    "Keeper and Aggregator addresses are identical – deployments.get() returned the wrong file"
-  );
-}
-
-  let TOKEN_ADDR;
-  if (network.name === "base") {
-    TOKEN_ADDR = process.env.WRAPPED_VERDIKTA_TOKEN_BASE;
-  } else if (network.name === "base_sepolia") {
-    TOKEN_ADDR = process.env.WRAPPED_VERDIKTA_TOKEN_BASE_SEPOLIA;
-  } else {
-    TOKEN_ADDR = process.env.WRAPPED_VERDIKTA_TOKEN;
-  }
-
-  if (!ethers.isAddress(TOKEN_ADDR)) {
-    throw new Error("WRAPPED_VERDIKTA_TOKEN env var missing or invalid");
-  }
-
-  /* ----------------------------------------------------------------------- */
-  /* 1. Ensure keeper points at the correct token (redundant but safe)       */
-  /* ----------------------------------------------------------------------- */
-  const currentToken = await keeper.verdiktaToken();
-  if (currentToken.toLowerCase() !== TOKEN_ADDR.toLowerCase()) {
-    console.log("Updating Verdikta token address in keeper…");
-    await (await keeper.setVerdiktaToken(TOKEN_ADDR)).wait(CONFIRMATIONS);
-  }
-
-  /* ----------------------------------------------------------------------- */
-  /* 2. Configure aggregator                                                 */
-  /* ----------------------------------------------------------------------- */
-  console.log("Configuring aggregator parameters…");
-  await (await aggregator.setConfig(6, 4, 3, 2, 300)).wait(CONFIRMATIONS);
-
-  // ETH hard ceiling: 0.0004 ETH (4e14 wei) = the live 0.05 LINK ceiling scaled by
-  // /125 (docs section 4.6). This is below the prevailing 0.002-LINK arbiter band, so
-  // the clamp excludes every LINK-scale arbiter from the ETH aggregator's selection.
-  const maxFee = ethers.parseEther("0.0004");
-  await (await aggregator.setMaxOracleFee(maxFee)).wait(CONFIRMATIONS);
+  // bonus x3, settle 2 due rounds per request, 250k dispatch stipend, 3-point spread floor, and the
+  // ETH fee ceiling: 0.0004 ETH (4e14 wei), the live 0.05 LINK ceiling scaled by /125 (docs 4.6)
+  await execute("ReputationAggregator", tx, "setParams", 3, 2, 250_000, 30_000, ethers.parseEther("0.0004"));
 
   console.log("Aggregator configured.");
 };
 
 module.exports.tags = ["config"];
 module.exports.dependencies = ["aggregator", "keeper"];
- 

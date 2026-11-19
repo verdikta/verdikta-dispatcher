@@ -201,6 +201,16 @@ library AggregatorLib {
         return (true, i);
     }
 
+    /// @dev isValidCidSalt and parseCidSaltUnchecked in one call: (false, "", 0) if malformed.
+    function parseCidSalt(string memory packed)
+        public pure
+        returns (bool ok, string memory cidOnly, uint256 salt)
+    {
+        uint256 colon;
+        (ok, colon) = isValidCidSalt(packed);
+        if (ok) (cidOnly, salt) = parseCidSaltUnchecked(packed, colon);
+    }
+
     /// @dev Call **only after** `isValidCidSalt` returned (true, pos).
     function parseCidSaltUnchecked(string memory packed, uint256 colonPos)
         public pure
@@ -225,6 +235,29 @@ library AggregatorLib {
             }
         }
         cidOnly = string(cidBytes);
+    }
+
+    // ----------------------------------------------------------------------
+    //                          REQUEST PAYLOAD
+    // ----------------------------------------------------------------------
+
+    error BadInput();
+
+    /// @notice The commit-request payload "1:<cid>,<cid>...[:<addendum>]". Reverts with BadInput for no
+    ///         CIDs, more than `maxCount`, a CID longer than `maxLen` or an addendum longer than `maxAdd`.
+    function buildCommitPayload(string[] memory cids, string memory addendum, uint256 maxCount, uint256 maxLen, uint256 maxAdd)
+        public
+        pure
+        returns (string memory)
+    {
+        if (cids.length == 0 || cids.length > maxCount || bytes(addendum).length > maxAdd) revert BadInput();
+        bytes memory cat = "1:";
+        for (uint256 i = 0; i < cids.length; i++) {
+            if (bytes(cids[i]).length > maxLen) revert BadInput();
+            cat = abi.encodePacked(cat, cids[i], i + 1 < cids.length ? "," : "");
+        }
+        if (bytes(addendum).length > 0) cat = abi.encodePacked(cat, ":", addendum);
+        return string(cat);
     }
 
     // ----------------------------------------------------------------------

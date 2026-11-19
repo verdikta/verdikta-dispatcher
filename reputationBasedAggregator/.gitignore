@@ -31,3 +31,6 @@ npm-debug.log*
 *.swo
 
 
+
+# Snapshot of the v1 code (tag aggregator-v0.1.0 / commit 343ac6f) kept for comparison; not tracked
+/v1/
