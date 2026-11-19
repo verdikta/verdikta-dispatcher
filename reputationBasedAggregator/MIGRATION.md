@@ -27,8 +27,8 @@ comparing the two ABIs and the code that calls them.
     pulled from the caller, and the caller must be the keeper owner or the operator's `owner()`.
   - The node generates a hash chain (item 6: seed `s`, `v_{i-1} = keccak256(v_i)`) and registers the
     head.
-  - `requestExit` + `completeExit` (after 7 days) replace `deregisterOracle`. `setPaused` replaces
-    `setOracleActive`.
+  - `requestExit` + `completeExit` (after 7 days) replace `deregisterOracle`. `completeExit` reverts
+    while a health call is outstanding, so answer it first. `setPaused` replaces `setOracleActive`.
 - **Health calls** (`HealthCall(key, sentAt)` from the keeper).
   - Answer with `answerHealthCall(key, nextPreimage)` within `callDeadline` (60 s), from an authorized
     sender of the operator or its owner. Otherwise the arbiter is frozen until it answers.
@@ -63,7 +63,9 @@ Behaviour BountyEscrow must allow for:
   - a missed beacon quorum (phase 8, `EvaluationFailed(aggId, 2)`);
   - a commit phase that had M commits but was never promoted (closed and not promoted, or nobody
     called `closeCommits` after T+);
-  - a cancelled round (phase 9: never sealed within ~27 min, or sealed but undrawn for a day).
+  - a cancelled round (phase 9: never sealed within ~27 min, or sealed but undrawn for a day);
+  - a beacon round whose jury can't be drawn once the beacon values are in, when the class list is
+    longer than the keeper's `maxScan` (`keeper.scansAll(cls)` is false). The beacons are still paid.
 
   The hunter may re-run (item 12), but its `refundLeftoverEth` gets nothing back for that round.
 - **Refunds land in `ethOwed[wallet]`:**

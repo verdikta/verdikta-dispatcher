@@ -1,7 +1,7 @@
 // Item 9's beacon flag: JuryBeacons + the aggregator's beacon stage + the keeper's beacon pick.
 // A flagged request escrows the beacon quorum; the first drawJury picks 4 beacons from the class's state
 // as of block B and sends each a health call. A beacon answers like any arbiter, with its next chain
-// value (verified by the keeper); its beacon value is its first reveal after B. The first 2 reveals (by
+// value (verified by the keeper); its beacon value is its first reveal after block B+1. The first 2 reveals (by
 // block, ties by index) are used, mixed in beacon-index order; a missed quorum ends the round with no
 // result and no refund.
 const { expect } = require("chai");
@@ -28,6 +28,10 @@ describe("JuryBeacons (item 9's beacon flag)", function () {
     return () => arbs.forEach((a, i) => { a.ch = u[i][0]; a.ch.used = u[i][1]; });
   };
   const requestBlock = async (r) => (await agg.getRoundInfo(r.aggId))[1];
+  const valueBlock = async (r) => (await requestBlock(r)) + 1n;              // values: first reveal after B+1
+  const deadlineOf = async (r) => (await beacons.getBeacons(agg.target, r.aggId))[2];
+  const pending = async (key) => ((await keeper.getArbiter(key)).flags & 16n) !== 0n;
+  const ST = { NONE: 0n, PENDING: 1n, READY: 2n, EXPIRED: 3n };
   const automine = (on) => ethers.provider.send("evm_setAutomine", [on]);
 
   beforeEach(async () => {
@@ -76,6 +80,7 @@ describe("JuryBeacons (item 9's beacon flag)", function () {
     await drv.beaconStage(r, { answering: 0 });
     const b = r.beacons[0];
     const B = await requestBlock(r);
+    const V = await valueBlock(r);
     const ch = b.arb.ch;
     const v = ch.chain[ch.chain.length - 2 - ch.used];                          // its next value
     await expect(keeper.connect(stranger).answerHealthCall(b.key, v))
@@ -84,10 +89,10 @@ describe("JuryBeacons (item 9's beacon flag)", function () {
       .to.be.revertedWithCustomError(keeper, "BadPreimage");
     await expect(keeper.connect(b.arb.node).answerHealthCall(b.key, ch.preimageOf(v)))   // skips a value
       .to.be.revertedWithCustomError(keeper, "BadPreimage");
-    expect((await keeper.revealAfter(b.key, B)).value).to.equal(ethers.ZeroHash);
+    expect((await keeper.revealAfter(b.key, V)).value).to.equal(ethers.ZeroHash);
     const rc = await drv.answerBeacon(r, 0);
     expect((await keeper.getArbiter(b.key)).flags & 16n).to.equal(0n);       // call answered
-    const rv = await keeper.revealAfter(b.key, B);
+    const rv = await keeper.revealAfter(b.key, V);
     expect(rv.value).to.equal(v);
     expect(rv.blk).to.equal(BigInt(rc.blockNumber));
     expect(rv.oracle).to.equal(b.arb.opAddr);
@@ -98,7 +103,7 @@ describe("JuryBeacons (item 9's beacon flag)", function () {
     // a later answer (to a later call) does not change the beacon value
     await keeper.sendHealthCalls([b.key]);
     await keeper.connect(b.arb.node).answerHealthCall(b.key, ch.next());
-    expect((await keeper.revealAfter(b.key, B)).value).to.equal(v);
+    expect((await keeper.revealAfter(b.key, V)).value).to.equal(v);
   });
 
   it("only an approved aggregator can start a stage; owner limits on the parameters", async () => {
@@ -223,7 +228,7 @@ describe("JuryBeacons (item 9's beacon flag)", function () {
     }
   });
 
-  it("a beacon cannot answer its call and keep its value back: a live beacon's answer is its value", async () => {
+  it("a beacon delivers its value only by answering its health call; used values are paid in index order", async () => {
     const r = await drv.requestOnly();
     await drv.beaconStage(r, { answering: 0 });
     const b = r.beacons[3];
@@ -279,6 +284,164 @@ describe("JuryBeacons (item 9's beacon flag)", function () {
     expect(ev(agg, r.rcpt, "BeaconPayment").map((p) => p.payee)).to.deep.equal([await r.beacons[1].arb.op.owner()]);
     const [, , , , , , , rewards] = await agg.getRoundInfo(r.aggId);
     expect(rewards).to.equal(3n * H.MAX_FEE);                                 // 2 x draw reward + 1 beacon
+  });
+
+  it("withholding is cheap: a beacon that answers just after the deadline is frozen only from 60 s, and its value does not count", async () => {
+    const r = await drv.requestOnly();
+    await drv.beaconStage(r, { answering: 1 });
+    const b = r.beacons[1];
+    const dl = await deadlineOf(r);
+    await time.increaseTo(dl);
+    expect(await keeper.isFrozen(b.key)).to.equal(true);                     // frozen since the 60 s call deadline
+    await time.setNextBlockTimestamp(dl + 1n);
+    await drv.answerBeacon(r, 1);                                              // one second late
+    expect(await pending(b.key)).to.equal(false);
+    expect(await keeper.isFrozen(b.key)).to.equal(false);
+    expect((await keeper.revealAfter(b.key, await valueBlock(r))).value).to.not.equal(ethers.ZeroHash);
+    expect((await beacons.result(agg.target, r.aggId)).state).to.equal(ST.EXPIRED);
+    await agg.connect(stranger).drawJury(r.aggId);
+    expect(await phase(r)).to.equal(PH.FAILED);                               // a no-result round for ~60 s of freeze
+  });
+
+  it("a reveal in the deadline's second counts; one second later does not", async () => {
+    const r = await drv.requestOnly();
+    await drv.beaconStage(r, { answering: 1 });
+    const dl = await deadlineOf(r);
+    const snap = await takeSnapshot();
+    const restoreChains = saveChains();
+    await time.setNextBlockTimestamp(dl);
+    await drv.answerBeacon(r, 1);
+    await mine(1);
+    expect((await beacons.result(agg.target, r.aggId)).state).to.equal(ST.READY);
+    await snap.restore();
+    restoreChains();
+    await time.setNextBlockTimestamp(dl + 1n);
+    await drv.answerBeacon(r, 1);
+    await mine(1);
+    expect((await beacons.result(agg.target, r.aggId)).state).to.equal(ST.EXPIRED);
+  });
+
+  it("values are anchored at B+1: an answer included in block B+1 does not count, the next one does", async () => {
+    await keeper.sendHealthCalls(arbs.map((a) => a.key));                     // calls pending at B
+    const r = await drv.requestOnly();                                         // block B
+    await automine(false);
+    for (const a of arbs) await keeper.connect(a.node).answerHealthCall(a.key, a.ch.next(), { gasLimit: 500_000 });
+    await mine(1);                                                             // all answers in block B+1
+    await automine(true);
+    const B = await requestBlock(r);
+    expect((await keeper.revealAfter(arbs[0].key, B)).blk).to.equal(B + 1n);  // revealed in B+1 ...
+    await drv.beaconStage(r, { answering: 0, waitBlocks: 0 });
+    expect((await beacons.result(agg.target, r.aggId)).state).to.equal(ST.PENDING);   // ... but not counted
+    const rc = await drv.answerBeacon(r, 0);                                   // the answer to the beacon call
+    expect((await keeper.revealAfter(r.beacons[0].key, B + 1n)).blk).to.equal(BigInt(rc.blockNumber));
+    await drv.answerBeacon(r, 1);
+    await drv.draw(r, { waitBlocks: 0 });
+    expect(await phase(r)).to.equal(PH.COMMIT);
+  });
+
+  it("rotating the chain in the beacon answer itself does not change the value or the jury", async () => {
+    const r = await drv.requestOnly();
+    await drv.beaconStage(r, { answering: 0 });
+    const snap = await takeSnapshot();
+    const restoreChains = saveChains();
+    await drv.answerBeacon(r, 0);
+    await drv.answerBeacon(r, 1);
+    await drv.draw(r, { waitBlocks: 0 });
+    const jury = await juryKeys(r);
+    await snap.restore();
+    restoreChains();
+    const b0 = r.beacons[0];
+    const fresh = H.makeChain();
+    await keeper.connect(b0.arb.node).rotateChain(b0.key, b0.arb.ch.next(), fresh.head);
+    b0.arb.ch = fresh;
+    await keeper.sendHealthCalls([b0.key]);
+    await keeper.connect(b0.arb.node).answerHealthCall(b0.key, fresh.next());   // and answer again
+    await drv.answerBeacon(r, 1);
+    await drv.draw(r, { waitBlocks: 0 });
+    expect(await juryKeys(r)).to.deep.equal(jury);
+  });
+
+  it("a beacon picked in two concurrent rounds gives both the same value with one answer", async () => {
+    let r1, r2, common;
+    for (let t = 0; t < 6 && !common; t++) {
+      r1 = await drv.requestOnly();
+      r2 = await drv.requestOnly();
+      await drv.beaconStage(r1, { answering: 0 });
+      await drv.beaconStage(r2, { answering: 0, waitBlocks: 0 });
+      const k2 = new Set(r2.beacons.map((b) => b.key));
+      common = r1.beacons.find((b) => k2.has(b.key));
+      if (!common) {
+        for (const r of [r1, r2]) for (const b of r.beacons) {
+          if (await pending(b.key)) await keeper.connect(b.arb.node).answerHealthCall(b.key, b.arb.ch.next());
+        }
+        await agg.drawJury(r1.aggId, { gasLimit: 16_000_000 });
+        await agg.drawJury(r2.aggId, { gasLimit: 16_000_000 });
+      }
+    }
+    expect(common).to.not.equal(undefined);
+    await keeper.connect(common.arb.node).answerHealthCall(common.key, common.arb.ch.next());
+    const v1 = await keeper.revealAfter(common.key, await valueBlock(r1));
+    const v2 = await keeper.revealAfter(common.key, await valueBlock(r2));
+    expect(v1.value).to.equal(v2.value);
+    expect(v1.blk).to.equal(v2.blk);
+    expect(await pending(common.key)).to.equal(false);
+  });
+
+  it("an arbiter with a call pending cannot complete its exit (re-registering would drop the call unanswered)", async () => {
+    const [lock, decay, dead] = [await keeper.lockDuration(), await keeper.decayPeriod(), await keeper.callDeadline()];
+    await keeper.setTiming(lock, decay, dead, 0);                             // unbonding shorter than the stage
+    const r = await drv.requestOnly();
+    await drv.beaconStage(r, { answering: 1 });
+    const b = r.beacons[1];
+    await keeper.requestExit(b.key);
+    await expect(keeper.completeExit(b.key)).to.be.revertedWithCustomError(keeper, "CallPending");
+    await drv.answerBeacon(r, 1);                                              // answering reveals the value
+    await keeper.completeExit(b.key);
+    await drv.draw(r, { waitBlocks: 0 });
+    expect(await phase(r)).to.equal(PH.COMMIT);
+  });
+
+  it("a jury shortage after the beacon stage refunds only if selection walks the whole class list", async () => {
+    // 7 of 12 arbiters cost more than the request's maxFee: beacons ignore fees, the jury (K = 6) cannot fill
+    for (const a of arbs.slice(5)) await keeper.setFee(a.key, H.MAX_FEE + 1n);
+    const run = async () => {
+      const r = await drv.requestOnly();
+      await drv.beaconStage(r, { answering: 2 });
+      const [owedReq, owedTreasury] = [await agg.ethOwed(requester.address), await agg.ethOwed(deployer.address)];
+      await agg.connect(stranger).drawJury(r.aggId, { gasLimit: 16_000_000 });
+      expect(await phase(r)).to.equal(PH.FAILED);
+      const [, , , , received] = await agg.getRoundInfo(r.aggId);
+      return { received, req: (await agg.ethOwed(requester.address)) - owedReq,
+               treasury: (await agg.ethOwed(deployer.address)) - owedTreasury };
+    };
+    let o = await run();                                                       // maxScan 400 >= 12: seed-independent
+    expect(o.req).to.equal(o.received - 2n * H.MAX_FEE);                      // refund less the 2 beacons
+    expect(o.treasury).to.equal(0n);
+    await keeper.setSelection(6, 6, 0);                                        // walks 6 of 12: seed-dependent
+    o = await run();
+    expect(o.req).to.equal(0n);                                                // a refund would be a re-roll
+    expect(o.treasury).to.equal(o.received - 2n * H.MAX_FEE);
+  });
+
+  it("an owner change of polled below a round's fixed quorum does not fail the round", async () => {
+    await beacons.setParams(4, 4, 120);
+    const r = await drv.requestOnly();                                         // escrows and fixes quorum 4
+    await beacons.setParams(3, 2, 120);
+    await drv.beaconStage(r);
+    expect(r.beacons.length).to.equal(4);                                      // at least the quorum is picked
+    await drv.draw(r, { waitBlocks: 0 });
+    expect(await phase(r)).to.equal(PH.COMMIT);
+  });
+
+  it("documented constraint: swapping the beacon contract during a beacon stage strands the round until it is cancelled", async () => {
+    const r = await drv.requestOnly();
+    await drv.beaconStage(r);
+    const nb = await (await ethers.getContractFactory("JuryBeacons")).deploy(keeper.target);
+    await agg.setContracts(keeper.target, nb.target, deployer.address);
+    await expect(agg.drawJury(r.aggId)).to.be.revertedWithCustomError(agg, "TooEarly");
+    await time.increase(24 * 3600 + 1);
+    await agg.cancelUnsealed(r.aggId);
+    expect(await phase(r)).to.equal(PH.CANCELLED);
   });
 
   it("the requester's 30 s draw priority runs from the quorum-th value", async () => {

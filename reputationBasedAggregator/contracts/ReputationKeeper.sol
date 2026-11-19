@@ -37,9 +37,11 @@ interface IBurnableToken { function burn(uint256 amount) external; }
  *         lists are append-only with checkpointed lengths, so state changes between B and the draw
  *         cannot shift the result.
  *
- * @dev Selection walks the requested class's list (as of B) with a seed-derived coprime stride and
- *      stops once the shortlist is full or after `maxScan` entries, so its cost does not grow with the
- *      pool. Whether the stake meets the requirement is checkpointed too (F_UNDERSTAKED, updated when
+ * @dev Selection visits the requested class's list (as of B) in a seed-derived random order (random
+ *      positions without repeats, see _nextPos) and stops once the shortlist is full or after `maxScan`
+ *      entries, so its cost does not grow with the pool. The order is a uniform random sample, so
+ *      where an arbiter sits in the list does not matter: a cartel that registers back to back is drawn
+ *      no more often than any other set of arbiters. Whether the stake meets the requirement is checkpointed too (F_UNDERSTAKED, updated when
  *      the stake changes), so a top-up after B cannot re-roll the draw; a new stakeRequirement applies
  *      to an arbiter at its next stake change.
  */
@@ -139,6 +141,7 @@ contract ReputationKeeper is Ownable {
     error TransferFailed();
     error FutureBlock();
     error NotEnoughEligible();
+    error CallPending();
 
     // ------------------------------------------------------------------ events
     event ArbiterRegistered(bytes32 indexed key, address indexed oracle, bytes32 jobId, uint256 fee);
@@ -337,11 +340,14 @@ contract ReputationKeeper is Ownable {
     }
 
     /// @notice Finish unbonding: refund the remaining stake to the arbiter's owner. A banned key keeps
-    ///         its record (a tombstone), so it can never register again.
+    ///         its record (a tombstone), so it can never register again. An outstanding health call
+    ///         must be answered first: re-registering would otherwise drop it unanswered, so a beacon
+    ///         could clear its call without revealing its value.
     function completeExit(bytes32 key) external {
         Meta storage m = _onlyArbiterOwner(key);
         Ck memory c = _cur(key);
         if (c.flags & F_EXITING == 0 || block.timestamp < m.exitAt) revert StillBonded();
+        if (c.flags & F_CALL_PENDING != 0) revert CallPending();
         if (c.blockedUntil > block.timestamp) revert Blocked();
         uint256 refund = m.stake;
         address to = IOracleOwner(m.oracle).owner();
@@ -419,7 +425,7 @@ contract ReputationKeeper is Ownable {
      * @notice The arbiter's first hash-chain value revealed after block `b` (by any answer to a health
      *         call, or a rotation), with the block and time of the reveal; zeros if none yet. The value
      *         is the preimage of the head as of `b`, so it was fixed at `b` and only its timing is the
-     *         arbiter's choice. Item 9's beacons use it as the beacon value.
+     *         arbiter's choice. Item 9's beacons use it as the beacon value, with `b` = B+1.
      */
     function revealAfter(bytes32 key, uint256 b)
         external
@@ -503,19 +509,16 @@ contract ReputationKeeper is Ownable {
         if (n == 0) revert NoEligibleArbiters();
 
         uint256 s = uint256(seed);
-        uint256 idx = s % n;
-        uint256 step = n == 1 ? 1 : 1 + (s >> 128) % (n - 1);
-        while (_gcd(step, n) != 1) step = step % n + 1;
-
         uint256 cap = shortlistSize;
         uint256 scanLimit = maxScan < n ? maxScan : n;
+        Walk memory wk = _walk(seed, n, scanLimit);
         bytes32[] memory sk = new bytes32[](cap);
         uint256[] memory w = new uint256[](cap);
         uint256[] memory fees = new uint256[](cap);   // fee as of B: a later fee change cannot break the draw
         uint256 m;
         uint256 total;
         for (uint256 i = 0; i < scanLimit && m < cap; i++) {
-            bytes32 key = list[idx];
+            bytes32 key = list[_nextPos(wk)];
             Ck memory c = _at(key, atBlock);
             if (_eligibleAt(c, sp.maxFee, atTime)) {
                 sk[m] = key;
@@ -525,7 +528,6 @@ contract ReputationKeeper is Ownable {
                 total += wi;
                 m++;
             }
-            idx = (idx + step) % n;
         }
         if (m == 0) revert NoEligibleArbiters();
         if (m < sp.count) revert NotEnoughEligible();
@@ -562,12 +564,12 @@ contract ReputationKeeper is Ownable {
      * @notice Pick up to `count` beacons for a draw (item 9's beacon flag) from `cls`, entirely from the
      *         state as of block `atBlock` (time `atTime`): registered, and not paused, banned, exiting,
      *         under-staked, blocked or frozen. Each beacon gets a health call, and its beacon value is
-     *         its next hash-chain value as of `atBlock` (revealAfter): its answer to that call, or to
-     *         an earlier one if it answered after `atBlock`. The value was fixed before blockhash(B+1)
-     *         existed, so nothing after B (who starts the stage, when, or a chain rotation) changes the
-     *         pick or the values.
-     * @dev Walks the class list with a seed-derived coprime stride, at most `maxScan` entries. Fewer
-     *      than `count` are returned only if the walk finds fewer.
+     *         its next hash-chain value as of block B+1 (revealAfter): its answer to that call, or to
+     *         an earlier one if it answered after B+1. The value was fixed by the end of B+1, so
+     *         nothing later (who starts the stage, when, or a chain rotation) changes the pick or the
+     *         values.
+     * @dev Visits the class list in a seed-derived random order (as selection does), at most `maxScan`
+     *      entries. Fewer than `count` are returned only if the walk finds fewer.
      */
     function pickBeacons(bytes32 seed, uint64 cls, uint256 atBlock, uint256 atTime, uint256 count)
         external
@@ -580,13 +582,10 @@ contract ReputationKeeper is Ownable {
         uint256 m;
         if (n > 0) {
             bytes32[] storage list = classList[cls];
-            uint256 s = uint256(seed);
-            uint256 idx = s % n;
-            uint256 step = n == 1 ? 1 : 1 + (s >> 128) % (n - 1);
-            while (_gcd(step, n) != 1) step = step % n + 1;
             uint256 scanLimit = maxScan < n ? maxScan : n;
+            Walk memory wk = _walk(seed, n, scanLimit);
             for (uint256 i = 0; i < scanLimit && m < count; i++) {
-                bytes32 key = list[idx];
+                bytes32 key = list[_nextPos(wk)];
                 Ck memory c = _at(key, atBlock);
                 if (c.flags & (F_REGISTERED | F_PAUSED | F_BANNED | F_EXITING | F_UNDERSTAKED) == F_REGISTERED
                     && c.blockedUntil <= atTime && !_frozenAt(c, atTime)) {
@@ -594,7 +593,6 @@ contract ReputationKeeper is Ownable {
                     m++;
                     _call(key);
                 }
-                idx = (idx + step) % n;
             }
         }
         assembly ("memory-safe") {   // shrink in place (lengths only decrease)
@@ -602,9 +600,70 @@ contract ReputationKeeper is Ownable {
         }
     }
 
-    function _gcd(uint256 a, uint256 b) internal pure returns (uint256) {
-        while (b != 0) (a, b) = (b, a % b);
-        return a;
+    /// @dev The visiting order of a selection walk: random positions in [0, n) without repeats.
+    struct Walk {
+        uint256 seen;    // memory pointer to a bitmap of visited positions, one bit per list entry
+        uint256 n;
+        bytes32 key;     // keccak256(seed, "walk"): separate from the seed's other uses (the weighted picks)
+        uint256 ctr;     // keccak counter
+        uint256 pool;    // unused random bits
+        uint256 left;    // 32-bit draws left in pool
+        uint256 draws;   // random draws left before the sweep
+        uint256 sweep;   // next position of the sweep
+    }
+
+    /// @dev A walk that visits up to `limit` (<= n) positions of a list of length n.
+    function _walk(bytes32 seed, uint256 n, uint256 limit) internal pure returns (Walk memory w) {
+        uint256[] memory seen = new uint256[]((n + 255) >> 8);   // zeroed; n / 256 words
+        uint256 ptr;
+        assembly ("memory-safe") {
+            ptr := add(seen, 32)
+        }
+        bytes32 key = keccak256(abi.encodePacked(seed, "walk"));
+        w = Walk(ptr, n, key, 0, 0, 0, 2 * limit, uint256(key) % n);
+    }
+
+    /**
+     * @dev The next unvisited position: a uniform random sample without replacement. Each keccak gives
+     *      eight 32-bit draws, each taken mod n (a relative bias below n / 2^32), and a draw that hits a
+     *      visited position is discarded. Random draws find the last unvisited positions slowly, so
+     *      after 2 x limit draws the walk finishes with a sweep from a random start over the unvisited
+     *      positions: the cost stays bounded, every position can still be reached (so `scansAll` holds),
+     *      and the sweep only runs once most of the list has been visited without filling the
+     *      shortlist, when nearly every eligible entry is taken anyway. The caller visits at most n.
+     */
+    function _nextPos(Walk memory w) internal pure returns (uint256 y) {
+        uint256 seen = w.seen;
+        uint256 n = w.n;
+        unchecked {
+            while (w.draws != 0) {
+                w.draws--;
+                if (w.left == 0) {
+                    w.pool = uint256(keccak256(abi.encodePacked(w.key, w.ctr++)));
+                    w.left = 8;
+                }
+                y = (w.pool & 0xffffffff) % n;
+                w.pool >>= 32;
+                w.left--;
+                if (_mark(seen, y)) return y;
+            }
+            while (true) {
+                y = w.sweep;
+                w.sweep = y + 1 == n ? 0 : y + 1;
+                if (_mark(seen, y)) return y;
+            }
+        }
+    }
+
+    /// @dev set bit y of the bitmap at `seen`; false if it was already set
+    function _mark(uint256 seen, uint256 y) private pure returns (bool fresh) {
+        assembly ("memory-safe") {
+            let slot := add(seen, shl(5, shr(8, y)))
+            let word := mload(slot)
+            let bit := shl(and(y, 255), 1)
+            fresh := iszero(and(word, bit))
+            if fresh { mstore(slot, or(word, bit)) }
+        }
     }
 
     // ================================================================== scoring (Table 1 -> Table 2)
@@ -737,6 +796,12 @@ contract ReputationKeeper is Ownable {
 
     function classSize(uint64 cls) external view returns (uint256) {
         return classList[cls].length;
+    }
+
+    /// @notice Whether a selection walks the whole class list, so that whether it finds enough
+    ///         eligible arbiters does not depend on the seed (lists only grow, so this holds as of B too)
+    function scansAll(uint64 cls) external view returns (bool) {
+        return classList[cls].length <= maxScan;
     }
 
     // ================================================================== owner configuration

@@ -328,7 +328,8 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
      *         does not matter. Reward: 2 x eff, to the requester if it draws within 30 s, otherwise to
      *         whoever draws after 30 s (a third party drawing earlier earns nothing). If no arbiter was
      *         eligible at B the round fails and the requester is refunded: no jury could be drawn, so
-     *         the refund is no re-roll.
+     *         the refund is no re-roll. After a beacon stage that holds only if the selection walk
+     *         covers the whole class list; otherwise the prepay goes to the treasury.
      *
      *         With beacons, the first call only starts the beacon stage (no reward) and the draw needs
      *         a second call once the quorum is in; the 30 s priority then runs from the quorum-th value.
@@ -385,7 +386,9 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         } catch {
             if (gasleft() < g / 63) revert OutOfGas();
             r.phase = PH_FAILED;
-            _refund(r, aggId, r.requester);
+            // After a beacon stage, a failure that could depend on the seed (the walk covers only part
+            // of the class list) is a re-roll the beacons' timing could choose, so no refund then
+            _refund(r, aggId, r.beaconFees != 0 && !keeper.scansAll(r.cls) ? treasury : r.requester);
             emit EvaluationFailed(aggId, PH_DRAW);
             return;
         }

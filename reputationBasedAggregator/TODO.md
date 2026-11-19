@@ -569,6 +569,23 @@ the randomness exists.
     otherwise breaks the escrow arithmetic, and through the settlement queue blocks every request.
   - **Checkpoint stake eligibility too** (a flag updated when the stake changes). A live stake read
     lets an under-staked arbiter decide, after seeing the seed, whether to top up and re-roll the draw.
+  - **Visit the class list in random order, not by a stride (2026-11-19).** The first version walked
+    the list from `seed % n` with a fixed coprime stride. Class lists are append-only, so a cartel
+    that registers back to back stays one block, and the strides 1 and n − 1 walk straight through
+    it; the bump to a coprime stride also made n − 1 six times as likely as other strides. For a 15%
+    cartel (45 of 300) in one block, P(≥ 34 of the 60 shortlisted) was about 3 × 10⁻³ per round
+    against 3 × 10⁻¹⁹ for a random sample, and P(≥ 20) about 1% against 4 × 10⁻⁵.
+    - The walk now draws random positions without repeats: eight 32-bit draws per keccak, each mod
+      n, with a memory bitmap of visited positions (n / 256 words). After 2 × min(n, `maxScan`)
+      draws it finishes with a sweep of the unvisited positions from a random start, so its cost is
+      bounded and every entry can still be reached (`scansAll` still holds). `pickBeacons` uses the
+      same walk.
+    - Cost: about 270 gas per visited position against 195 for the stride, the same at 300 or
+      300,000 arbiters (a seed-keyed Feistel shuffle, also tried, cost 900–2,400). Selection stays
+      2.9M at K = 50.
+    - `keeper.rules.test.js` checks a 10-of-40 block against the hypergeometric tails (the stride
+      walk put 51 of 1,000 seeds in them; the random walk 5, against 8.4 expected) and that the walk
+      reaches every entry.
 - **Promotion (item 14's M+ / T+) has the same withholding problem** as the draw. The promotion seed
   is `blockhash(C+1)`, so whoever can call `promote` sees the draw first. If only the requester
   calls it, the requester can abort a draw it dislikes and pay only the base fees, which re-rolls
@@ -590,14 +607,14 @@ the randomness exists.
     heads but not the cartel's, and pushing out enough candidates bought a refund. Now nothing after
     B changes the pick or the values.
   - **A beacon call is a health call (2026-11-19).** The beacon answers it like any arbiter, with its
-    next chain value, which the keeper verifies. Its beacon value is its first value revealed after B
-    (`revealAfter`): normally its answer to the beacon call, or its answer to an earlier call if it
-    answered one after B.
-    - So the value was fixed at B. A rotation after B reveals that value first, so it cannot choose
-      the value.
-    - Answering is revealing, so a live beacon cannot keep its value back. Withholding means leaving
-      the call unanswered, and the beacon is then frozen like any silent arbiter. This closes the
-      review's open item, where a beacon could answer at the keeper and never submit its value.
+    next chain value, which the keeper verifies. Its beacon value is its first value revealed after
+    block B+1 (`revealAfter`): normally its answer to the beacon call, or its answer to an earlier
+    call if it answered one after B+1.
+    - So the value was fixed by the end of B+1, and a later rotation reveals it first, so it cannot
+      choose the value. Anchoring at B+1 rather than B keeps an honest answer included in B+1 from
+      giving its value to that block's builder.
+    - A beacon can't answer at the keeper and keep its value from JuryBeacons any more. But it can
+      still answer just after the 120 s deadline, so withholding costs about a minute of freeze.
     - There is no separate submission, so the node needs no beacon-specific code.
     - Head entries are never overwritten and record the block and time of each reveal. A rotation
       writes the revealed value, then the new head.
@@ -617,9 +634,19 @@ the randomness exists.
     cannot be read goes unpaid, and the draw goes ahead.
   - **Cost:** about 0.39M gas to start. A beacon answer is an ordinary health answer (123k). Jumbo is
     about $0.57 a round in gas with beacons, $0.56 without.
-  - **Silent beacons are only frozen**, as for any missed health call: no score change. If freezing is
-    too cheap for a cartel that forces no-result rounds, the option is −400 timeliness for a beacon
-    that stayed silent when the stage missed its quorum. Not modelled.
+  - **Withholding is cheap** (second review, 2026-11-19). A beacon that answers just after the deadline
+    is frozen only from the 60 s call deadline until then, with no score change. With the default
+    2 of 4, a cartel needs 3 seats to force a no-result round; with all 4 required, 1. The option is
+    −400 timeliness for a beacon whose value was not in when the stage missed its quorum (deferred).
+  - **Other fixes from the second review:**
+    - A jury shortage after the beacon stage is refunded only if selection walks the whole class list
+      (`scansAll`). Otherwise the outcome depended on the seed, and a beacon's timing could buy a
+      refunded re-roll, so it goes to the treasury.
+    - `completeExit` refuses while a health call is pending: exit and re-registration could drop a
+      beacon call unanswered.
+    - The stage picks at least the round's fixed quorum when the owner has lowered `polled`.
+    - The owner() stipend check counts the cold-account cost.
+    - Swapping the beacon contract mid-stage remains an owner constraint (documented).
 - **Other fixes from the 2026-11-18 review** (all with tests):
   - A requester could skip `closeCommits` (with one colluding juror not committing) for a refund. A
     round with M commits that was never promoted now sends its prepay to the treasury.
@@ -1132,7 +1159,8 @@ round at 0.006 gwei.
     requests. The model scales the K = 6 request (~3.3M gas) linearly, to about 27M. That may
     exceed a block's or a transaction's gas limit (EIP-7825 caps a transaction at 2^24 gas
     where it applies). It would then need item 2's cheaper selection, or a draw split across
-    several calls.
+    several calls. Measured since (2026-11-19): 13.5–13.8M, so it fits; see item 15's "Jumbo's
+    draw size".
   - **The 38th commit.** That arbiter's `fulfill` runs `_dispatchRevealRequests`, which sends
     38 reveal requests, so the arbiter pays for them. If the job's gas limit is too low the
     fulfill reverts, the commit is lost and the round stalls until timeout.
@@ -1677,9 +1705,10 @@ The README lists the behaviour; the points below changed or sharpened the design
   head applies to later calls only.
 - **Measured gas, 300-arbiter pool, one full round, all transactions, at 0.006 gwei** (re-measured
   2026-11-18 with the operators' keeper gate and checkpointed chain heads):
-  - Small $0.087, Medium $0.099, Large $0.248, Jumbo $0.558 without beacons and $0.569 with them
-    (2026-11-19, beacon values from health answers).
-  - Jumbo's draw is 13.6M of the 16.8M per-transaction cap, and `promote` is 5.9M.
+  - Small $0.087, Medium $0.100, Large $0.248, Jumbo $0.558 without beacons and $0.570 with them
+    (2026-11-19, beacon values from health answers and the random-order walk).
+  - Jumbo's draw is 13.4–13.8M of the 16.8M per-transaction cap, depending on the jury, and
+    `promote` is 5.9M.
   - Selection is 2.9M at K = 50, and the same with 300 or 3,000 arbiters.
   - A health answer is 123k, up from 77k, for the head checkpoint.
   - These are a little above `bounty_sizing.py`'s gas term (0.05 + 0.34 × K / 50: $0.09 at K = 6,
@@ -1927,9 +1956,17 @@ call `promote` first; the draw reward goes back to the hunter.
   the protection from the sequencer; a no-beacon Jumbo would need about K = 35 at this standard.
 
 ### Open
-- **Jumbo's draw size.** In the v2 contracts Jumbo's draw uses about 13.6M of the 16.8M per-transaction
-  cap (with the operators' keeper gate). A gas-burning operator adds at most about 140k, so about 23
-  colluding jurors of 50 would make the draw too large. The round could then only be cancelled to the treasury after a day.
+- **Jumbo's draw size (measured 2026-11-19).** Jumbo's draw uses 13.4–13.8M of the 16.8M
+  per-transaction cap, depending on the jury (with the operators' keeper gate). Each juror whose
+  operator burns its whole stipend adds about 92k. 33 such jurors of 50 still fit and 35 do not, with
+  or without beacons. The round could then only be cancelled to the treasury after a day.
+  - With the random-order walk, a 15% cartel (45 of 300 eligible) gets 34 of the 60 shortlisted
+    seats with probability about 3 × 10⁻¹⁹ per round, and 1 × 10⁻⁶ even at 30%. The risk is
+    negligible, so the draw stays one transaction (a batched draw was considered and not adopted).
+  - Before the random-order walk it was about 3 × 10⁻³ per round for a cartel registered back to
+    back (item 9, "Visit the class list in random order").
+  - The figures come from the test stand-in operator. Re-measure with a real `ArbiterOperator` on
+    testnet (item 16).
 - **Noise.** Everything assumes honest SD 3, a target. The measured normal-SD equivalent is 7.1,
   which lowers every limit; re-size once noise is re-measured (item 13's sensitivity).
 - **Cartel share and pool.** 15% of 300 eligible; 32 arbiters are registered today.
@@ -1962,3 +1999,56 @@ call `promote` first; the draw reward goes back to the hunter.
   `--config 50,38,27,17,12 --bond 250 --P 2 --beacons`.
 - The earlier class figures ($159 / $1.1K for K=6, $314 / $1.8K for K=8 at $25 / $250 bonds,
   2026-11-16) had no recorded method; this item replaces them.
+
+---
+
+## 16. Bring the consumers in sync with the v2 contracts, and test them together on testnet
+
+**Status:** not started (added 2026-11-19). The v2 contracts are on the `beacon` branch; `master`
+matches the live v1 deployment.
+
+The v2 contracts are a redeploy with a new ABI (`MIGRATION.md` lists every change). Nothing that
+calls them has been ported, so they cannot run end to end yet. Each consumer gets a `beacon` branch
+in its repository, and they are tested together on Base Sepolia before anything merges.
+
+What each consumer needs (the files are where the v1 calls are today):
+- **The arbiters themselves (the node; its own repository).** Needed first: without it every
+  arbiter freezes at its first health call and cannot be drawn.
+  - Generate and store a hash chain (item 6), and register with `registerArbiter(..., chainHead)`.
+  - Answer every keeper `HealthCall` within 60 s with the next chain value (`answerHealthCall`),
+    and rotate before the chain runs out (`rotateChain`). Beacon calls are ordinary health calls.
+  - The commit / reveal wire format is unchanged. `aggId` is now sequential; check any parsing.
+  - Each operator owner calls `addReputationKeeper(<v2 keeper>)` on its `ArbiterOperator`.
+- **Example arbiters** (`applications/example-arbiters`).
+  - Registration: `arbiterRegistration.js`, `RegisterArbiterModal.jsx`, `arbiterContracts.js`.
+  - Exit: `requestExit` and `completeExit` replace deregistration.
+  - Reset: `resetRegistry.js` and `ResetArbiterModal.jsx` have no v2 equivalent.
+  - Views and stats: `MyArbiters.jsx`, `Analytics.jsx`, `Contracts.jsx`, the server's
+    `verdiktaService.js` and `analyticsRoutes.js`. These move to `getArbiter`, the two scores,
+    freeze, blocks and bans, and the v2 events.
+- **BountyEscrow** (`applications/example-bounty-program`).
+  - Contracts: `IVerdiktaAggregator.sol`, `BountyEscrow.sol`, `EvaluationWallet.sol`,
+    `BountyEscrowLens.sol`, and the mock.
+    - The 8-argument request, with the beacon flag from the class preset.
+    - `maxTotalFee(fee, flag)`.
+    - A `drawJury` passthrough, called twice with beacons.
+    - `settle` replaces the timeout call, and `getRoundInfo` replaces the status call.
+    - An undrawn round never times out.
+    - Some outcomes refund nothing, and refunds go to credit.
+  - Item 12's decision rules use item 11's `getOutcomeScores`.
+  - The server and client: `contractService.js`, `verdiktaService.js`, `classPolicy.js`, the job,
+    class and analytics routes, `BountyDetails.jsx`, `Blockchain.jsx`. Each class points at its own
+    aggregator (item 15).
+  - Someone must call `drawJury` (and `promote`) promptly. Rewards exist for that, but the server
+    should do it too.
+- **Example frontend** (`applications/example-frontend`): `RunQuery.js`, `contractUtils.js`,
+  `timeoutUtils.js`, `App.js`, the debug tools. The query flow becomes request, then `drawJury` at
+  B+2 (twice with beacons), then `promote`, then the result after finalization; timeouts now run
+  from the draw.
+- **Shared.** Port this folder's ops scripts (`MIGRATION.md` table), and update the docs site.
+
+Order: deploy the v2 contracts to Base Sepolia, run
+a few nodes on the beacon branch against them, then the example arbiters, then BountyEscrow and the
+frontend. Done when a Small round and a Jumbo round with beacons complete end to end on testnet
+through BountyEscrow, including a failed round and a settlement. Test with at least one real
+`ArbiterOperator`, since the tests here use a stand-in.

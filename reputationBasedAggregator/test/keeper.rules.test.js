@@ -378,6 +378,48 @@ describe("ReputationKeeper rules (item 14)", function () {
         .to.be.revertedWithCustomError(keeper, "FutureBlock");
     });
 
+    it("a block of back-to-back registrations is drawn no more often than a random sample", async () => {
+      // A stride walk visits an arithmetic progression of list positions, so the strides 1 and n-1 walk
+      // straight through a block of back-to-back registrations: the block is drawn whole, or not at
+      // all, far more often than chance. With 10 of 40 entries in one block and all 20 shortlisted
+      // entries drawn, the jury should follow the hypergeometric distribution: P(<= 1 or >= 9
+      // colluders) = 0.84%, so 8.4 of 1,000 seeds (the stride walk gave 51).
+      arbs = arbs.concat(await H.registerArbiters(core, 28));
+      await keeper.setSelection(20, 400, 0);
+      const block = new Set(arbs.slice(10, 20).map((a) => a.key));
+      const [bn, ts] = await at();
+      const counts = [];
+      for (let i = 0; i < 1000; i++) {
+        const seed = ethers.keccak256(ethers.toUtf8Bytes(`walk ${i}`));   // fixed seeds: reproducible
+        const sel = await keeper.connect(fakeAgg).selectArbiters.staticCall(SP(20), seed, bn, ts);
+        counts.push(sel.filter((s) => block.has(s.key)).length);
+      }
+      const mean = counts.reduce((a, b) => a + b, 0) / counts.length;
+      const tails = counts.filter((c) => c <= 1 || c >= 9).length;
+      expect(mean).to.be.within(4.8, 5.2);
+      expect(tails).to.be.at.most(16);
+    });
+
+    it("the walk reaches every entry when the list fits in maxScan", async () => {
+      // 20 of 40 eligible and 20 seats: every eligible entry must be found, including the last ones
+      // the random draws are slow to hit (the walk finishes with a sweep of the unvisited entries)
+      arbs = arbs.concat(await H.registerArbiters(core, 28));
+      await keeper.setSelection(20, 400, 0);
+      const live = [];
+      for (let i = 0; i < arbs.length; i++) {
+        if ((i * 7) % 3 === 0 || i % 5 === 1) await keeper.setPaused(arbs[i].key, true);
+        else live.push(arbs[i].key);
+      }
+      const extra = live.splice(20);
+      for (const k of extra) await keeper.setPaused(k, true);
+      expect(live.length).to.equal(20);
+      const [bn, ts] = await at();
+      for (let i = 0; i < 10; i++) {
+        const sel = await keeper.connect(fakeAgg).selectArbiters.staticCall(SP(20), rndSeed(), bn, ts);
+        expect(sel.map((s) => s.key).sort()).to.deep.equal([...live].sort());
+      }
+    });
+
     it("higher scores raise selection weight at most 2x", async () => {
       // push half the pool to 1000/1000 and compare selection frequency
       const hi = arbs.slice(0, 6).map((a) => a.key);

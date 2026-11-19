@@ -22,29 +22,29 @@ interface IBeaconKeeper {
  *         known. The keeper picks `polled` beacons (default 4) from the request's class, entirely from
  *         its state as of block B, and sends each a health call. A beacon is called like any arbiter
  *         and answers like any arbiter: with its next hash-chain value, which the keeper verifies
- *         against its head. Its beacon value is its first value revealed after B (the keeper's
- *         revealAfter): normally its answer to the beacon call, or its answer to an earlier call if it
- *         answered one after B. The first `quorum` values revealed (default 2, by block, ties by beacon
- *         index) by the deadline (default 120 s after start) are used, mixed in beacon-index order,
- *         and the aggregator draws the jury with keccak256(aggId, blockhash(B+1), mix). With fewer, the
- *         round ends with no result.
+ *         against its head. Its beacon value is its first value revealed after block B+1 (the
+ *         keeper's revealAfter): normally its answer to the beacon call, or its answer to an earlier
+ *         call if it answered one after B+1. The first `quorum` values revealed (default 2, by block,
+ *         ties by beacon index) by the deadline (default 120 s after start) are used, mixed in
+ *         beacon-index order, and the aggregator draws the jury with keccak256(aggId, blockhash(B+1),
+ *         mix). With fewer, the round ends with no result.
  *
  *         Why this resists steering:
- *           - the pick and the values depend only on blockhash(B+1) and the state as of B: each value
- *             is the next one after the head as of B, so it was fixed before the pick was known, and
- *             no chain rotation after B can change it (a rotation reveals that value first);
- *           - a beacon can therefore only choose when to reveal, or not to: and since revealing is
- *             answering its health call, a beacon that keeps its value back stays unanswered and is
- *             frozen like any silent arbiter;
+ *           - the pick depends only on blockhash(B+1) and the state as of B, and each value is the
+ *             next one after the head at the end of B+1, so it was fixed before anyone but the builder
+ *             of B+1 knew the pick. No chain rotation later can change it (a rotation reveals that
+ *             value first). Anchoring at B+1 rather than B means an honest beacon's answer included
+ *             in B+1 does not hand its value to that block's builder;
+ *           - a beacon can therefore only choose when to reveal, or not to;
  *           - only the arbiter (its owner or an authorized sender of its operator) can answer, so the
  *             reveal times are the beacons' own doing, not a relayer's;
  *           - the result reads only completed blocks, so within a block the order of transactions
  *             cannot change it, and once ready it is final;
  *           - mixing in index order means arrival decides only which values are used, not their order.
  *         A cartel holding beacon seats still chooses among a few seeds by when it reveals, and can
- *         force a no-result round by staying silent at the cost of a freeze (item 9, "What it buys and
- *         costs"). A value is public once its arbiter answers a health call after B; only a sequencer
- *         that sees such an answer while building block B+1 could use that.
+ *         force a no-result round by withholding (item 9, "What it buys and costs"). Withholding is
+ *         cheap: a beacon that answers just after the deadline is frozen only from the call deadline
+ *         (60 s) until then, and its value does not count.
  *
  *         Payment is the aggregator's: it credits one per-arbiter fee to the payee (operator owner) of
  *         each used value when it draws. The owner is read here with a fixed stipend.
@@ -55,6 +55,7 @@ contract JuryBeacons is Ownable {
     uint8 public constant ST_READY = 2;
     uint8 public constant ST_EXPIRED = 3;
     uint256 private constant OWNER_GAS = 30_000;
+    uint256 private constant COLD_ACCOUNT = 2_600;     // the staticcall's first touch of the operator
 
     struct Req {
         uint32 atBlock;      // the request block B
@@ -97,7 +98,9 @@ contract JuryBeacons is Ownable {
         if (!approved[msg.sender]) revert NotApproved();
         Req storage q = reqs[msg.sender][aggId];
         if (q.deadline != 0) revert AlreadyStarted();
-        bytes32[] memory keys = keeper.pickBeacons(seed, cls, atBlock, atTime, polled);
+        // at least the round's quorum, fixed at request, so an owner change of `polled` cannot fail it
+        uint8 count = polled < quorum_ ? quorum_ : polled;
+        bytes32[] memory keys = keeper.pickBeacons(seed, cls, atBlock, atTime, count);
         picked = keys.length;
         if (picked < quorum_ || quorum_ == 0) return picked;
         uint40 dl = uint40(block.timestamp) + timeout;
@@ -132,7 +135,7 @@ contract JuryBeacons is Ownable {
         uint256[] memory ats = new uint256[](n);
         address[] memory oracles = new address[](n);
         for (uint256 i = 0; i < n; i++) {
-            (bytes32 v, uint256 blk, uint256 at, address o) = keeper.revealAfter(q.keys[i], q.atBlock);
+            (bytes32 v, uint256 blk, uint256 at, address o) = keeper.revealAfter(q.keys[i], uint256(q.atBlock) + 1);
             // completed blocks only, so the transaction order within a block cannot change the result
             if (blk != 0 && blk < block.number && at <= dl) (vals[i], blks[i], ats[i], oracles[i]) = (v, blk, at, o);
         }
@@ -178,7 +181,7 @@ contract JuryBeacons is Ownable {
     ///      owner() leaves that beacon unpaid instead of breaking the draw. Reverts if the stipend is
     ///      not really available, so a caller's gas limit cannot skip the payments.
     function _ownerOf(address o) internal view returns (address) {
-        if (gasleft() < OWNER_GAS + OWNER_GAS / 63 + 2_000) revert OutOfGas();
+        if (gasleft() < OWNER_GAS + COLD_ACCOUNT + (OWNER_GAS + COLD_ACCOUNT) / 63 + 2_000) revert OutOfGas();
         uint256 w;
         assembly ("memory-safe") {
             mstore(0, 0x8da5cb5b00000000000000000000000000000000000000000000000000000000)   // owner()
@@ -188,8 +191,8 @@ contract JuryBeacons is Ownable {
         return w >> 160 == 0 ? address(uint160(w)) : address(0);
     }
 
-    /// @notice The request's beacons, the request block (values are the first reveals after it) and
-    ///         the deadline.
+    /// @notice The request's beacons, the request block B (values are the first reveals after B+1)
+    ///         and the deadline.
     function getBeacons(address aggregator, bytes32 aggId)
         external
         view
