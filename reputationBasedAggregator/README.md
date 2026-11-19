@@ -13,7 +13,7 @@ arbiter node, the operator contract and the scripts.
 | `ReputationKeeper` | Arbiter registry, stake, unbonding, burns, two scores (Table 1 via `applyOutcomes`, −400 for a live non-committer when the round failed for lack of commits), blocks / bans / 90-day decay (Table 2), hash-chain health calls (each reveal recorded with its block and time), freeze and chain rotation, reputation-weighted selection from a bounded walk of the class list in random order, and the beacon pick. Selection state is checkpointed by block, so a draw reads the state as of the request block (item 9). Answers `isContractApproved`, which every deployed `ArbiterOperator` uses to gate requests |
 | `ReputationAggregator` | Two-phase request (escrow at block B; `drawJury` from B+2, seeded by `blockhash(B+1)`, read through EIP-2935 after 256 blocks; 2 x fee draw reward; `sealSeed`, `cancelUnsealed`), the optional beacon stage, M+ / T+ promotion (closes at the M+-th commit or after T+ with at least M; `promote` from C+2 draws M of all commits), late reveals, settlement after the deadline with one batched keeper call, a settlement queue drained by new requests, `getOutcomeScores` (item 11) |
 | `JuryBeacons` | Item 9's beacon flag, kept out of the aggregator for bytecode: picks 4 beacons through the keeper (which sends each a health call), reads their answers from the keeper, and reports the mix of the first 2 |
-| `ScoringLib` | External library: finalization in one call (cluster, mean, quality classes), the promotion draw, and a faster, result-identical version of v1's greedy clustering |
+| `ScoringLib` | External library: finalization in one call (v1's length normalization, cluster, mean, quality classes), the promotion draw. The cluster is item 10's nearest-neighbour rule, which replaces v1's greedy one |
 | `AggregatorLib` | External library: v1's helpers plus the commit payload builder and a one-call CID/salt parser |
 | `test/TestOperator` | Gas-faithful stand-in for Chainlink's Operator (the real one pins solc 0.8.19), with `ArbiterOperator`'s keeper gate (on by default in the tests). `setBomb` makes it burn all gas |
 | `test/MockHistory` | Stand-in for the EIP-2935 history contract, installed at its address (Hardhat's stub reverts) |
@@ -41,7 +41,10 @@ Tests:
     cancel to the treasury; empty pool;
   - M+ / T+ promotion, finalize, late reveals and settlement;
   - the 0..1,000,000 score scale, failed rounds, the freeze dodge, the queue;
-  - ETH solvency, item 11 scores, gas griefing, the operator gate and clustering equivalence.
+  - ETH solvency, item 11 scores, gas griefing, the operator gate;
+  - clustering, quality classes and normalization against a JavaScript reference (and v1's
+    `AggregatorLib` where they must agree), on 420 reproducible random inputs built for ties and
+    duplicates; identical extreme reveals don't pull the cluster from an honest majority.
 - `beacons.test.js`:
   - escrow;
   - the pick and the values, which depend only on the state as of B and B+1 (earlier answers and
@@ -105,6 +108,17 @@ so each class is a separate deployment. Local networks get a `MockLinkToken` and
   shortlist (60) or `maxScan` (400) entries, and after 2 × min(n, `maxScan`) draws it finishes with
   a sweep of the unvisited entries, so it stays bounded and can reach every entry. About 270 gas per
   entry visited, at any pool size. `pickBeacons` uses the same walk.
+- **The cluster is the tightest nearest-neighbour group.** For each counted reveal, its group is it
+  and its P − 1 nearest; the cluster is the group with the smallest sum of pairwise distances (ties
+  to the earlier reveal). v1's greedy rule let identical colluders seed the cluster and pull its
+  mean (4 colluders at Jumbo: about 6 points; now about 1). With 2 colluders among Small's or
+  Medium's 4 counted reveals no cluster rule helps, an exact one included. A cartel that copies the
+  expected consensus still takes more than its share of the bonus under any rule that rewards the
+  tightest group. For P = 2 the cluster is v1's closest pair.
+- **The finalizing reveal pays for clustering.** The N-th counted reveal's `fulfill` runs it: 2.4–2.5M
+  gas at Jumbo with two-outcome vectors, about 5M (estimated) at the maximum 20 outcomes; 0.55M at
+  Small. The arbiter node's job gas limit must cover it, or that reveal reverts and is lost, and so
+  does every later one.
 - **Fewer than K eligible arbiters at B:** the draw fails the round and refunds (no jury could be
   drawn, so it is no re-roll). Slots never repeat: a repeated arbiter would vote and be charged twice.
 - **`promote` pays its caller 1 x eff** (`promoteRewardFees`, in the escrow), so third parties call it
@@ -185,8 +199,8 @@ so each class is a separate deployment. Local networks get a `MockLinkToken` and
   the failure did not depend on the seed. Otherwise it goes to the treasury: a beacon could choose by
   its timing between a jury and a refund.
 - **Cost.** The stage costs the requester ~0.39M gas to start. A beacon's answer is an ordinary health
-  answer (123k). Jumbo with beacons costs about $0.57 a round in gas (all transactions, 0.006 gwei)
-  against $0.56 without.
+  answer (123k). Jumbo with beacons costs about $0.56 a round in gas (all transactions, 0.006 gwei)
+  against $0.55 without.
 - **Owner settings.** `JuryBeacons.setParams(polled, quorum, timeout)`. A quorum equal to `polled` is
   item 9's stricter variant (all values required), under which one silent beacon forces a no-result
   round.

@@ -654,7 +654,7 @@ the randomness exists.
   - **Payment:** each used beacon's operator owner is read with a 30k stipend at the draw. An owner that
     cannot be read goes unpaid, and the draw goes ahead.
   - **Cost:** about 0.39M gas to start. A beacon answer is an ordinary health answer (123k). Jumbo is
-    about $0.57 a round in gas with beacons, $0.56 without.
+    about $0.56 a round in gas with beacons, $0.55 without (nearest-neighbour clustering, 2026-11-19).
   - **Withholding is cheap** (second review, 2026-11-19). A beacon that answers just after the deadline
     is frozen only from the 60 s call deadline until then, with no score change. With the default
     2 of 4, a cartel needs 3 seats to force a no-result round; with all 4 required, 1. The option is
@@ -729,9 +729,11 @@ updates for the second transaction.
 
 ## 10. True best-cluster selection instead of greedy closest-pair seeding
 
-**Status:** not started (design discussed 2026-11-07)
-**Scope:** `AggregatorLib.sol` (`findBestCluster`). The aggregator links the library, so it
-needs a redeploy.
+**Status:** nearest-neighbour variant adopted in the v2 contracts (owner, 2026-11-19), in
+`ScoringLib.bestCluster`. Exact enumeration not adopted: it is out of reach at Jumbo, matches the
+nearest-neighbour rule at Large, and does not help at N = 4 (below).
+**Scope:** `ScoringLib.sol` (v2); v1's `AggregatorLib.findBestCluster` is kept as the reference for
+P = 2.
 
 ### Problem
 `findBestCluster` seeds the cluster with the closest pair, then repeatedly adds the response with
@@ -790,6 +792,39 @@ $300K for the second. Those figures are for **item 11's Q-of-N rule** with Q = P
 P − 1 colluder case above sets the limit. Under Q-of-N the cluster decides only the bonus, so the
 larger gain comes from item 11. True clustering still matters for consumers that use the cluster
 mean and for who earns the bonus.
+
+### Nearest-neighbour variant measured (2026-11-19)
+Rule: for each counted reveal, take it and its P − 1 nearest (by distance, then reveal order), score
+the group by the sum of its pairwise distances, and keep the smallest (first centre on ties). Honest
+scores N(80, 3), the cartel's best value per rule (a prototype simulation, not committed):
+
+| Cluster-mean shift a steering cartel can buy | greedy | nearest-neighbour |
+|---|---|---|
+| Jumbo (N = 27, P = 17), 2 / 4 / 6 / 8 / 10 colluders | +4.2 / +6.3 / +8.6 / +10.8 / +12.9 | +0.5 / +1.1 / +2.0 / +2.9 / +4.1 |
+| Large (N = 13, P = 10), 2 / 3 / 4 colluders | +5.0 / +7.0 / +8.9 | +0.9 / +1.7 / +2.8 |
+| Small and Medium (N = 4, P = 3), 2 colluders | +13.9 | +13.8 |
+
+- **It limits steering of the mean** at Large and Jumbo: under greedy the cartel reports 100 and
+  seeds the cluster; under nearest-neighbour it must stay within a few points of the honest scores
+  or be left out. At N = 4 two colluders are half the reveals, and no rule helps.
+- **It does not change bonus capture.** A mimic cartel reporting identical values at the expected
+  consensus takes the same share of bonus slots under both (Jumbo, 4 colluders: 23.5% against a fair
+  14.8%). Any rule that rewards the tightest group rewards identical reports at the centre. Only a
+  different bonus rule (the band rule: split among all close reveals) changes that.
+- **With no cartel** its mean sits a little nearer the honest median (0.57 points against 0.75).
+- **Gas, as adopted:** `bestCluster` is 1.28M at N = 27, P = 17 against the optimized greedy's 0.39M
+  (v1's greedy: 5.55M). The Jumbo finalizing reveal is 2.4–2.5M (greedy optimized: 1.69M; before
+  either change: 2.88M). Each centre keeps its P nearest sorted while scanning its row, and the
+  group's pairwise sum stops once it cannot beat the best. Same cost as greedy at N = 4.
+- **An exact cluster does not fix Small and Medium.** With 2 colluders among 4 counted reveals, every
+  group of 3 holds a colluder; exact enumeration of all 4 groups buys the cartel the same +13.9 points
+  (a cluster median: +20.1). Half the reveals is past any rule's breakdown point. At Large (13
+  counted) exact and nearest-neighbour agree within noise (+0.9 / +1.7 / +2.6 points against +1.0 /
+  +1.6 / +2.9 for 2 / 3 / 4 colluders). For the decision itself Small and Medium rely on Q-of-N
+  (item 11): Q = 3 of 4 means 2 colluders cannot force a pass.
+- **Who it matters for:** BountyEscrow decides with item 11's Q-of-N rule, which ignores the
+  cluster. The cluster mean matters to consumers that read `getEvaluation`'s aggregate, and the
+  cluster decides the bonus.
 
 ### Why it's deferred
 It is a library change with an aggregator redeploy and new tests. A larger P also raises the
@@ -1192,7 +1227,10 @@ round at 0.006 gwei.
     - A cartel member can grief this: it commits 38th with too little gas.
   - **The 27th reveal.** That `fulfill` finalizes the round: clustering, the keeper's score
     updates for all 50 slots (item 1) and bonus credits. Measure it the same way. Consider
-    finalizing in a separate permissionless call.
+    finalizing in a separate permissionless call. Measured (2026-11-19): 2.4–2.5M gas in the v2
+    contracts with two-outcome vectors and nearest-neighbour clustering (score updates moved to
+    settlement), about 5M estimated at 20 outcomes. Check the arbiter job's gas limit against it
+    (item 16).
   - **The consumer.** BountyEscrow's read of `getOutcomeScores` at N = 27 is about 146k gas
     (item 11's fit).
 - **Response timeout.** The round waits for the 38th commit and the 27th reveal. Set
@@ -1228,7 +1266,8 @@ round at 0.006 gwei.
   | 25, 2 | ~30% |
 
   Their fair share is 15% of counted reveals. They collect this without changing any outcome,
-  and with it the cluster reputation gain.
+  and with it the cluster reputation gain. The nearest-neighbour cluster (item 10, adopted 2026-11-19) leaves this
+  unchanged: identical reports at the consensus are the tightest group under any such rule.
 - **Gas.**
   - Greedy `findBestCluster` at N = 27, P = 17 makes about 11,000 `calculateDistance` calls.
   - Computing the 351 pairwise distances once and updating scores incrementally gives the same
@@ -1730,8 +1769,13 @@ The README lists the behaviour; the points below changed or sharpened the design
   head applies to later calls only.
 - **Measured gas, 300-arbiter pool, one full round, all transactions, at 0.006 gwei** (re-measured
   2026-11-18 with the operators' keeper gate and checkpointed chain heads):
-  - Small $0.087, Medium $0.100, Large $0.248, Jumbo $0.558 without beacons and $0.570 with them
-    (2026-11-19, beacon values from health answers and the random-order walk).
+  - Small $0.087, Medium $0.099, Large $0.245, Jumbo $0.553 without beacons and $0.563 with them
+    (2026-11-19, nearest-neighbour clustering).
+  - The finalizing reveal is 0.55M at Small, 1.10M at Large and 2.4–2.5M at Jumbo (before the
+    clustering work: 0.58M, 1.28M and 2.88M). `ScoringLib`'s loops read memory directly, and
+    `aggregate` does v1's length normalization itself, saving a library call (the aggregator shrank
+    306 B). At N = 27, P = 17: `bestCluster` 1.28M (nearest-neighbour; the greedy rule rewritten the
+    same way was 0.39M, v1's `findBestCluster` 5.55M), `classify` 0.17M (was 0.36M).
   - Jumbo's draw is 13.4–13.8M of the 16.8M per-transaction cap, depending on the jury, and
     `promote` is 5.9M.
   - Selection is 2.9M at K = 50, and the same with 300 or 3,000 arbiters.

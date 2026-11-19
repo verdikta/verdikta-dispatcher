@@ -616,7 +616,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         uint256 n = r.order.length;
         uint256[][] memory ll = new uint256[][](n);
         for (uint256 i = 0; i < n; i++) ll[i] = r.likes[r.order[i]];
-        (ll, ) = AggregatorLib.normalizeToModal(ll);
+        // aggregate resizes the vectors to their most common length first (v1's normalizeToModal)
         (bool[] memory inCl, uint256[] memory agg, uint8[] memory codes, uint256[] memory med, uint256 spread) =
             ScoringLib.aggregate(ll, r.P, spreadFloor);
         uint96 bonus;
