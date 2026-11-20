@@ -23,7 +23,7 @@ interface IJuryBeacons {
 }
 
 /**
- * @title ReputationAggregator (example implementation of TODO items 14, 9, 11 and 8)
+ * @title ReputationAggregator (example implementation of TODO items 14, 9, 11, 8, 4 and 5)
  * @notice Commit-reveal aggregation with ETH escrow (as today), plus:
  *   - two-phase request (item 9): the request only escrows and records the query in block B; the jury
  *     is drawn by drawJury() from block B+2 with seed keccak256(aggId, blockhash(B+1)) and the
@@ -53,7 +53,9 @@ interface IJuryBeacons {
  *     apply a Q-of-N rule (item 12).
  *   - a requester-set fee floor (item 8): each juror is paid max(its posted fee, minFee), and its bonus
  *     scales off that, so a requester can make every attempt cost at least K x minFee. Eligibility
- *     still uses the ceiling only.
+ *     still uses the ceiling only;
+ *   - commits bound to the round (items 4 and 5): keccak256(abi.encode(aggId, operator, response, salt)),
+ *     all 32 bytes, with a 128-bit salt, so no commit can be opened two ways in practice.
  *   Calls to arbiter contracts get a fixed gas stipend, and every call whose failure is tolerated
  *   first checks that enough gas is left, so neither an arbiter (gas bomb) nor a caller (a tight
  *   gas limit) can make one slot, or the keeper's settlement, fail on purpose.
@@ -83,7 +85,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
     uint256 private constant MAX_CID_COUNT = 10;
     uint256 private constant MAX_CID_LENGTH = 100;
     uint256 private constant MAX_ADDENDUM_LENGTH = 1000;
-    uint256 private constant MAX_REVEAL_CID_LENGTH = MAX_CID_LENGTH + 21;
+    uint256 private constant MAX_REVEAL_CID_LENGTH = MAX_CID_LENGTH + 33;   // ":" + 32 hex salt (items 4, 5)
     uint256 private constant MAX_SCORE = 1e34;
     /// @dev EIP-2935 block-hash history (8,191 blocks); live on Base (checked 2026-11-17)
     address private constant HISTORY = 0x0000F90827F1C53a10cb7A02335B175320002935;
@@ -107,7 +109,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         uint40 committedAt;
         uint8 flags;
         uint8 qcode;
-        bytes16 commitHash;   // s3
+        bytes32 commitHash;   // s3: keccak256(abi.encode(aggId, operator, response, salt)), all 32 bytes
     }
 
     struct Round {
@@ -173,7 +175,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
     // ------------------------------------------------------------------ events
     event RequestAIEvaluation(bytes32 indexed aggRequestId, string[] cids);
     event RequestFunded(bytes32 indexed aggRequestId, address indexed requester, uint256 fromCredit, uint256 fromValue);
-    event CommitReceived(bytes32 indexed aggRequestId, uint256 pollIndex, bytes16 commitHash);
+    event CommitReceived(bytes32 indexed aggRequestId, uint256 pollIndex, bytes32 commitHash);
     event CommitPhaseComplete(bytes32 indexed aggRequestId, uint256 promoted);
     event CommitWindowClosed(bytes32 indexed aggRequestId, uint256 closeBlock);
     event SeedSealed(bytes32 indexed aggRequestId, bytes32 blockHash);
@@ -536,8 +538,8 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
 
         if (response.length == 1 && bytes(cid).length == 0) {
             // ---------------- commit
-            bytes16 h = bytes16(bytes32(response[0] << 128));
-            if (r.phase != PH_COMMIT || h == bytes16(0) || sl.flags & S_COMMITTED != 0) return;
+            bytes32 h = bytes32(response[0]);
+            if (r.phase != PH_COMMIT || h == bytes32(0) || sl.flags & S_COMMITTED != 0) return;
             sl.commitHash = h;
             sl.committedAt = uint40(block.timestamp);
             sl.flags |= S_COMMITTED;
@@ -556,7 +558,10 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         if (bytes(cid).length > MAX_REVEAL_CID_LENGTH) return;
         (bool ok, string memory cleanCid, uint256 salt) = AggregatorLib.parseCidSalt(cid);
         if (!ok) return;
-        if (bytes16(sha256(abi.encode(msg.sender, response, salt))) != sl.commitHash) return;
+        // items 4 and 5: Keccak, all 32 bytes, bound to the round. An arbiter chooses its own salt, so only
+        // the hash keeps it from opening one commit two ways: a 128-bit commit without the round would
+        // let a collision found once offline (~2^64 work) be reused in every round
+        if (keccak256(abi.encode(bytes32(id), msg.sender, response, salt)) != sl.commitHash) return;
         for (uint256 i = 0; i < response.length; i++) if (response[i] > MAX_SCORE) response[i] = MAX_SCORE;
         sl.flags |= S_REVEALED;
 
@@ -622,7 +627,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
             uint256 s = chosen[j];
             Slot storage sl = r.slots[s];
             sl.flags |= S_PROMOTED;
-            string memory payload = string(abi.encodePacked("2:", AggregatorLib.bytes16ToHexLower(sl.commitHash)));
+            string memory payload = string(abi.encodePacked("2:", AggregatorLib.bytes32ToHexLower(sl.commitHash)));
             (bool sent, bytes32 opReq) = _dispatch(aggId, sl.oracle, sl.key, payload);
             if (sent) requestRef[opReq] = (id << 8) | s;
             else emit SlotSkipped(aggId, s, 3);

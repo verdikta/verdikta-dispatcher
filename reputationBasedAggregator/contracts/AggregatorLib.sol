@@ -168,73 +168,39 @@ library AggregatorLib {
     //                              CID : SALT
     // ----------------------------------------------------------------------
 
-    /// @dev Fast shape check for "cid:20hex" format.
-    ///      Returns (ok, lastColonPos) where `lastColonPos` is the index
-    ///      of ':' that separates cid and salt (undefined if !ok).
-    function isValidCidSalt(string memory packed)
-        public pure
-        returns (bool, uint256)
-    {
-        bytes memory b = bytes(packed);
-
-        // at least 1 char + ':' + 20 chars
-        if (b.length <= 21) return (false, 0);
-
-        // find the last ':'
-        uint256 i = b.length;
-        while (i > 0 && b[i-1] != ":") { unchecked { --i; } }
-        if (i == 0 || (b.length - i) != 20) return (false, 0);
-
-        // check all 20 chars are hex. Each branch bounds BOTH ends of its ASCII range:
-        // the digit branch's upper bound matters because c-48 for ':' .. '?' (58..63)
-        // would otherwise land in 10..15 and be wrongly accepted as a hex nibble.
-        unchecked {
-            for (uint256 j = i; j < b.length; ++j) {
-                uint8 c = uint8(b[j]);
-                uint8 v = (c >= 97 && c <= 102) ? c - 87   // a-f
-                       : (c >= 65 && c <= 70)  ? c - 55     // A-F
-                       : (c >= 48 && c <= 57)  ? c - 48     // 0-9
-                       : 255;
-                if (v >= 16) return (false, 0);
-            }
-        }
-        return (true, i);
-    }
-
-    /// @dev isValidCidSalt and parseCidSaltUnchecked in one call: (false, "", 0) if malformed.
+    /// @dev Split a reveal's "cid:32hex" (a 128-bit salt, items 4 and 5) in one pass: (false, "", 0) if
+    ///      malformed. The salt is the 32 chars after the last ':', so the input must end in ':' and 32 hex
+    ///      digits (either case), with a CID of at least 1 char before them. The CID is returned by
+    ///      shortening `packed` in place (no copy): fine for this public function, whose argument is the
+    ///      caller's ABI-encoded copy, but an internal caller would see its string cut.
     function parseCidSalt(string memory packed)
         public pure
         returns (bool ok, string memory cidOnly, uint256 salt)
     {
-        uint256 colon;
-        (ok, colon) = isValidCidSalt(packed);
-        if (ok) (cidOnly, salt) = parseCidSaltUnchecked(packed, colon);
-    }
-
-    /// @dev Call **only after** `isValidCidSalt` returned (true, pos).
-    function parseCidSaltUnchecked(string memory packed, uint256 colonPos)
-        public pure
-        returns (string memory cidOnly, uint256 salt)
-    {
         bytes memory b = bytes(packed);
-
-        // copy CID bytes
-        bytes memory cidBytes = new bytes(colonPos - 1);
-        for (uint256 j; j < cidBytes.length; ++j) cidBytes[j] = b[j];
-
-        // parse 20-char hex salt. Bounds mirror isValidCidSalt (which has already accepted
-        // this input); kept identical so the two never diverge if called independently.
-        unchecked {
-            for (uint256 j = colonPos; j < b.length; ++j) {
-                uint8 c = uint8(b[j]);
-                uint8 v = (c >= 97 && c <= 102) ? c - 87   // a-f
-                       : (c >= 65 && c <= 70)  ? c - 55     // A-F
-                       : (c >= 48 && c <= 57)  ? c - 48     // 0-9
-                       : 0;           // unreachable post-validation; safe default
-                salt = (salt << 4) | v;
+        uint256 n = b.length;
+        if (n < 34 || b[n - 33] != ":") return (false, "", 0);
+        assembly ("memory-safe") {
+            let p := add(add(b, 32), sub(n, 32))     // the first salt char
+            ok := 1
+            for { let j := 0 } lt(j, 32) { j := add(j, 1) } {
+                let c := byte(0, mload(add(p, j)))
+                let d := sub(c, 48)                     // '0'..'9' (wraps below '0')
+                if gt(d, 9) {
+                    d := sub(or(c, 0x20), 97)           // 'a'..'f' / 'A'..'F' (wraps below 'a')
+                    if gt(d, 5) { ok := 0 break }
+                    d := add(d, 10)
+                }
+                salt := or(shl(4, salt), d)
+            }
+            if ok {
+                let c := sub(n, 33)
+                mstore(b, c)                            // the CID: everything before the ':'
+                mstore(add(add(b, 32), c), 0)           // clean padding (the ':' and salt, inside b)
             }
         }
-        cidOnly = string(cidBytes);
+        if (!ok) return (false, "", 0);
+        cidOnly = string(b);
     }
 
     // ----------------------------------------------------------------------
@@ -264,29 +230,32 @@ library AggregatorLib {
     //                          HEX CONVERSIONS
     // ----------------------------------------------------------------------
 
-    function bytes16ToHexLower(bytes16 data) public pure returns (string memory) {
-        bytes memory hexChars = new bytes(32);
-        for (uint256 i = 0; i < 16; i++) {
-            uint8 b = uint8(data[i]);
-            hexChars[2 * i] = lowerHexChar(b >> 4);
-            hexChars[2 * i + 1] = lowerHexChar(b & 0x0f);
-        }
-        return string(hexChars);
-    }
-
-    function bytes32ToHex(bytes32 x) public pure returns (string memory) {
-        bytes memory s = new bytes(2+64);
-        s[0] = "0";
-        s[1] = "x";
-        for (uint256 i; i < 32; ++i) {
-            uint8 b = uint8(x[i]);
-            s[2 + 2*i]     = lowerHexChar(b >> 4);
-            s[3 + 2*i] = lowerHexChar(b & 0x0f);
-        }
+    /// @dev 64 lowercase hex chars, no prefix (the reveal request's "2:<commit hash>")
+    function bytes32ToHexLower(bytes32 data) public pure returns (string memory) {
+        bytes memory s = new bytes(64);
+        _hex64(data, s, 0);
         return string(s);
     }
 
-    function lowerHexChar(uint8 nib) internal pure returns (bytes1) {
-        return bytes1(uint8(nib < 10 ? 48 + nib : 87 + nib)); // 0-9 → '0'-'9', 10-15 → 'a'-'f'
+    /// @dev "0x" + 64 lowercase hex chars (the request's aggId)
+    function bytes32ToHex(bytes32 x) public pure returns (string memory) {
+        bytes memory s = new bytes(66);
+        s[0] = "0";
+        s[1] = "x";
+        _hex64(x, s, 2);
+        return string(s);
+    }
+
+    /// @dev writes x as 64 lowercase hex chars into s from byte `at` (s must hold at + 64 bytes)
+    function _hex64(bytes32 x, bytes memory s, uint256 at) private pure {
+        assembly ("memory-safe") {
+            mstore(0x0f, 0x30313233343536373839616263646566)   // "0123456789abcdef" ends at 0x2e:
+            let o := add(add(s, 32), at)                       // mload(k) ends in char k
+            for { let i := 0 } lt(i, 32) { i := add(i, 1) } {
+                let v := byte(i, x)
+                mstore8(add(o, shl(1, i)), mload(shr(4, v)))
+                mstore8(add(o, add(shl(1, i), 1)), mload(and(v, 15)))
+            }
+        }
     }
 }

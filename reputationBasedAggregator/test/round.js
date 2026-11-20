@@ -114,8 +114,8 @@ class RoundDriver {
   async commit(round, slot, reveal, kind = "commit") {
     const s = round.slots[slot];
     s.reveal = reveal;
-    s.salt = BigInt(slot) + 1n;
-    const word = H.commitWord(s.arb.opAddr, reveal, s.salt);
+    s.salt = (1n << 127n) | (BigInt(slot) + 1n);   // a full 128-bit salt: the top bit set
+    const word = H.commitWord(round.aggId, s.arb.opAddr, reveal, s.salt);
     const rcpt = await (await H.fulfil(s.commitReq, s.arb.node, [word], "")).wait();
     const received = this.hasEvent(rcpt, "CommitReceived");
     if (received) s.committed = true;
@@ -147,7 +147,7 @@ class RoundDriver {
 
   async reveal(round, slot, kind = "reveal") {
     const s = round.slots[slot];
-    const cid = `QmJustification${slot}:${H.saltHex(slot)}`;
+    const cid = `QmJustification${slot}:${H.saltHex(s.salt)}`;
     const rcpt = await (await H.fulfil(s.revealReq, s.arb.node, s.reveal, cid)).wait();
     return this.log(kind, rcpt);
   }

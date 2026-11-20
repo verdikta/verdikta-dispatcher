@@ -79,12 +79,14 @@ async function registerArbiters(core, n, { cls = 1, nodes, jobsPerOperator = 1, 
   return arbs;
 }
 
-function saltHex(i) {
-  return (BigInt(i) + 1n).toString(16).padStart(20, "0");
+/** The reveal's salt field: 32 hex chars, a 128-bit salt (items 4 and 5). */
+function saltHex(salt) {
+  return BigInt(salt).toString(16).padStart(32, "0");
 }
-function commitWord(operatorAddr, reveal, salt) {
-  const enc = abi.encode(["address", "uint256[]", "uint256"], [operatorAddr, reveal, salt]);
-  return BigInt(ethers.dataSlice(ethers.sha256(enc), 0, 16));
+/** The commit (items 4 and 5): keccak256(abi.encode(aggId, operator, response, salt)), all 32 bytes. */
+function commitWord(aggId, operatorAddr, reveal, salt) {
+  const enc = abi.encode(["bytes32", "address", "uint256[]", "uint256"], [aggId, operatorAddr, reveal, salt]);
+  return BigInt(ethers.keccak256(enc));
 }
 
 /** Install MockHistory at the EIP-2935 address (Hardhat's stub reverts). */

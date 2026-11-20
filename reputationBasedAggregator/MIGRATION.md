@@ -7,11 +7,9 @@ comparing the two ABIs and the code that calls them.
 
 ## Unchanged for arbiters' nodes and operators
 
-- **Commit / reveal wire format.**
-  - Requests carry `cid` = `1:<cids>[:addendum]` (commit) or `2:<commit hash>` (reveal), plus `aggId`.
-  - The callback is `fulfill(bytes32, uint256[], string)`.
-  - The commit is `bytes16(sha256(abi.encode(operator, response, salt)))`, and the reveal CID is
-    `cid:20-hex-salt`.
+- **Request and callback shape.** Requests carry `cid` = `1:<cids>[:addendum]` (commit) or
+  `2:<commit hash>` (reveal), plus `aggId`. The callback is `fulfill(bytes32, uint256[], string)`.
+  The commit and the reveal's salt change (items 4 and 5, under "Arbiter node" below).
 - **`aggId` is now sequential** (`bytes32(roundId)`) rather than a hash. Nodes treat it as an opaque
   string, so this should not matter, but check any node-side parsing.
 - **`ArbiterOperator`'s keeper gate** calls `isContractApproved(requester)` on each keeper in its list,
@@ -21,6 +19,18 @@ comparing the two ABIs and the code that calls them.
   every test. Each operator owner must call `addReputationKeeper(<v2 keeper>)`.
 
 ## Arbiter node (new work)
+
+- **Commit and reveal format (items 4 and 5).** Every node must switch when the v2 aggregator goes
+  live; a commit in v1's format is accepted but can never be revealed.
+  - **Commit:** `keccak256(abi.encode(aggId, operator, response, salt))`, sent in full as the commit
+    word (v1: the first 16 bytes of `sha256(abi.encode(operator, response, salt))`).
+    - `aggId` is the request's `aggId` parameter, as `bytes32`.
+    - `operator` is the operator contract that fulfills.
+    - `response` is the `uint256[]` that will be revealed.
+  - **Salt:** 16 random bytes, fresh for every commit. The reveal CID is `cid:<32 hex>` (v1: 20 hex).
+  - **Reveal request:** `2:<64 hex>`, the full commit hash in lowercase (v1: 32 hex). Look up the
+    stored answer by it.
+  - **One answer per request.** A malformed reveal still uses up the request, so there is no retry.
 
 - **Registration.**
   - `registerArbiter(oracle, jobId, fee, classes, chainHead)` replaces `registerOracle`. The stake is

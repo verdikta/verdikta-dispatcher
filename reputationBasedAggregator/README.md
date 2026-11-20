@@ -1,4 +1,4 @@
-# Reputation aggregator v2 (TODO items 8, 9, 11, 14 and 15)
+# Reputation aggregator v2 (TODO items 4, 5, 8, 9, 11, 14 and 15)
 
 The v2 contracts: the two-score reputation design (item 14), the two-phase request with optional
 beacons (item 9), the per-arbiter score getter (item 11), the requester-set fee floor (item 8) and
@@ -15,7 +15,7 @@ arbiter node, the operator contract and the scripts.
 | `ReputationAggregator` | Two-phase request (escrow at block B; `drawJury` from B+2, seeded by `blockhash(B+1)`, read through EIP-2935 after 256 blocks; 2 x fee draw reward; `sealSeed`, `cancelUnsealed`), the optional beacon stage, M+ / T+ promotion (closes at the M+-th commit or after T+ with at least M; `promote` from C+2 draws M of all commits), late reveals, settlement after the deadline with one batched keeper call, a settlement queue drained by new requests, `getOutcomeScores` (item 11), the requester-set fee floor (item 8) |
 | `JuryBeacons` | Item 9's beacon flag, kept out of the aggregator for bytecode: picks 4 beacons through the keeper (which sends each a health call), reads their answers from the keeper, and reports the mix of the first 2 |
 | `ScoringLib` | External library: finalization in one call (v1's length normalization, cluster, mean, quality classes), the promotion draw. One-number answers get the exact 1-D cluster; longer vectors item 10's nearest-neighbour rule, which replaces v1's greedy one |
-| `AggregatorLib` | External library: v1's helpers plus the commit payload builder and a one-call CID/salt parser |
+| `AggregatorLib` | External library: v1's helpers plus the commit payload builder, a one-pass CID/salt parser for the 128-bit salt, and word-level hex encoders |
 | `test/TestOperator` | Gas-faithful stand-in for Chainlink's Operator (the real one pins solc 0.8.19), with `ArbiterOperator`'s keeper gate (on by default in the tests). `setBomb` makes it burn all gas |
 | `test/MockHistory` | Stand-in for the EIP-2935 history contract, installed at its address (Hardhat's stub reverts) |
 
@@ -130,9 +130,20 @@ so each class is a separate deployment. Local networks get a `MockLinkToken` and
   round numbers, so equal scores are common, and under reveal order the bonus would go to the
   fastest. The order is keccak256(sealed hash, slot): fixed at the draw, and random rather than the
   selection order (which favours high-weight arbiters).
+- **Commits are bound to the round, in full (items 4 and 5).** The commit is
+  `keccak256(abi.encode(aggId, operator, response, salt))`, all 32 bytes, and the reveal carries a
+  128-bit salt as `cid:<32 hex>`.
+  - An arbiter picks its own salt, so the salt does nothing to stop it opening one commit two ways;
+    only the hash does.
+  - v1's commit was 128 bits and didn't include the round. A collision found once offline (about 2^64
+    hashes) could then be reused in every round, revealing whichever answer suited after seeing the
+    earlier reveals.
+  - Including `aggId` makes a collision useful for one round only. The full 32 bytes put one out of
+    reach (about 2^128).
+  - The reveal request carries the full commit hash as `2:<64 hex>`.
 - **The finalizing reveal pays for clustering.** The N-th counted reveal's `fulfill` runs it. At
   Jumbo: 1.30M gas with one-number answers, 2.5–2.6M with two-outcome vectors, 6.9M at the maximum
-  20 outcomes (all measured); 0.56M at Small. The arbiter node's job gas limit must cover the largest
+  20 outcomes (all measured); 0.54M at Small. The arbiter node's job gas limit must cover the largest
   answer a class allows, with margin, or that reveal reverts and is lost, and so does every later
   one. `setConfig` caps N at 40 (at 20 outcomes, clustering 40 reveals is about 8M gas) and
   `setParams` caps `spreadFloor` at 1e34 (a larger floor would be cut when stored, or overflow).
@@ -236,8 +247,8 @@ so each class is a separate deployment. Local networks get a `MockLinkToken` and
   the failure did not depend on the seed. Otherwise it goes to the treasury: a beacon could choose by
   its timing between a jury and a refund.
 - **Cost.** The stage costs the requester ~0.39M gas to start. A beacon's answer is an ordinary health
-  answer (123k). Jumbo with beacons costs about $0.56 a round in gas (all transactions, 0.006 gwei)
-  against $0.55 without.
+  answer (123k). Jumbo with beacons costs about $0.53 a round in gas (all transactions, 0.006 gwei)
+  against $0.52 without.
 - **Owner settings.** `JuryBeacons.setParams(polled, quorum, timeout)`. A quorum equal to `polled` is
   item 9's stricter variant (all values required), under which one silent beacon forces a no-result
   round.
@@ -252,7 +263,6 @@ so each class is a separate deployment. Local networks get a `MockLinkToken` and
 
 - **Per-class configuration.** K/M/N/P, T+ and the timeout are per aggregator: one deployment per
   class (item 15).
-- Items 4 (128-bit salt) and 5 (Keccak instead of SHA-256 for commits): they change the node protocol.
 - **The abstain dodge.** A cartel that blocks by never committing and also ignores its health call is
   frozen at round end and so escapes the −400. Being frozen costs it only being unselectable until it
   answers. The simulator lets colluders always answer calls, so it does not model this. Options: a
@@ -263,11 +273,12 @@ so each class is a separate deployment. Local networks get a `MockLinkToken` and
   - With 2 of 4, forcing a no-result round takes 3 cartel seats; with all 4 required, it takes 1.
   - Option: −400 timeliness to each beacon whose value was not in when the stage missed its quorum,
     as Table 1 does for a missing commit (deferred, 2026-11-19).
-- **Jumbo draw size.** Jumbo's draw uses 13.4–13.8M of the 16.8M per-transaction cap, with the
-  operator gate. Each juror whose operator burns its whole stipend adds about 92k: 33 such jurors of
-  50 still fit, 35 do not (measured with the test operator). The round can then only be cancelled to
-  the treasury after a day. With selection in random order, a 15% cartel gets 34 seats with
-  probability about 3 × 10⁻¹⁹ per round, so the draw stays one transaction.
+- **Jumbo draw size.** Jumbo's draw uses 12.3–13.2M of the 16.8M per-transaction cap, depending on
+  the jury, with the operator gate. Each juror whose operator burns its whole stipend adds about 98k.
+  With beacons, 33 such jurors of 50 still fit and 35 do not; without, 35 fit and 38 do not (measured
+  with the test operator, 2026-11-20). The round can then only be cancelled to the treasury after a
+  day. With selection in random order, a 15% cartel gets 34 seats with probability about 3 × 10⁻¹⁹ per
+  round, so the draw stays one transaction.
 - **`setContracts` does not check that the beacon contract uses the same keeper** (its keeper is
   immutable). `deploy/02_keeper.js` deploys them as a pair.
 - **Integrations.** BountyEscrow, the arbiter node and the operations scripts still speak v1 (see

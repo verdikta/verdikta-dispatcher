@@ -7,13 +7,11 @@ bottom; check items off as they land.
 
 ## What's left (2026-11-20)
 
-The v2 contracts on the `beacon` branch implement items 1, 2, 6, 7, 8, 9, 10, 11 and 14. Nothing that
+The v2 contracts on the `beacon` branch implement items 1, 2, 4, 5, 6, 7, 8, 9, 10, 11 and 14. Nothing that
 calls them is ported yet. The numbered items below hold the details; this list is the summary.
 
 ### Contracts: still to build or decide before the v2 deploy
 v2 is a breaking redeploy, so changes to the request or the wire format cost least now.
-- **Items 4 and 5: a 128-bit salt, and Keccak instead of SHA-256 for commits.** Both change the
-  node's wire format. Do them now, alongside the node work in item 16, or decide to keep v1's format.
 - **Item 3, the refund beneficiary (`refundTo`).** Optional. It would let BountyEscrow drop the
   per-submission `EvaluationWallet`. Decide before porting BountyEscrow.
 - **Open decisions:**
@@ -58,8 +56,8 @@ v2 is a breaking redeploy, so changes to the request or the wire format cost lea
   round with beacons complete end to end through BountyEscrow, including a failed round and a
   settlement.
 - Re-measure with a real `ArbiterOperator`; the figures here come from the test stand-in.
-  - Jumbo's draw: 13.4–13.8M of the 16.8M cap.
-  - `promote`: 5.9M.
+  - Jumbo's draw: 12.3–13.2M of the 16.8M cap.
+  - `promote`: 5.1M.
   - The finalizing reveal.
   - A health answer: 123k.
 
@@ -224,7 +222,8 @@ this is a simplification/efficiency win, not a blocker.
 
 ## 4. Increase the commit salt from 80 to 128 bits
 
-**Status:** not started
+**Status:** implemented in the v2 contracts with item 5 and a round binding (2026-11-20; see item 5).
+Arbiter node not started (item 16).
 **Scope:** `ReputationAggregator.sol` + `AggregatorLib.sol` + arbiter node (commit/reveal format change)
 
 ### Problem
@@ -257,7 +256,8 @@ contract, and new-format reveals would fail against the old one.
 
 ## 5. Use Keccak-256 everywhere (replace the one SHA-256 use)
 
-**Status:** not started
+**Status:** implemented in the v2 contracts with item 4, plus a round binding and the full 32-byte hash
+(2026-11-20). Arbiter node not started (item 16).
 **Scope:** `ReputationAggregator.sol` + arbiter node (commit hash change)
 
 ### Problem
@@ -272,6 +272,39 @@ functions in one protocol is an avoidable source of off-chain mismatch bugs.
 - Arbiter node computes the commitment with keccak256 over the same ABI encoding.
 - Update the comment on the zero-commit guard in `fulfill` that refers to `sha256(...)`.
 
+### v2 implementation (2026-11-20, with item 4)
+- **Commit:** `keccak256(abi.encode(aggId, operator, response, salt))`, stored and checked in full
+  (`bytes32 commitHash`, still one storage word). The reveal CID is `cid:<32 hex>`, a 128-bit salt,
+  and the reveal request is `2:<64 hex>`.
+- **Why the round binding and the full hash.** The salt gives hiding, not binding: an arbiter
+  chooses its own salt.
+  - v1's 128-bit commit didn't include the round. An arbiter could search offline, once, for
+    `[pass]` and `[fail]` with salts whose commits collide. A birthday search takes about 2^64
+    hashes, with small memory using distinguished points.
+  - It could then reuse that collision in every round, committing once and revealing whichever
+    answer suited after seeing the earlier reveals.
+  - With `aggId` in the hash a collision serves one round only. Round ids are sequential, so a
+    future one is predictable, but with the full 32 bytes even a one-round collision needs about
+    2^128 work.
+  - The longer salt is not what closes this; it only raises hiding from 2^80 to 2^128 guesses per
+    possible answer.
+- **Gas.**
+  - `AggregatorLib.parseCidSalt` is one pass in assembly, returning the CID by shortening the input
+    in place. `isValidCidSalt` and `parseCidSaltUnchecked` are removed.
+  - The hex encoders (`bytes32ToHexLower` for the reveal request, `bytes32ToHex` for every request's
+    `aggId`) write from a lookup table.
+  - Together they more than pay for the longer format: a reveal is 191k gas (was 211k), Jumbo's
+    `promote` 5.1M (was 5.9M), its draw 12.3–13.2M (was 13.4–13.8M), and a Jumbo round $0.52
+    (was $0.555).
+- **Tests** (`commit format (items 4 and 5)` in `test/aggregator.flow.test.js`):
+  - the commit stored in full, and the reveal request's payload;
+  - a commit made for another round can't be revealed;
+  - v1's truncated SHA-256 commit and a 20-hex salt are refused;
+  - `parseCidSalt` against a JavaScript reference on 600 generated inputs, with coverage counts;
+  - the hex encoders against ethers.
+- `scripts/arbiter-noise.js` and `scripts/lib/chain-stats-utils.js` still parse v1's format, on
+  purpose: they read the live v1 history.
+
 ### Why it's deferred
 Same lockstep problem as item 4: every arbiter must switch at the same moment the new
 aggregator goes live, or its reveals will hash-mismatch and it will be penalized as a
@@ -279,7 +312,7 @@ no-show.
 
 ### Notes / related
 - Ship with item 4 (one format change).
-- The commitment is still truncated to 128 bits (`bytes16`); that is unchanged by this item.
+- v2 also stops truncating the commitment to 128 bits, and binds it to the round (above).
 
 ---
 
@@ -767,7 +800,7 @@ the randomness exists.
   - **Payment:** each used beacon's operator owner is read with a 30k stipend at the draw. An owner that
     cannot be read goes unpaid, and the draw goes ahead.
   - **Cost:** about 0.39M gas to start. A beacon answer is an ordinary health answer (123k). Jumbo is
-    about $0.56 a round in gas with beacons, $0.55 without (nearest-neighbour clustering, 2026-11-19).
+    about $0.53 a round in gas with beacons, $0.52 without (2026-11-20).
   - **Withholding is cheap** (second review, 2026-11-19). A beacon that answers just after the deadline
     is frozen only from the 60 s call deadline until then, with no score change. With the default
     2 of 4, a cartel needs 3 seats to force a no-result round; with all 4 required, 1. The option is
@@ -1352,7 +1385,7 @@ round at 0.006 gwei.
     requests. The model scales the K = 6 request (~3.3M gas) linearly, to about 27M. That may
     exceed a block's or a transaction's gas limit (EIP-7825 caps a transaction at 2^24 gas
     where it applies). It would then need item 2's cheaper selection, or a draw split across
-    several calls. Measured since (2026-11-19): 13.5–13.8M, so it fits; see item 15's "Jumbo's
+    several calls. Measured since (2026-11-20): 12.3–13.2M, so it fits; see item 15's "Jumbo's
     draw size".
   - **The 38th commit.** That arbiter's `fulfill` runs `_dispatchRevealRequests`, which sends
     38 reveal requests, so the arbiter pays for them. If the job's gas limit is too low the
@@ -1904,16 +1937,20 @@ The README lists the behaviour; the points below changed or sharpened the design
   head applies to later calls only.
 - **Measured gas, 300-arbiter pool, one full round, all transactions, at 0.006 gwei** (re-measured
   2026-11-18 with the operators' keeper gate and checkpointed chain heads):
-  - Small $0.087, Medium $0.100, Large $0.246, Jumbo $0.555 without beacons and $0.565 with them
-    (2026-11-19, after the clustering review); Jumbo with beacons and one-number answers $0.538,
-    Jumbo with 20-outcome answers $0.764.
-  - The finalizing reveal is 0.56M at Small, 1.14M at Large and 2.5–2.6M at Jumbo (before the
+  - Small $0.083, Medium $0.095, Large $0.232, Jumbo $0.521 without beacons and $0.532 with them
+    (2026-11-20, after items 4 and 5); Jumbo with beacons and one-number answers $0.506, Jumbo with
+    20-outcome answers $0.731.
+  - Items 4 and 5 saved about 5%. The new format alone added about 10k gas per reveal and 12k per
+    reveal request. The one-pass salt parser and the word-level hex encoders (also used for the
+    `aggId` in every request) more than paid for that. A reveal is 191k, down from 211k; Jumbo's
+    `promote` is 5.1M, down from 5.9M.
+  - The finalizing reveal is 0.54M at Small, 1.11M at Large and 2.5–2.6M at Jumbo (before the
     clustering work: 0.58M, 1.28M and 2.88M). `ScoringLib`'s loops read memory directly, and
     `aggregate` does v1's length normalization itself, saving a library call (the aggregator shrank
     306 B). At N = 27, P = 17: `bestCluster` 1.28M (nearest-neighbour; the greedy rule rewritten the
     same way was 0.39M, v1's `findBestCluster` 5.55M), `classify` 0.17M (was 0.36M).
-  - Jumbo's draw is 13.4–13.8M of the 16.8M per-transaction cap, depending on the jury, and
-    `promote` is 5.9M.
+  - Jumbo's draw is 12.3–13.2M of the 16.8M per-transaction cap, depending on the jury, and
+    `promote` is 5.1M.
   - Selection is 2.9M at K = 50, and the same with 300 or 3,000 arbiters.
   - A health answer is 123k, up from 77k, for the head checkpoint.
   - These are a little above `bounty_sizing.py`'s gas term (0.05 + 0.34 × K / 50: $0.09 at K = 6,
@@ -2161,10 +2198,10 @@ call `promote` first; the draw reward goes back to the hunter.
   the protection from the sequencer; a no-beacon Jumbo would need about K = 35 at this standard.
 
 ### Open
-- **Jumbo's draw size (measured 2026-11-19).** Jumbo's draw uses 13.4–13.8M of the 16.8M
+- **Jumbo's draw size (re-measured 2026-11-20).** Jumbo's draw uses 12.3–13.2M of the 16.8M
   per-transaction cap, depending on the jury (with the operators' keeper gate). Each juror whose
-  operator burns its whole stipend adds about 92k. 33 such jurors of 50 still fit and 35 do not, with
-  or without beacons. The round could then only be cancelled to the treasury after a day.
+  operator burns its whole stipend adds about 98k. With beacons, 33 such jurors of 50 still fit and 35
+  do not; without, 35 fit and 38 do not. The round could then only be cancelled to the treasury after a day.
   - With the random-order walk, a 15% cartel (45 of 300 eligible) gets 34 of the 60 shortlisted
     seats with probability about 3 × 10⁻¹⁹ per round, and 1 × 10⁻⁶ even at 30%. The risk is
     negligible, so the draw stays one transaction (a batched draw was considered and not adopted).
@@ -2222,7 +2259,11 @@ What each consumer needs (the files are where the v1 calls are today):
   - Generate and store a hash chain (item 6), and register with `registerArbiter(..., chainHead)`.
   - Answer every keeper `HealthCall` within 60 s with the next chain value (`answerHealthCall`),
     and rotate before the chain runs out (`rotateChain`). Beacon calls are ordinary health calls.
-  - The commit / reveal wire format is unchanged. `aggId` is now sequential; check any parsing.
+  - The new commit and reveal format (items 4 and 5, `MIGRATION.md`):
+    - the commit is `keccak256(abi.encode(aggId, operator, response, salt))` in full;
+    - the salt is 128 bits, written as 32 hex characters;
+    - the reveal request carries the commit as 64 hex characters.
+  - `aggId` is now sequential; check any parsing.
   - One-number questions: return a single value (`[score]`). Skip any rescaling of outcome scores to
     add up to 1,000,000 for them, or every answer would be 1,000,000. Decide how a query manifest
     says it wants one number.

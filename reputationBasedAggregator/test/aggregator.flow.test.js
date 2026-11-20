@@ -590,6 +590,106 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
     });
   });
 
+  describe("commit format (items 4 and 5)", () => {
+    const revealed = async (r, sl) => ((await flags(r, sl)) & 8) !== 0;   // S_REVEALED
+    // every juror commits `word(slot)` in place of the driver's commit, then the jury is promoted
+    async function commitWith(word) {
+      const r = await drv.request();
+      await drv.answerAll(r);
+      for (let sl = 0; sl < 6; sl++) {
+        const s = r.slots[sl];
+        s.reveal = V(600_000);
+        s.salt = (1n << 127n) | BigInt(sl + 1);
+        await H.fulfil(s.commitReq, s.arb.node, [word(r, s)], "");
+      }
+      await drv.promote(r);
+      return r;
+    }
+
+    it("the commit is keccak256(aggId, operator, response, salt) in full, and the reveal request carries all 32 bytes", async () => {
+      const r = await commitWith((r, s) => H.commitWord(r.aggId, s.arb.opAddr, s.reveal, s.salt));
+      for (const sl of drv.promotedSlots(r)) {
+        const s = r.slots[sl];
+        const want = ethers.toBeHex(H.commitWord(r.aggId, s.arb.opAddr, s.reveal, s.salt), 32);
+        expect((await agg.getSlot(r.aggId, sl)).commitHash).to.equal(want);
+        const tag = ethers.hexlify(ethers.toUtf8Bytes(`2:${want.slice(2)}`)).slice(2);
+        expect(s.revealReq.data.includes(tag)).to.equal(true);
+      }
+      const sl = drv.promotedSlots(r)[0];
+      await drv.reveal(r, sl);
+      expect(await revealed(r, sl)).to.equal(true);
+    });
+
+    it("parseCidSalt matches a reference on 600 inputs, and the hex encoders match ethers", async () => {
+      const L = await (await ethers.getContractFactory("AggregatorLib")).deploy();
+      let st = 0x2545f491;                                                      // mulberry32
+      const rnd = () => { st = (st + 0x6d2b79f5) | 0; let t = Math.imul(st ^ (st >>> 15), 1 | st);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+      const pick = (str) => str[Math.floor(rnd() * str.length)];
+      const HEX = "0123456789abcdefABCDEF", ODD = ":/@`gG~ Qz\x7f.";
+      const ref = (str) => {
+        const i = str.lastIndexOf(":");
+        if (str.length < 34 || i < 0 || str.length - i - 1 !== 32) return [false, "", 0n];
+        const t = str.slice(i + 1);
+        if (!/^[0-9a-fA-F]{32}$/.test(t)) return [false, "", 0n];
+        return [true, str.slice(0, i), BigInt("0x" + t)];
+      };
+      const kinds = { valid: 0, invalid: 0 };
+      for (let k = 0; k < 600; k++) {
+        const cidLen = Math.floor(rnd() * 70);
+        let cid = ""; for (let i = 0; i < cidLen; i++) cid += pick("QmXyz0123456789" + (rnd() < 0.2 ? ODD : ""));
+        let salt = ""; const sl = rnd() < 0.7 ? 32 : Math.floor(rnd() * 40);
+        for (let i = 0; i < sl; i++) salt += rnd() < 0.01 ? pick(ODD) : pick(HEX);
+        let str = rnd() < 0.9 ? `${cid}:${salt}` : cid + salt;
+        if (rnd() < 0.05) str = str.slice(0, Math.floor(rnd() * str.length));
+        const want = ref(str);
+        const got = await L.parseCidSalt(str);
+        expect([got[0], got[1], got[2]]).to.deep.equal(want);
+        kinds[want[0] ? "valid" : "invalid"]++;
+      }
+      expect(kinds.valid).to.be.above(200);
+      expect(kinds.invalid).to.be.above(150);
+      // boundary: a 1-char CID, the largest salt, and an extra colon inside the CID
+      expect((await L.parseCidSalt("Q:" + "f".repeat(32)))[2]).to.equal(2n ** 128n - 1n);
+      expect((await L.parseCidSalt("a:b:" + "0".repeat(32)))[1]).to.equal("a:b");
+      expect((await L.parseCidSalt(":" + "0".repeat(32)))[0]).to.equal(false);
+      for (let k = 0; k < 20; k++) {
+        const x = ethers.hexlify(ethers.randomBytes(32));
+        expect(await L.bytes32ToHexLower(x)).to.equal(x.slice(2));
+        expect(await L.bytes32ToHex(x)).to.equal(x);
+      }
+      expect(await L.bytes32ToHex(ethers.ZeroHash)).to.equal(ethers.ZeroHash);
+    });
+
+    it("a commit made for another round cannot be revealed (no reuse across rounds)", async () => {
+      const other = ethers.zeroPadValue(ethers.toBeHex(999), 32);
+      const r = await commitWith((r, s) => H.commitWord(other, s.arb.opAddr, s.reveal, s.salt));
+      for (const sl of drv.promotedSlots(r)) {
+        await drv.reveal(r, sl);
+        expect(await revealed(r, sl)).to.equal(false);
+      }
+    });
+
+    it("v1's format is refused: a truncated SHA-256 commit, and an 80-bit (20 hex) salt", async () => {
+      const v1Word = (r, s) => BigInt(ethers.dataSlice(ethers.sha256(ethers.AbiCoder.defaultAbiCoder().encode(
+        ["address", "uint256[]", "uint256"], [s.arb.opAddr, s.reveal, s.salt])), 0, 16));
+      const r = await commitWith(v1Word);
+      for (const sl of drv.promotedSlots(r)) {
+        await drv.reveal(r, sl);
+        expect(await revealed(r, sl)).to.equal(false);
+      }
+      // correct v2 commits with small salts: written as 20 hex chars the reveal is ignored, as 32 counted
+      // (one answer per request: the operator consumes the request either way)
+      const r2 = await commitWith((r, s) => H.commitWord(r.aggId, s.arb.opAddr, s.reveal, BigInt(s.slot + 1)));
+      const [a, b] = drv.promotedSlots(r2);
+      const salt = (sl) => BigInt(sl) + 1n;
+      await H.fulfil(r2.slots[a].revealReq, r2.slots[a].arb.node, V(600_000), `QmJ:${salt(a).toString(16).padStart(20, "0")}`);
+      expect(await revealed(r2, a)).to.equal(false);
+      await H.fulfil(r2.slots[b].revealReq, r2.slots[b].arb.node, V(600_000), `QmJ:${H.saltHex(salt(b))}`);
+      expect(await revealed(r2, b)).to.equal(true);
+    });
+  });
+
   describe("fee floor (item 8)", () => {
     const B = 3n, Pn = 3n, Kn = 6n;   // the defaults: bonus multiplier, P, K
     const basePaid = (rcpt) => eventArgs(rcpt, "BasePayment").map((a) => a.amount);
