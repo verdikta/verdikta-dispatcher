@@ -129,6 +129,7 @@ contract ReputationKeeper is Ownable {
         uint256 count;
         uint256 alpha;
         uint256 maxFee;
+        uint256 minFee;               // the round's fee floor (item 8): fees below it score as the floor
         uint256 estimatedBaseCost;
         uint256 maxFeeBasedScalingFactor;
         uint64 requestedClass;
@@ -516,13 +517,16 @@ contract ReputationKeeper is Ownable {
     function _weight(Ck memory c, SelectParams calldata sp) internal view returns (uint256) {
         uint256 rep = ((1000 - sp.alpha) * c.quality + sp.alpha * c.timeliness) / 1000;  // 0..cap
         uint256 w = 1000 + rep * 1000 / points.cap;                                       // 1000..2000
-        uint256 fee = c.fee;
-        if (fee > sp.estimatedBaseCost && sp.maxFee > sp.estimatedBaseCost) {
-            uint256 ratio = (sp.maxFee - sp.estimatedBaseCost) * 1e18 / (fee - sp.estimatedBaseCost);
-            uint256 maxScaling = sp.maxFeeBasedScalingFactor * 1e18;
-            if (ratio > maxScaling) ratio = maxScaling;
-            if (ratio > 1e18) w = w * ratio / 1e18;
-        }
+        // Score the fee the requester pays: below the floor every arbiter costs the same, so a near-zero
+        // posted fee wins no weight (item 8). A fee at or below the base cost gets the full boost (v1 gave
+        // it none, while a fee just above the base cost got nearly the full boost).
+        uint256 fee = c.fee < sp.minFee ? sp.minFee : c.fee;
+        uint256 maxScaling = sp.maxFeeBasedScalingFactor * 1e18;
+        uint256 ratio = fee > sp.estimatedBaseCost
+            ? (sp.maxFee - sp.estimatedBaseCost) * 1e18 / (fee - sp.estimatedBaseCost)
+            : maxScaling;
+        if (ratio > maxScaling) ratio = maxScaling;
+        if (ratio > 1e18) w = w * ratio / 1e18;
         return w;
     }
 

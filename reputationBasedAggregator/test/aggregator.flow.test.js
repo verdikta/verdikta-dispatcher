@@ -160,13 +160,13 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
       for (const s of drv.promotedSlots(r).slice(0, 4)) await drv.reveal(r, s);
       expect((await agg.getEvaluation(r.aggId))[2]).to.equal(true);
       await time.increase(301);
-      await drv.requestOnly({ value: await agg.maxTotalFee(H.MAX_FEE, false) });    // settles r via the queue
+      await drv.requestOnly({ value: await agg.maxTotalFee(H.MAX_FEE, 0, false) });    // settles r via the queue
       expect((await agg.getRoundInfo(r.aggId))[0]).to.equal(7n);              // PH_SETTLED
     });
 
     it("rejects a scaling factor that would not fit its uint16 field", async () => {
-      const v = await agg.maxTotalFee(H.MAX_FEE, false);
-      await expect(agg.connect(requester).requestAIEvaluationWithApproval(["Qm"], "", 500, H.MAX_FEE, H.BASE_COST, 65536, 1, false, { value: v }))
+      const v = await agg.maxTotalFee(H.MAX_FEE, 0, false);
+      await expect(agg.connect(requester).requestAIEvaluationWithApproval(["Qm"], "", 500, H.MAX_FEE, 0, H.BASE_COST, 65536, 1, false, { value: v }))
         .to.be.revertedWithCustomError(agg, "BadInput");
     });
 
@@ -464,7 +464,7 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
 
     it("credit covers only what msg.value does not, and an overpayment returns to credit", async () => {
       await drv.fullRound();
-      const required = await agg.maxTotalFee(H.MAX_FEE, false);
+      const required = await agg.maxTotalFee(H.MAX_FEE, 0, false);
       const c0 = await agg.ethOwed(requester.address);
       expect(c0 > 0n && c0 < required).to.equal(true);                        // the refund and draw reward
       const x = await drv.requestOnly({ value: required });                   // fully paid: credit untouched
@@ -587,6 +587,69 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
         }
         await s2.restore();
       }
+    });
+  });
+
+  describe("fee floor (item 8)", () => {
+    const B = 3n, Pn = 3n, Kn = 6n;   // the defaults: bonus multiplier, P, K
+    const basePaid = (rcpt) => eventArgs(rcpt, "BasePayment").map((a) => a.amount);
+
+    it("maxTotalFee: a floor at or below the ceiling changes nothing; above it, jurors are sized on the floor and rewards on the ceiling", async () => {
+      const plain = await agg.maxTotalFee(H.MAX_FEE, 0, false);
+      expect(plain).to.equal(H.MAX_FEE * (Kn + B * Pn + 3n));                  // + draw (2) and promote (1) rewards
+      expect(await agg.maxTotalFee(H.MAX_FEE, H.MAX_FEE, false)).to.equal(plain);
+      expect(await agg.maxTotalFee(H.MAX_FEE, H.MAX_FEE / 2n, false)).to.equal(plain);
+      const f = 10n * H.MAX_FEE;                                               // above the ceiling: allowed
+      expect(await agg.maxTotalFee(H.MAX_FEE, f, false)).to.equal(f * (Kn + B * Pn) + H.MAX_FEE * 3n);
+      // the global ceiling applies to the requester's ceiling, never to the floor
+      await agg.setParams(3, 2, 250_000, 30_000, H.MAX_FEE / 2n);
+      expect(await agg.maxTotalFee(H.MAX_FEE, f, false)).to.equal(f * (Kn + B * Pn) + (H.MAX_FEE / 2n) * 3n);
+    });
+
+    it("a floor above every posted fee (and above the ceiling) pays each juror the floor and each cluster member B x the floor; the rest is refunded", async () => {
+      const f = 10n * H.MAX_FEE;
+      const required = await agg.maxTotalFee(H.MAX_FEE, f, false);
+      const c0 = await agg.ethOwed(requester.address);
+      const r = await drv.fullRound({ request: { minFee: f, value: required } });
+      expect(basePaid(r.rcpt)).to.deep.equal(Array(6).fill(f));
+      for (let i = 0; i < 6; i++) {
+        expect((await agg.getSlot(r.aggId, i)).fee).to.equal(f);
+        expect((await keeper.getArbiter(r.slots[i].arb.key)).fee).to.equal(H.FEE);   // posted fee untouched
+      }
+      const [phase, , , , received, base, bonus, reward] = await agg.getRoundInfo(r.aggId);
+      expect(phase).to.equal(7n);
+      expect([received, base, bonus, reward]).to.deep.equal([required, Kn * f, Pn * B * f, 3n * H.MAX_FEE]);
+      // the requester drew within 30 s (2 x the ceiling) and gets back everything not paid out
+      expect((await agg.ethOwed(requester.address)) - c0).to.equal(required - Kn * f - Pn * B * f - H.MAX_FEE);
+    });
+
+    it("a floor between posted fees: an arbiter above it is paid its own fee, one below is paid the floor", async () => {
+      const f = 3n * 10n ** 13n, hi = 5n * 10n ** 13n;                        // FEE = 1e13 < f < hi <= ceiling
+      for (const a of arbs.slice(0, 6)) await keeper.setFee(a.key, hi);
+      await mine(1);
+      const r = await drv.request({ minFee: f });
+      const paid = basePaid(r.rcpt);
+      for (let i = 0; i < 6; i++) {
+        const posted = (await keeper.getArbiter(r.slots[i].arb.key)).fee;
+        expect(paid[i]).to.equal(posted > f ? posted : f);
+        expect((await agg.getSlot(r.aggId, i)).fee).to.equal(paid[i]);
+      }
+    });
+
+    it("rejects a floor whose escrow would not fit in 88 bits (the narrowest credited total)", async () => {
+      const f = 2n ** 88n / 15n;                                               // x (K + B x P) = 15, plus the rewards, passes 2^88
+      await expect(agg.connect(requester).requestAIEvaluationWithApproval(["Qm"], "", 500, H.MAX_FEE, f, H.BASE_COST, 5, 1, false))
+        .to.be.revertedWithCustomError(agg, "BadInput");
+    });
+
+    it("keeps the ETH solvency invariant with a floor", async () => {
+      for (let i = 0; i < 2; i++) await drv.fullRound({ request: { minFee: 7n * H.MAX_FEE } });
+      const [deployer] = await ethers.getSigners();
+      const payees = new Set([requester.address, deployer.address]);
+      for (const a of arbs) payees.add(await a.op.owner());
+      let owed = 0n;
+      for (const p of payees) owed += await agg.ethOwed(p);
+      expect(await ethers.provider.getBalance(agg.target)).to.equal(owed);
     });
   });
 

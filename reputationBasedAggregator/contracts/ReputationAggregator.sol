@@ -23,7 +23,7 @@ interface IJuryBeacons {
 }
 
 /**
- * @title ReputationAggregator (example implementation of TODO items 14, 9 and 11)
+ * @title ReputationAggregator (example implementation of TODO items 14, 9, 11 and 8)
  * @notice Commit-reveal aggregation with ETH escrow (as today), plus:
  *   - two-phase request (item 9): the request only escrows and records the query in block B; the jury
  *     is drawn by drawJury() from block B+2 with seed keccak256(aggId, blockhash(B+1)) and the
@@ -51,6 +51,9 @@ interface IJuryBeacons {
  *     settlement never depends on an outside keeper bot (anyone may also call settle());
  *   - getOutcomeScores (item 11): every counted reveal's score for one outcome, so a consumer can
  *     apply a Q-of-N rule (item 12).
+ *   - a requester-set fee floor (item 8): each juror is paid max(its posted fee, minFee), and its bonus
+ *     scales off that, so a requester can make every attempt cost at least K x minFee. Eligibility
+ *     still uses the ceiling only.
  *   Calls to arbiter contracts get a fixed gas stipend, and every call whose failure is tolerated
  *   first checks that enough gas is left, so neither an arbiter (gas bomb) nor a caller (a tight
  *   gas limit) can make one slot, or the keeper's settlement, fail on purpose.
@@ -98,7 +101,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
     // ------------------------------------------------------------------ types
     struct Slot {
         address oracle;       // s0
-        uint96 fee;
+        uint96 fee;           // paid: max(posted fee as of B, the round's floor)
         bytes32 key;          // s1
         address payee;        // s2
         uint40 committedAt;
@@ -137,7 +140,8 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         uint96 effMaxFee;     // s4
         uint96 baseCost;
         uint64 cls;
-        bytes32 sealedHash;   // s5
+        uint96 minFee;        // s5: fee floor (item 8): each juror is paid max(posted fee, minFee)
+        bytes32 sealedHash;   // s6
         string payload;
         uint256[] aggregated;
         uint256[] median;
@@ -233,6 +237,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         string memory addendumText,
         uint256 alpha,
         uint256 maxFee,
+        uint256 minFee,
         uint256 estimatedBaseCost,
         uint256 maxFeeBasedScalingFactor,
         uint64 requestedClass,
@@ -248,7 +253,8 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         uint256 effMaxFee = maxFee < maxOracleFee ? maxFee : maxOracleFee;
         if (estimatedBaseCost >= effMaxFee || alpha > 1000 || maxFeeBasedScalingFactor < 1 || maxFeeBasedScalingFactor > type(uint16).max)
             revert BadInput();
-        uint256 required = maxTotalFee(maxFee, withBeacons);
+        uint256 required = maxTotalFee(maxFee, minFee, withBeacons);
+        if (required > type(uint88).max) revert BadInput();   // so every credited total fits its field
         // credit covers only what msg.value does not; any excess value goes back to credit, so the
         // escrow is exactly `required` (a treasury path never takes more than the round's prepay)
         uint256 fromCredit = msg.value < required ? required - msg.value : 0;
@@ -277,18 +283,25 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         r.effMaxFee = uint96(effMaxFee);
         r.baseCost = uint96(estimatedBaseCost);
         r.cls = requestedClass;
+        if (minFee != 0) r.minFee = uint96(minFee);
         r.payload = payload;
         emit RequestFunded(aggId, msg.sender, fromCredit, msg.value);
         emit RequestAIEvaluation(aggId, cids);
     }
 
-    /// @notice Escrow for one request: eff x (K + B x P + drawRewardFees + promoteRewardFees), plus the
-    ///         beacon quorum if `withBeacons` (reverts if no beacon contract is set).
-    function maxTotalFee(uint256 maxFee, bool withBeacons) public view returns (uint256) {
+    /// @notice Escrow for one request: juror x (K + B x P [+ beacon quorum if `withBeacons`]) +
+    ///         eff x (drawRewardFees + promoteRewardFees); reverts if `withBeacons` and no beacon contract
+    ///         is set. eff = min(maxFee, maxOracleFee) is the fee ceiling; juror = max(eff, minFee) bounds
+    ///         what a juror or a beacon is paid (item 8). The floor may exceed the ceiling: the ceiling
+    ///         limits which arbiters are eligible, not what a requester chooses to pay. The draw and promote
+    ///         rewards are paid on eff, so a requester that draws or promotes its own round gets none of
+    ///         the floor back.
+    function maxTotalFee(uint256 maxFee, uint256 minFee, bool withBeacons) public view returns (uint256) {
         uint256 eff = maxFee < maxOracleFee ? maxFee : maxOracleFee;
-        uint256 n = uint256(K) + uint256(bonusMultiplier) * P + drawRewardFees + promoteRewardFees;
+        uint256 juror = minFee > eff ? minFee : eff;
+        uint256 n = uint256(K) + uint256(bonusMultiplier) * P;
         if (withBeacons) n += beacons.quorum();
-        return eff * n;
+        return juror * n + eff * (uint256(drawRewardFees) + promoteRewardFees);
     }
 
     // ================================================================== two-phase draw (item 9)
@@ -368,11 +381,12 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         } else {
             (uint8 st, bytes32 mix, uint256 readyAt, address[] memory payees) = beacons.result(address(this), aggId);
             if (st != 2 && st != 3) revert TooEarly();
+            uint256 pay = r.minFee > eff ? r.minFee : eff;    // a beacon is paid as a juror: the floor (item 8)
             for (uint256 i = 0; i < payees.length; i++) {
-                ethOwed[payees[i]] += eff;
-                emit BeaconPayment(aggId, payees[i], eff);
+                ethOwed[payees[i]] += pay;
+                emit BeaconPayment(aggId, payees[i], pay);
             }
-            r.rewardCredited += uint88(eff * payees.length);
+            r.rewardCredited += uint88(pay * payees.length);
             if (st == 3) {
                 r.phase = PH_FAILED;              // quorum missed: no result, and no refund (a free re-roll)
                 _refund(r, aggId, treasury);
@@ -385,7 +399,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         ReputationKeeper.Selected[] memory sel;
         uint256 g = gasleft();
         try keeper.selectArbiters(
-            ReputationKeeper.SelectParams(r.K, r.alpha, eff, r.baseCost, r.scaling, r.cls), seed, r.requestBlock, r.requestTime
+            ReputationKeeper.SelectParams(r.K, r.alpha, eff, r.minFee, r.baseCost, r.scaling, r.cls), seed, r.requestBlock, r.requestTime
         ) returns (ReputationKeeper.Selected[] memory s_) {
             sel = s_;
         } catch {
@@ -406,7 +420,8 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         r.deadline = uint40(block.timestamp) + responseTimeoutSeconds;
         string memory payload = r.payload;
         uint96 base;
-        for (uint256 i = 0; i < sel.length; i++) base += _pollSlot(r, aggId, id, i, sel[i], payload, eff);
+        uint256 floor_ = r.minFee;
+        for (uint256 i = 0; i < sel.length; i++) base += _pollSlot(r, aggId, id, i, sel[i], payload, eff, floor_);
         r.baseCredited = base;
 
         uint256 reward;
@@ -442,12 +457,14 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         uint256 i,
         ReputationKeeper.Selected memory s,
         string memory payload,
-        uint256 effMaxFee
+        uint256 effMaxFee,
+        uint256 minFee
     ) internal returns (uint96 credited) {
         if (s.fee > effMaxFee) revert InsufficientPayment();
+        uint256 paid = s.fee < minFee ? minFee : s.fee;    // the floor (item 8); the bonus scales off it
         Slot storage sl = r.slots[i];
         sl.oracle = s.oracle;
-        sl.fee = uint96(s.fee);
+        sl.fee = uint96(paid);
         sl.key = s.key;
         // low-level, so a malformed return (short, or dirty high bits) skips the slot instead of
         // reverting the draw, which would leave the round undrawable
@@ -471,9 +488,9 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
             sl.payee = payee;
             sl.flags = S_DISPATCHED;
             requestRef[opReq] = (id << 8) | i;
-            ethOwed[payee] += s.fee;
-            credited = uint96(s.fee);
-            emit BasePayment(aggId, i, payee, s.fee);
+            ethOwed[payee] += paid;
+            credited = uint96(paid);
+            emit BasePayment(aggId, i, payee, paid);
         } else {
             emit SlotSkipped(aggId, i, 2);
         }

@@ -15,7 +15,7 @@ describe("ReputationKeeper rules (item 14)", function () {
   const apply = async (keys, codes, end) => keeper.connect(fakeAgg).applyOutcomes(keys, codes, end ?? (await time.latest()) + 1);
   const info = (k) => keeper.getArbiter(k);
   const SP = (count, maxFee = H.MAX_FEE) => ({
-    count, alpha: 500, maxFee, estimatedBaseCost: H.BASE_COST, maxFeeBasedScalingFactor: 5, requestedClass: 1,
+    count, alpha: 500, maxFee, minFee: 0, estimatedBaseCost: H.BASE_COST, maxFeeBasedScalingFactor: 5, requestedClass: 1,
   });
   // item 9: selection reads the state as of a past block, with an explicit seed
   // mine one block so the latest state is strictly in the past (eth_call runs at block.number = latest)
@@ -540,6 +540,29 @@ describe("ReputationKeeper rules (item 14)", function () {
       }
       // expected share with weights 2000 vs 1500: 6*2000 / (6*2000 + 6*1500) = 57%
       expect(hiCount / total).to.be.within(0.42, 0.72);
+    });
+
+    it("item 8: fees below the floor weigh the same, and a fee at or below the base cost gets the full boost", async () => {
+      // arbs 0-5 cheap, arbs 6-11 at the ceiling (no boost); scaling factor 5
+      const cheap = arbs.slice(0, 6).map((a) => a.key);
+      for (const a of arbs.slice(6)) await keeper.setFee(a.key, H.MAX_FEE);
+      const share = async (minFee) => {
+        let c = 0;
+        const n = 120;
+        for (let r = 0; r < n; r++) {
+          const [bn, ts] = await at();
+          const sel = await keeper.connect(fakeAgg).selectArbiters.staticCall({ ...SP(1), minFee }, rndSeed(), bn, ts);
+          if (cheap.includes(sel[0].key)) c++;
+        }
+        return c / n;
+      };
+      // no floor: the cheap arbiters get the full 5x boost, 6*5 / (6*5 + 6) = 83%
+      expect(await share(0)).to.be.above(0.7);
+      // a floor at the ceiling: every arbiter costs the requester the same, so 50%
+      expect(await share(H.MAX_FEE)).to.be.within(0.33, 0.67);
+      // posted at the base cost: the full boost (v1 gave none, while a fee just above it got nearly 5x)
+      for (const a of arbs.slice(0, 6)) await keeper.setFee(a.key, H.BASE_COST);
+      expect(await share(0)).to.be.above(0.7);
     });
   });
 });

@@ -78,7 +78,7 @@ describe("gas and cost (300-arbiter pool)", function () {
       await cc.keeper.setApproved(deployer.address, true);
       await ethers.provider.send("evm_mine", []);
       const b = await ethers.provider.getBlock((await ethers.provider.getBlockNumber()) - 1);
-      const sp = { count: c.K, alpha: 500, maxFee: H.MAX_FEE, estimatedBaseCost: H.BASE_COST, maxFeeBasedScalingFactor: 5, requestedClass: 1 };
+      const sp = { count: c.K, alpha: 500, maxFee: H.MAX_FEE, minFee: 0, estimatedBaseCost: H.BASE_COST, maxFeeBasedScalingFactor: 5, requestedClass: 1 };
       const g = [];
       for (let i = 0; i < 5; i++) {
         g.push(Number(await cc.keeper.selectArbiters.estimateGas(sp, ethers.hexlify(ethers.randomBytes(32)), b.number, b.timestamp)));

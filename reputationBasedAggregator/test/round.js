@@ -40,10 +40,10 @@ class RoundDriver {
   }
 
   /** Phase 1: escrow only. `beacons` sets item 9's per-request beacon flag. */
-  async requestOnly({ kind = "request (escrow)", value, beacons = this.beacons } = {}) {
-    value = value ?? (await this.agg.maxTotalFee(H.MAX_FEE, beacons));
+  async requestOnly({ kind = "request (escrow)", value, beacons = this.beacons, minFee = 0n } = {}) {
+    value = value ?? (await this.agg.maxTotalFee(H.MAX_FEE, minFee, beacons));
     const tx = await this.agg.connect(this.requester).requestAIEvaluationWithApproval(
-      ["QmRequestCid"], "", 500, H.MAX_FEE, H.BASE_COST, 5, 1, beacons, { value, gasLimit: 16_000_000 }
+      ["QmRequestCid"], "", 500, H.MAX_FEE, minFee, H.BASE_COST, 5, 1, beacons, { value, gasLimit: 16_000_000 }
     );
     const reqRcpt = this.log(kind, await tx.wait());
     const aggId = ethers.zeroPadValue(ethers.toBeHex(await this.agg.roundCount()), 32);
@@ -156,9 +156,10 @@ class RoundDriver {
     return this.log("settle (applyOutcomes x K)", await (await this.agg.settle(round.aggId, { gasLimit: 16_000_000 })).wait());
   }
 
-  /** A complete honest round: all answer, all commit, every promoted arbiter reveals. */
-  async fullRound({ vectors, lateReveals = true, settle = true } = {}) {
-    const round = await this.request();
+  /** A complete honest round: all answer, all commit, every promoted arbiter reveals. `request` holds
+   *  requestOnly's options (e.g. item 8's `minFee`). */
+  async fullRound({ vectors, lateReveals = true, settle = true, request = {} } = {}) {
+    const round = await this.request(request);
     await this.answerAll(round);
     const slots = Object.keys(round.slots).map(Number).sort((a, b) => a - b);
     for (const sl of slots) await this.commit(round, sl, vectors ? vectors(sl) : H.vec(600_000 + (sl % 3) * 10_000));

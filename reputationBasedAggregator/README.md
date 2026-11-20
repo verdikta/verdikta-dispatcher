@@ -1,7 +1,8 @@
-# Reputation aggregator v2 (TODO items 9, 11, 14 and 15)
+# Reputation aggregator v2 (TODO items 8, 9, 11, 14 and 15)
 
 The v2 contracts: the two-score reputation design (item 14), the two-phase request with optional
-beacons (item 9), the per-arbiter score getter (item 11) and item 15's class configurations. They
+beacons (item 9), the per-arbiter score getter (item 11), the requester-set fee floor (item 8) and
+item 15's class configurations. They
 replaced the v1 contracts in this folder on 2026-11-18. Not audited and not deployed yet.
 
 The deployed v1 code is tag `aggregator-v0.1.0`. An untracked copy of the v1 folder sits in `v1/`
@@ -10,8 +11,8 @@ arbiter node, the operator contract and the scripts.
 
 | Contract | Role |
 |---|---|
-| `ReputationKeeper` | Arbiter registry, stake, unbonding, burns, two scores (Table 1 via `applyOutcomes`, −400 for a live non-committer when the round failed for lack of commits), blocks / bans / 90-day decay (Table 2), hash-chain health calls (each reveal recorded with its block and time), freeze and chain rotation, reputation-weighted selection from a bounded walk of the class list in random order, and the beacon pick. Selection state is checkpointed by block, so a draw reads the state as of the request block (item 9). Answers `isContractApproved`, which every deployed `ArbiterOperator` uses to gate requests |
-| `ReputationAggregator` | Two-phase request (escrow at block B; `drawJury` from B+2, seeded by `blockhash(B+1)`, read through EIP-2935 after 256 blocks; 2 x fee draw reward; `sealSeed`, `cancelUnsealed`), the optional beacon stage, M+ / T+ promotion (closes at the M+-th commit or after T+ with at least M; `promote` from C+2 draws M of all commits), late reveals, settlement after the deadline with one batched keeper call, a settlement queue drained by new requests, `getOutcomeScores` (item 11) |
+| `ReputationKeeper` | Arbiter registry, stake, unbonding, burns, two scores (Table 1 via `applyOutcomes`, −400 for a live non-committer when the round failed for lack of commits), blocks / bans / 90-day decay (Table 2), hash-chain health calls (each reveal recorded with its block and time), freeze and chain rotation, reputation-weighted selection (the fee weight scored on what the requester pays, item 8) from a bounded walk of the class list in random order, and the beacon pick. Selection state is checkpointed by block, so a draw reads the state as of the request block (item 9). Answers `isContractApproved`, which every deployed `ArbiterOperator` uses to gate requests |
+| `ReputationAggregator` | Two-phase request (escrow at block B; `drawJury` from B+2, seeded by `blockhash(B+1)`, read through EIP-2935 after 256 blocks; 2 x fee draw reward; `sealSeed`, `cancelUnsealed`), the optional beacon stage, M+ / T+ promotion (closes at the M+-th commit or after T+ with at least M; `promote` from C+2 draws M of all commits), late reveals, settlement after the deadline with one batched keeper call, a settlement queue drained by new requests, `getOutcomeScores` (item 11), the requester-set fee floor (item 8) |
 | `JuryBeacons` | Item 9's beacon flag, kept out of the aggregator for bytecode: picks 4 beacons through the keeper (which sends each a health call), reads their answers from the keeper, and reports the mix of the first 2 |
 | `ScoringLib` | External library: finalization in one call (v1's length normalization, cluster, mean, quality classes), the promotion draw. One-number answers get the exact 1-D cluster; longer vectors item 10's nearest-neighbour rule, which replaces v1's greedy one |
 | `AggregatorLib` | External library: v1's helpers plus the commit payload builder and a one-call CID/salt parser |
@@ -169,6 +170,25 @@ so each class is a separate deployment. Local networks get a `MockLinkToken` and
   it to at least 30 s after the close.
 - **Credit covers only what `msg.value` does not.** Any excess value returns to credit, so the escrow
   is exactly `maxTotalFee`.
+- **The fee floor (item 8).** The request carries `minFee` next to the ceiling `maxFee`.
+  - **Payment.** Each juror is paid `max(posted fee, minFee)`, and its bonus is B times that. So
+    every attempt costs at least K × `minFee`, and with a cluster about B × P × `minFee` more.
+    `BasePayment` and `getSlot(...).fee` show the amount paid; the posted fee is the keeper's.
+  - **Eligibility uses the ceiling only**, as before. The floor may exceed the ceiling and the
+    global `maxOracleFee`: the ceiling keeps expensive arbiters out of selection, and doesn't limit
+    what a requester chooses to pay.
+  - **Beacons get the floor too.** A used beacon is paid `max(eff, minFee)`, like a juror.
+  - **Rewards are not on the floor.** The draw and promote rewards stay on the ceiling, so a
+    requester that draws its own round gets none of the floor back.
+  - **The escrow** is `max(eff, minFee) × (K + B×P [+ quorum]) + eff × (draw + promote rewards)`. It
+    must fit in 88 bits, the narrowest credited total; otherwise the request reverts `BadInput`.
+  - **Selection scores the fee the requester pays.** Below the floor every arbiter costs the same,
+    so a near-zero posted fee wins no extra weight.
+  - **The base cost.** A fee at or below `estimatedBaseCost` now gets the full fee boost. v1 gave it
+    none, while a fee just above it got nearly the full boost.
+  - **Who sets it.** The floor deters only a requester who can't choose it. In the bounty program
+    that is the bounty creator, through BountyEscrow; it gives no protection to a submitter calling
+    the aggregator directly.
 - **The settlement-queue walk is bounded** at 8 steps per round a request may settle, counting rounds
   already settled with `settle()`, so holes in the queue cannot make requests run out of gas.
 - **Only the arbiter's owner can top up its stake** (a top-up re-applies the current requirement).
@@ -176,7 +196,8 @@ so each class is a separate deployment. Local networks get a `MockLinkToken` and
 ## Beacons (item 9's flag; Jumbo)
 
 - **Flag and escrow.** The requester sets `withBeacons` in the request. The escrow adds the quorum
-  (2) in fees: `maxTotalFee(maxFee, true)`.
+  (2) in fees: `maxTotalFee(maxFee, minFee, true)`. A used beacon is paid as a juror: the ceiling,
+  or the fee floor if that is higher.
 - **The pick.** The first `drawJury` seals `blockhash(B+1)` and asks `JuryBeacons` to start. The keeper
   picks 4 arbiters from the request's class, entirely from its state as of B: registered, and not
   paused, banned, exiting, under-staked, blocked or frozen. Each gets a health call. Nothing after B

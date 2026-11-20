@@ -50,6 +50,10 @@ comparing the two ABIs and the code that calls them.
 - **Job gas limit.** The N-th counted reveal finalizes the round and pays for it: at Jumbo 1.3M gas
   with one-number answers, 2.6M with two outcomes, 6.9M at 20 outcomes. Set the job's gas limit
   above the largest answer the class allows; a reveal that runs out of gas is lost.
+- **Posted fees and the floor (item 8).** A request may set a fee floor, and every juror is then paid
+  at least the floor. Selection weighs the fee the requester pays, so a fee posted below a round's
+  floor gains no weight there. A fee at or below the request's base cost now gets the full fee boost
+  (v1 gave it none).
 
 ## BountyEscrow / EvaluationWallet (redeploy; item 9's notes)
 
@@ -57,8 +61,8 @@ comparing the two ABIs and the code that calls them.
 
 | v1 | v2 |
 |---|---|
-| `requestAIEvaluationWithApproval(cids, addendum, alpha, maxFee, baseCost, scaling, class)` | same plus `bool withBeacons` (the class preset: Jumbo on) |
-| `maxTotalFee(maxFee)` | `maxTotalFee(maxFee, withBeacons)`: `eff × (K + B×P + 2 + 1 [+ 2])` |
+| `requestAIEvaluationWithApproval(cids, addendum, alpha, maxFee, baseCost, scaling, class)` | `(cids, addendum, alpha, maxFee, minFee, baseCost, scaling, class, withBeacons)`: item 8's fee floor after `maxFee` (0 = none), and the beacon flag at the end (the class preset: Jumbo on) |
+| `maxTotalFee(maxFee)` | `maxTotalFee(maxFee, minFee, withBeacons)`: `max(eff, minFee) × (K + B×P [+ 2]) + eff × (2 + 1)` |
 | (none) | `drawJury(aggId)` from block B+2: a passthrough on the wallet, like `startEvaluation`, so the draw reward reaches the hunter. With beacons, call it twice: once to start the stage, then again once 2 beacon values are in |
 | `finalizeEvaluationTimeout(aggId)` | `settle(aggId)` after the round's deadline. Anyone may call it, and new requests settle due rounds too |
 | `getAggregationStatus(aggId)` → `isComplete, failed, …` | `getRoundInfo(aggId)` → `phase, …`. Settled = phase 7 (settled) or 8 (failed); `isFailed(aggId)` |
@@ -90,6 +94,11 @@ Behaviour BountyEscrow must allow for:
   credit untouched, and an overpayment returns to credit.
 - **Fees per class.** The fee per class must stay at or below `maxOracleFee()`. K/M/N come from the
   class's aggregator, one deployment per class.
+- **The fee floor (item 8).** It is the bounty creator's setting: add `minOracleFee` to the bounty's
+  oracle parameters and pass it into every request for that bounty, never the hunter's choice. It
+  may exceed `maxOracleFee()`. The UI should ask for a target cost per attempt and divide by K,
+  since an attempt costs at least K × the floor (K + 2 with beacons, which are paid the floor too).
+  The draw reward the wallet receives is on the ceiling, not the floor.
 
 ## Scripts in this folder
 
@@ -106,7 +115,7 @@ use `ethers.getContractAt("ReputationAggregator", …)` now get the v2 ABI.
 | `reset-oracle.js`, `reset-reputations-cl.js` | `resetAllReputations` | none (no reset in v2) |
 | `oracle-poller(-cl).js`, `arbiter-noise.js`, `arbiter-stats.js` | `registeredOracles`, `getRegisteredOraclesCount`, `getOracleInfo`, `getOracleClasses` | the `ArbiterRegistered` events, `classSize(cls)`, `getArbiter(key)` |
 | `monitor-contracts(-cl).js`, `agg-history.js` | `getContractConfig`, `oraclesToPoll`, `getAggregationStatus`, v1 events | `K()`/`M()`/`N()`/`P()`, `getRoundInfo`, v2 events |
-| `single-query.js`, `simultaneous-tests.js` | 7-argument request, `maxTotalFee(fee)` | 8-argument request, `maxTotalFee(fee, flag)`, then `drawJury` at B+2 (twice with beacons) and `promote` after the commit phase closes |
+| `single-query.js`, `simultaneous-tests.js` | 7-argument request, `maxTotalFee(fee)` | 9-argument request, `maxTotalFee(fee, floor, flag)`, then `drawJury` at B+2 (twice with beacons) and `promote` after the commit phase closes |
 | `refund.js` | `finalizeEvaluationTimeout`, `getAggregationStatus` | `settle`, `getRoundInfo` |
 | `configure-contracts.js`, `deploy_just_aggregator.js` | `approveContract`, `setConfig(5 args)`, `setMaxOracleFee` | `setApproved`, `setConfig(6 args)`, `setParams`, `setContracts` (or `deploy/`) |
 | `reveal-forensics.js` | v1 reveal events (`RevealHashMismatch`, …) | v2 ignores bad reveals silently: only `RevealReceived` is emitted |

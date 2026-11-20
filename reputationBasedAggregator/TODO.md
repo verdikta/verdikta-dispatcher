@@ -7,19 +7,11 @@ bottom; check items off as they land.
 
 ## What's left (2026-11-20)
 
-The v2 contracts on the `beacon` branch implement items 1, 2, 6, 7, 9, 10, 11 and 14. Nothing that
+The v2 contracts on the `beacon` branch implement items 1, 2, 6, 7, 8, 9, 10, 11 and 14. Nothing that
 calls them is ported yet. The numbered items below hold the details; this list is the summary.
 
 ### Contracts: still to build or decide before the v2 deploy
 v2 is a breaking redeploy, so changes to the request or the wire format cost least now.
-- **Item 8, the requester-set fee floor.** It is not in v2, and the class limits in items 13 and 15
-  assume it (Option A: $0.25 per arbiter). It needs:
-  - `minOracleFee` in the request and in `maxTotalFee`;
-  - payment of `max(fee, minFee)`;
-  - keeper scoring on that amount, plus the fix for the boost discontinuity;
-  - BountyEscrow passing the floor through.
-
-  README's "Not implemented" doesn't list it yet.
 - **Items 4 and 5: a 128-bit salt, and Keccak instead of SHA-256 for commits.** Both change the
   node's wire format. Do them now, alongside the node work in item 16, or decide to keep v1's format.
 - **Item 3, the refund beneficiary (`refundTo`).** Optional. It would let BountyEscrow drop the
@@ -49,9 +41,13 @@ v2 is a breaking redeploy, so changes to the request or the wire format cost lea
 - Each operator owner calls `addReputationKeeper(<v2 keeper>)`.
 
 ### Consumers (items 12, 15 and 16)
-- **BountyEscrow.** The v2 ABI (`MIGRATION.md`), item 12's Q-of-N rules on `getOutcomeScores`, the
-  class presets (K/M/N/P, Q, R, fee floor, bond and beacon flag), one aggregator per class, and the
-  FUND score as a one-number answer. Its server must call `drawJury` and `promote` promptly.
+- **BountyEscrow.**
+  - The v2 ABI (`MIGRATION.md`).
+  - The bounty creator's fee floor (item 8), passed into every request for the bounty.
+  - Item 12's Q-of-N rules on `getOutcomeScores`.
+  - The class presets: K/M/N/P, Q, R, fee floor, bond and beacon flag.
+  - One aggregator per class.
+  - The FUND score as a one-number answer. Its server must call `drawJury` and `promote` promptly.
 - **Example arbiters and the example frontend:** registration, exit, views, and the new request flow
   (request, `drawJury` at B+2, `promote`, result).
 - **Ops scripts.** Port them (`MIGRATION.md` table), including `deploy_aggregatorOnly.sh`,
@@ -454,7 +450,8 @@ redeploy.
 
 ## 8. Requester-set minimum arbiter fee, to make repeated attempts uneconomic
 
-**Status:** not started (design discussed 2026-11-01)
+**Status:** design discussed 2026-11-01. Implemented in the v2 contracts on 2026-11-20 (see "v2
+implementation" below). The bounty-program side is not started (item 16).
 **Scope:** `ReputationAggregator.sol` + `ReputationKeeper.sol` (selection scoring) + bounty program
 (`BountyEscrow.sol`, `EvaluationWallet.sol`). Breaking change to the request signature and
 `maxTotalFee`; that is acceptable, since the next aggregator release is breaking anyway.
@@ -500,6 +497,35 @@ rejected, as now. An arbiter whose fee is below the floor is paid the floor.
   add `minOracleFee` to BountyEscrow's per-bounty oracle params (alongside `maxOracleFee`,
   `alpha`, `estimatedBaseCost`) and pass it through `EvaluationWallet`. Any application where
   submitters call the aggregator directly gets no protection from this; document that.
+
+### v2 implementation (2026-11-20)
+- **Request.** `requestAIEvaluationWithApproval(cids, addendum, alpha, maxFee, minFee, baseCost,
+  scaling, class, withBeacons)` and `maxTotalFee(maxFee, minFee, withBeacons)`.
+- **Escrow.** `max(eff, minFee) × (K + B×P [+ beacon quorum]) + eff × (draw + promote rewards)`.
+  - Used beacons are paid the floor, like jurors (owner, 2026-11-20).
+  - The draw and promote rewards stay on the ceiling. The draw reward goes to whoever draws, usually
+    the requester (or, in the bounty program, the hunter's wallet), so a reward on the floor would
+    hand 2 floors of each attempt back to the attacker.
+  - A request whose escrow doesn't fit in 88 bits (`rewardCredited`, the narrowest credited total)
+    reverts `BadInput`.
+- **Payment.** Each juror is paid `max(posted fee as of B, minFee)`, stored as the slot's fee. The
+  bonus scales off it, and `BasePayment` emits the amount paid (the posted fee is the keeper's).
+- **Selection.** The keeper's `SelectParams` gains `minFee`, and `_weight` scores
+  `max(fee, minFee)`. The boost discontinuity is fixed: a fee at or below `estimatedBaseCost` gets
+  the full `maxFeeBasedScalingFactor`.
+- **Cost.**
+  - The floor takes one more storage slot per round, written only when it is non-zero.
+  - Gas per round is unchanged within noise.
+  - The aggregator grew 300 B, leaving 192 B of headroom.
+- **Tests** (`fee floor (item 8)` in `test/aggregator.flow.test.js`, plus one keeper and one beacon
+  test):
+  - the escrow sizes;
+  - a floor above every posted fee and above the ceiling;
+  - a floor between posted fees;
+  - the 88-bit bound;
+  - solvency;
+  - beacons paid the floor, and the draw reward the ceiling;
+  - the selection weight under a floor, and at the base cost.
 
 ### Sizing guidance (for docs / bounty UI)
 - The cost of an attempt that cannot be avoided is the base fee, credited to all K arbiters
@@ -2211,8 +2237,9 @@ What each consumer needs (the files are where the v1 calls are today):
 - **BountyEscrow** (`applications/example-bounty-program`).
   - Contracts: `IVerdiktaAggregator.sol`, `BountyEscrow.sol`, `EvaluationWallet.sol`,
     `BountyEscrowLens.sol`, and the mock.
-    - The 8-argument request, with the beacon flag from the class preset.
-    - `maxTotalFee(fee, flag)`.
+    - The 9-argument request: the bounty creator's fee floor (item 8: `minOracleFee` in the
+      bounty's oracle params, never the hunter's choice) and the beacon flag from the class preset.
+    - `maxTotalFee(fee, floor, flag)`.
     - A `drawJury` passthrough, called twice with beacons.
     - `settle` replaces the timeout call, and `getRoundInfo` replaces the status call.
     - An undrawn round never times out.

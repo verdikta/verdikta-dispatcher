@@ -45,14 +45,14 @@ describe("JuryBeacons (item 9's beacon flag)", function () {
   });
 
   it("a flagged request escrows the beacon quorum on top; without a beacon contract it is refused", async () => {
-    const off = await agg.maxTotalFee(H.MAX_FEE, false);
-    const on = await agg.maxTotalFee(H.MAX_FEE, true);
+    const off = await agg.maxTotalFee(H.MAX_FEE, 0, false);
+    const on = await agg.maxTotalFee(H.MAX_FEE, 0, true);
     expect(on - off).to.equal(2n * H.MAX_FEE);
-    await expect(agg.connect(requester).requestAIEvaluationWithApproval(["Qm"], "", 500, H.MAX_FEE, H.BASE_COST, 5, 1, true, { value: off }))
+    await expect(agg.connect(requester).requestAIEvaluationWithApproval(["Qm"], "", 500, H.MAX_FEE, 0, H.BASE_COST, 5, 1, true, { value: off }))
       .to.be.revertedWithCustomError(agg, "InsufficientPayment");
     await agg.setContracts(keeper.target, ethers.ZeroAddress, deployer.address);
-    await expect(agg.maxTotalFee(H.MAX_FEE, true)).to.be.reverted;
-    await expect(agg.connect(requester).requestAIEvaluationWithApproval(["Qm"], "", 500, H.MAX_FEE, H.BASE_COST, 5, 1, true, { value: on }))
+    await expect(agg.maxTotalFee(H.MAX_FEE, 0, true)).to.be.reverted;
+    await expect(agg.connect(requester).requestAIEvaluationWithApproval(["Qm"], "", 500, H.MAX_FEE, 0, H.BASE_COST, 5, 1, true, { value: on }))
       .to.be.reverted;
   });
 
@@ -113,7 +113,10 @@ describe("JuryBeacons (item 9's beacon flag)", function () {
     await expect(beacons.setParams(17, 2, 120)).to.be.revertedWithCustomError(beacons, "InvalidConfig");
     await expect(beacons.connect(stranger).setParams(4, 4, 120)).to.be.revertedWithCustomError(beacons, "OwnableUnauthorizedAccount");
     await beacons.setParams(4, 4, 120);                                       // the stricter variant: all 4 values
-    expect((await agg.maxTotalFee(H.MAX_FEE, true)) - (await agg.maxTotalFee(H.MAX_FEE, false))).to.equal(4n * H.MAX_FEE);
+    expect((await agg.maxTotalFee(H.MAX_FEE, 0, true)) - (await agg.maxTotalFee(H.MAX_FEE, 0, false))).to.equal(4n * H.MAX_FEE);
+    // item 8: a beacon is paid as a juror, so a floor above the ceiling sizes the quorum's share
+    const f = 10n * H.MAX_FEE;
+    expect((await agg.maxTotalFee(H.MAX_FEE, f, true)) - (await agg.maxTotalFee(H.MAX_FEE, f, false))).to.equal(4n * f);
   });
 
   it("the first 2 values are paid one fee each; later ones count for liveness only", async () => {
@@ -126,6 +129,19 @@ describe("JuryBeacons (item 9's beacon flag)", function () {
     for (const p of paid) expect(p.amount).to.equal(H.MAX_FEE);
     const [, , , , , , , rewards] = await agg.getRoundInfo(r.aggId);
     expect(rewards).to.equal(4n * H.MAX_FEE);                                 // 2 x draw reward + 2 beacons
+  });
+
+  it("item 8: with a fee floor each used beacon is paid the floor; the draw reward stays on the ceiling", async () => {
+    const f = 10n * H.MAX_FEE;
+    const r = await drv.requestOnly({ minFee: f });
+    await drv.beaconStage(r);
+    await drv.draw(r, { waitBlocks: 0 });
+    const paid = ev(agg, r.rcpt, "BeaconPayment");
+    expect(paid.length).to.equal(2);
+    for (const p of paid) expect(p.amount).to.equal(f);
+    const [, , , , received, , , rewards] = await agg.getRoundInfo(r.aggId);
+    expect(rewards).to.equal(2n * H.MAX_FEE + 2n * f);                       // 2 x draw reward + 2 beacons
+    expect(received).to.equal(await agg.maxTotalFee(H.MAX_FEE, f, true));
   });
 
   it("the seed mixes the first 2 values to arrive, in index order: same values, same jury, whoever draws and whenever", async () => {
