@@ -602,24 +602,76 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
   });
 
   describe("clustering", () => {
-    // ScoringLib's loops are hand-written, so every function is checked against v1's AggregatorLib
-    // and against a plain JavaScript reference, on inputs built to produce ties and duplicates.
-    let seed = 12345;
-    const rnd = (n) => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n; };   // reproducible
+    // ScoringLib's loops are hand-written, so every function is checked against plain JavaScript
+    // references written from the stated rules (and v1's AggregatorLib where they must agree), on
+    // reproducible inputs built for ties, duplicates and extremes. The generator is mulberry32
+    // (32-bit integer arithmetic): a float LCG here once returned 0 for rnd(8) in 99.6% of calls.
+    function mulberry32(a) {
+      return () => {
+        a |= 0; a = (a + 0x6d2b79f5) | 0;
+        let t = Math.imul(a ^ (a >>> 15), 1 | a);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+    const R = mulberry32(0xc0ffee);
+    const rnd = (n) => Math.floor(R() * n);
+    const MAX = 10n ** 34n;
     const dist = (a, b) => a.reduce((s, x, k) => { const t = x > b[k] ? x - b[k] : b[k] - x; return s + t * t; }, 0n);
-    // nearest-neighbour cluster: each reveal plus its P - 1 nearest (ties to the earlier reveal); keep
-    // the group with the smallest pairwise sum (first centre on ties). P below 2 counts as 2
-    function refCluster(v, P) {
-      const n = v.length; if (P > n) P = n; if (P < 2) P = 2;
-      let best = null, grp = null;
+    // one-value vectors: P consecutive values in (value, position) order with the smallest
+    // P sum(x^2) - (sum x)^2, the first window on ties
+    function refWindow(v, P) {
+      const n = v.length;
+      const o = [...Array(n).keys()].sort((a, b) => (v[a][0] < v[b][0] ? -1 : v[a][0] > v[b][0] ? 1 : a - b));
+      let best = null, start = 0;
+      for (let s = 0; s + P <= n; s++) {
+        const w = o.slice(s, s + P).map((i) => v[i][0]);
+        const sc = BigInt(P) * w.reduce((t, x) => t + x * x, 0n) - w.reduce((t, x) => t + x, 0n) ** 2n;
+        if (best === null || sc < best) { best = sc; start = s; }
+      }
+      const out = Array(n).fill(false); for (const i of o.slice(start, start + P)) out[i] = true; return out;
+    }
+    // longer vectors: each position plus its P - 1 nearest (ties to the earlier position); the group
+    // with the smallest pairwise sum, the first centre on ties
+    function refNN(v, P) {
+      const n = v.length; let best = null, grp = null;
       for (let c = 0; c < n; c++) {
         const g = [...Array(n).keys()].sort((a, b) => { const x = dist(v[c], v[a]), y = dist(v[c], v[b]); return x < y ? -1 : x > y ? 1 : a - b; }).slice(0, P);
-        let s = 0n; for (let i = 0; i < P; i++) for (let j = i + 1; j < P; j++) s += dist(v[g[i]], v[g[j]]);
-        if (best === null || s < best) { best = s; grp = g; }
+        let sc = 0n; for (let i = 0; i < P; i++) for (let j = i + 1; j < P; j++) sc += dist(v[g[i]], v[g[j]]);
+        if (best === null || sc < best) { best = sc; grp = g; }
       }
       const out = Array(n).fill(false); for (const i of grp) out[i] = true; return out;
     }
-    const median = (a) => { const s = [...a].sort((x, y) => (x < y ? -1 : x > y ? 1 : 0)); const n = s.length; return n % 2 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2n; };
+    function refCluster(v, P) {
+      const n = v.length; if (P > n) P = n; if (P < 2) P = 2;
+      return v[0].length === 1 ? refWindow(v, P) : refNN(v, P);
+    }
+    const pairSum = (v, inC) => { const g = v.filter((_, i) => inC[i]); let t = 0n; for (let a = 0; a < g.length; a++) for (let b = a + 1; b < g.length; b++) t += dist(g[a], g[b]); return t; };
+    function bruteBest(v, P) {          // the smallest pairwise sum over every P-subset (small n)
+      let best = null;
+      const rec = (start, g) => {
+        if (g.length === P) { const t = pairSum(v, v.map((_, i) => g.includes(i))); if (best === null || t < best) best = t; return; }
+        for (let i = start; i < v.length; i++) rec(i + 1, [...g, i]);
+      };
+      rec(0, []); return best;
+    }
+    // the most common length, ties to the LONGER; truncate or zero-fill
+    function refNormalize(v) {
+      let modal = 0, cnt = 0;
+      for (const x of v) { const c = v.filter((y) => y.length === x.length).length; if (c > cnt || (c === cnt && x.length > modal)) { cnt = c; modal = x.length; } }
+      return v.map((x) => Array.from({ length: modal }, (_, j) => (j < x.length ? x[j] : 0n)));
+    }
+    const coder = ethers.AbiCoder.defaultAbiCoder();
+    const refTieOrder = (seed, ids) => {
+      const key = ids.map((id) => BigInt(ethers.keccak256(coder.encode(["bytes32", "uint256"], [seed, id]))) >> 8n);   // top 248 bits
+      return [...ids.keys()].sort((a, b) => (key[a] < key[b] ? -1 : key[a] > key[b] ? 1 : a - b));
+    };
+    function refAggregateCluster(v, P, seed, ids) {      // the cluster under the seeded tie order
+      const perm = refTieOrder(seed, ids);
+      const c = refCluster(perm.map((i) => v[i]), P);
+      const out = Array(v.length).fill(false); perm.forEach((p, k) => { if (c[k]) out[p] = true; }); return out;
+    }
+    const median = (a) => { const t = [...a].sort((x, y) => (x < y ? -1 : x > y ? 1 : 0)); const n = t.length; return n % 2 ? t[(n - 1) / 2] : (t[n / 2 - 1] + t[n / 2]) / 2n; };
     const dev = (x, med) => med.reduce((m, mj, j) => { const xj = j < x.length ? x[j] : 0n; const t = xj > mj ? xj - mj : mj - xj; return t > m ? t : m; }, 0n);
     const klass = (d, spread) => (d * 2n <= spread * 3n ? 1 : d <= spread * 3n ? 2 : 3);
     function refClassify(v, floor) {
@@ -628,33 +680,122 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
       let spread = (median(d) * 14826n) / 10000n; if (spread < floor) spread = floor;
       return { codes: d.map((x) => klass(x, spread)), med, spread };
     }
-    const GENS = [
-      (n, len) => Array.from({ length: n }, () => Array.from({ length: len }, () => BigInt(rnd(4)))),                // heavy ties
-      (n, len) => Array.from({ length: n }, () => Array.from({ length: len }, () => BigInt(rnd(3) * 500_000))),      // a coarse grid
-      (n, len) => Array.from({ length: n }, () => { const x = BigInt(rnd(1_000_001)); return len === 2 ? [x, 1_000_000n - x] : Array.from({ length: len }, () => BigInt(rnd(1_000_001))); }),
-      (n, len) => { const b = Array.from({ length: len }, () => BigInt(rnd(1_000_001))); return Array.from({ length: n }, () => (rnd(3) ? b.slice() : b.map(() => BigInt(rnd(1_000_001))))); }, // duplicates
-      (n, len) => Array.from({ length: n }, () => Array.from({ length: len }, () => (rnd(2) ? 10n ** 34n : 0n))),     // MAX_SCORE extremes
-    ];
+    const GENS = {
+      ties: (n, len) => Array.from({ length: n }, () => Array.from({ length: len }, () => BigInt(rnd(4)))),
+      grid: (n, len) => Array.from({ length: n }, () => Array.from({ length: len }, () => BigInt(rnd(3) * 500_000))),
+      uniform: (n, len) => Array.from({ length: n }, () => Array.from({ length: len }, () => BigInt(rnd(1_000_001)))),
+      pair: (n, len) => Array.from({ length: n }, () => { const x = BigInt(rnd(1_000_001)); return [x, 1_000_000n - x, ...Array(Math.max(0, len - 2)).fill(0n)].slice(0, len); }),
+      dups: (n, len) => { const b = Array.from({ length: len }, () => BigInt(rnd(1_000_001))); return Array.from({ length: n }, () => (rnd(3) ? b.slice() : b.map(() => BigInt(rnd(1_000_001))))); },
+      extremes: (n, len) => Array.from({ length: n }, () => Array.from({ length: len }, () => (rnd(2) ? MAX : 0n))),
+      nearMax: (n, len) => Array.from({ length: n }, () => Array.from({ length: len }, () => MAX - BigInt(rnd(3)))),
+    };
+    const seedOf = (t) => ethers.keccak256(ethers.toUtf8Bytes(`round ${t}`));
 
-    it("bestCluster, classify and aggregate match a reference implementation (and v1 at P = 2)", async () => {
+    it("bestCluster and classify match the references (v1 at P = 2 for vectors, brute force for one value)", async () => {
       const { scoring, aggLib } = core;
-      for (let t = 0; t < 300; t++) {
-        const n = 2 + rnd(t < 150 ? 8 : 26);
-        const len = [2, 2, 2, 3, 5, 20][rnd(6)];
-        const P = 1 + rnd(n + 2);                                   // includes P = 1 and P > n
-        const v = GENS[t % GENS.length](n, len);
+      const names = Object.keys(GENS);
+      let nd = 0, oneD = 0, v1checks = 0, brute = 0;
+      for (let t = 0; t < 400; t++) {
+        const n = 2 + rnd(t < 250 ? 9 : 26);
+        const len = [1, 1, 2, 2, 3, 5, 20][rnd(7)];
+        const P = rnd(n + 3);                                          // 0, 1, 2..n and past n
+        const g = names[t % names.length];
+        const v = GENS[g](n, len);
+        const what = `case ${t} ${g} n=${n} len=${len} P=${P}`;
         const got = [...(await scoring.bestCluster(v, P))];
-        expect(got, `case ${t}`).to.deep.equal(refCluster(v, P));
-        if (P <= 2) expect(got.map((b) => (b ? 1n : 0n)), `case ${t} v1`).to.deep.equal(await aggLib.findBestCluster(v, v.map((_, i) => i), P));
+        expect(got, what).to.deep.equal(refCluster(v, P));
+        expect(got.filter(Boolean).length, what).to.equal(Math.max(2, Math.min(P, n)));
+        if (len === 1) {
+          oneD++;
+          if (n <= 9) { brute++; expect(pairSum(v, got), `${what} exact`).to.equal(bruteBest(v, Math.max(2, Math.min(P, n)))); }
+        } else {
+          nd++;
+          if (P <= 2) { v1checks++; expect(got.map((b) => (b ? 1n : 0n)), `${what} v1`).to.deep.equal(await aggLib.findBestCluster(v, v.map((_, i) => i), P)); }
+        }
         const floor = BigInt([0, 1, 30_000][rnd(3)]);
         const c = await scoring.classify(v, floor);
         const rc = refClassify(v, floor);
-        expect([...c.codes].map(Number), `case ${t} codes`).to.deep.equal(rc.codes);
-        expect([...c.med], `case ${t} median`).to.deep.equal(rc.med);
-        expect(c.spread, `case ${t} spread`).to.equal(rc.spread);
+        expect([...c.codes].map(Number), `${what} codes`).to.deep.equal(rc.codes);
+        expect([...c.med], `${what} median`).to.deep.equal(rc.med);
+        expect(c.spread, `${what} spread`).to.equal(rc.spread);
         const late = Array.from({ length: [1, len, len + 2][rnd(3)] }, () => BigInt(rnd(1_000_001)));   // any length
-        expect(Number(await scoring.classifyOne(late, rc.med, rc.spread)), `case ${t} late`).to.equal(klass(dev(late, rc.med), rc.spread));
+        expect(Number(await scoring.classifyOne(late, rc.med, rc.spread)), `${what} late`).to.equal(klass(dev(late, rc.med), rc.spread));
       }
+      // the inputs really cover both rules
+      expect(nd).to.be.greaterThan(200);
+      expect(oneD).to.be.greaterThan(80);
+      expect(v1checks).to.be.greaterThan(10);
+      expect(brute).to.be.greaterThan(40);
+    });
+
+    it("aggregate: mixed lengths 1..20 (modal ties to the longer), the seeded tie order, mean and classes", async () => {
+      const { scoring } = core;
+      let mixed = 0, tied = 0;
+      for (let t = 0; t < 150; t++) {
+        const n = 1 + rnd(27);
+        const L = [1 + rnd(20), 1 + rnd(20), 1 + rnd(20)];
+        const v = Array.from({ length: n }, () => Array.from({ length: L[rnd(3)] }, () => (rnd(10) ? BigInt(rnd(t % 3 ? 1_000_001 : 3)) : MAX)));
+        const P = n === 1 ? 1 : 2 + rnd(n - 1);
+        const ids = [...Array(n).keys()].map(() => rnd(50));
+        const seed = seedOf(t);
+        const w = refNormalize(v);
+        if (new Set(v.map((x) => x.length)).size > 1) mixed++;
+        const counts = {}; for (const x of v) counts[x.length] = (counts[x.length] || 0) + 1;
+        const top = Math.max(...Object.values(counts)); if (Object.values(counts).filter((c) => c === top).length > 1) tied++;
+        const a = await scoring.aggregate(v, P, 30_000n, seed, ids);
+        const inC = n === 1 ? [true] : refAggregateCluster(w, P, seed, ids);
+        const cnt = BigInt(inC.filter(Boolean).length);
+        expect([...a.inCl], `case ${t} cluster`).to.deep.equal(inC);
+        expect([...a.agg], `case ${t} mean`).to.deep.equal(w[0].map((_, j) => w.reduce((s, x, i) => (inC[i] ? s + x[j] : s), 0n) / cnt));
+        const rc = refClassify(w, 30_000n);
+        expect([...a.codes].map(Number), `case ${t} codes`).to.deep.equal(rc.codes);
+        expect(a.spread, `case ${t} spread`).to.equal(rc.spread);
+        expect([...(await scoring.tieOrder(seed, ids))].map(Number), `case ${t} order`).to.deep.equal(refTieOrder(seed, ids));
+      }
+      expect(mixed).to.be.greaterThan(100);
+      expect(tied).to.be.greaterThan(10);
+    });
+
+    it("overflow bounds: 255 one-value reveals at 0 / 1e34, and 20 coordinates at 0 / 1e34 with large P", async () => {
+      const { scoring } = core;
+      for (const n of [200, 255]) {
+        const v = Array.from({ length: n }, () => [rnd(2) ? MAX : MAX - BigInt(rnd(2))]);
+        for (const P of [2, 100, n]) expect([...(await scoring.bestCluster(v, P))]).to.deep.equal(refCluster(v, P));
+        const a = await scoring.aggregate(v, n, 0n, seedOf(n), [...Array(n).keys()]);
+        expect(a.agg[0]).to.equal(v.reduce((s, x) => s + x[0], 0n) / BigInt(n));
+      }
+      const v = Array.from({ length: 40 }, (_, i) => Array.from({ length: 20 }, () => (i % 2 ? MAX : 0n)));
+      for (const P of [2, 21, 40]) expect([...(await scoring.bestCluster(v, P))]).to.deep.equal(refCluster(v, P));
+    });
+
+    it("edge cases: n = 1 / 2, P = 0 / 1 / n / past n, all equal, duplicates beyond P", async () => {
+      const { scoring } = core;
+      const a1 = await scoring.aggregate([[5n, 6n]], 1, 0, seedOf(0), [3]);
+      expect([...a1.inCl]).to.deep.equal([true]);
+      expect([...a1.agg]).to.deep.equal([5n, 6n]);
+      await expect(scoring.bestCluster([[1n]], 2)).to.be.revertedWithCustomError(scoring, "NeedTwo");
+      for (const P of [0, 1, 2, 3, 9]) expect([...(await scoring.bestCluster([[1n, 2n], [3n, 4n]], P))]).to.deep.equal([true, true]);
+      const same = Array.from({ length: 7 }, () => [7n, 7n]);
+      expect([...(await scoring.bestCluster(same, 3))]).to.deep.equal([true, true, true, false, false, false, false]);
+      const same1 = Array.from({ length: 7 }, () => [7n]);
+      expect([...(await scoring.bestCluster(same1, 3))]).to.deep.equal([true, true, true, false, false, false, false]);
+      // a centre with more zero-distance duplicates before it than P is left out of its own group;
+      // an earlier centre forms the same zero-score group first, so the result is unaffected
+      const d = [[9n, 9n], [1n, 1n], [1n, 1n], [1n, 1n], [5n, 5n]];
+      expect([...(await scoring.bestCluster(d, 2))]).to.deep.equal([false, true, true, false, false]);
+    });
+
+    it("limits: the library refuses values above 1e34 or more than 20; the owner can't set N above 40 or a floor above 1e34", async () => {
+      const { scoring } = core;
+      await expect(scoring.bestCluster([[MAX + 1n], [0n], [1n]], 2)).to.be.revertedWithCustomError(scoring, "OutOfRange");
+      await expect(scoring.classify([[0n, MAX + 1n], [0n, 0n]], 0)).to.be.revertedWithCustomError(scoring, "OutOfRange");
+      await expect(scoring.bestCluster([Array(21).fill(0n), Array(21).fill(1n)], 2)).to.be.revertedWithCustomError(scoring, "OutOfRange");
+      await expect(scoring.aggregate([[1n], [2n]], 2, 0, seedOf(1), [0])).to.be.revertedWithCustomError(scoring, "LengthMismatch");
+      await expect(agg.setConfig(50, 45, 41, 17, 600, 155)).to.be.revertedWithCustomError(agg, "InvalidConfig");
+      await agg.setConfig(50, 45, 40, 17, 600, 155);
+      const p = [await agg.bonusMultiplier(), await agg.settlePerRequest(), await agg.dispatchGas(), 0, await agg.maxOracleFee()];
+      await expect(agg.setParams(p[0], p[1], p[2], MAX + 1n, p[4])).to.be.revertedWithCustomError(agg, "InvalidConfig");
+      await agg.setParams(p[0], p[1], p[2], MAX, p[4]);
     });
 
     it("two identical extreme reveals do not pull the cluster away from an honest majority (item 10)", async () => {
@@ -672,25 +813,60 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
       }
     });
 
-    it("aggregate resizes mixed-length reveals as v1's normalizeToModal, then clusters, averages and classifies", async () => {
-      const { scoring, aggLib } = core;
-      for (let t = 0; t < 120; t++) {
-        const n = 1 + rnd(27);
-        const lens = [2 + rnd(3), 2 + rnd(3)];
-        const v = Array.from({ length: n }, () => Array.from({ length: lens[rnd(4) ? 0 : 1] }, () => BigInt(rnd(t % 2 ? 5 : 1_000_001))));
-        const P = n === 1 ? 1 : 2 + rnd(n - 1);
-        const floor = 30_000n;
-        const [norm] = await aggLib.normalizeToModal(v);
-        const w = norm.map((x) => [...x]);
-        const a = await scoring.aggregate(v, P, floor);
-        const inC = n === 1 ? [true] : refCluster(w, P);
-        const cnt = BigInt(inC.filter(Boolean).length);
-        expect([...a.inCl], `case ${t} cluster`).to.deep.equal(inC);
-        expect([...a.agg], `case ${t} mean`).to.deep.equal(w[0].map((_, j) => w.reduce((s, x, i) => (inC[i] ? s + x[j] : s), 0n) / cnt));
-        const rc = refClassify(w, floor);
-        expect([...a.codes].map(Number), `case ${t} codes`).to.deep.equal(rc.codes);
-        expect(a.spread, `case ${t} spread`).to.equal(rc.spread);
+    it("cluster ties follow a seeded order of the slots, not who revealed first", async () => {
+      // models often give round numbers: 6 reveals of 800000 at P = 3. The same reveals in another
+      // order, from the same slots, give the same members; and the members are not simply the first
+      const { scoring } = core;
+      const seed = seedOf(7);
+      for (const v of [[[790_000n], [800_000n], [800_000n], [800_000n], [800_000n], [800_000n], [800_000n]],
+                       [[790_000n, 210_000n], [800_000n, 200_000n], [800_000n, 200_000n], [800_000n, 200_000n], [800_000n, 200_000n], [800_000n, 200_000n], [800_000n, 200_000n]]]) {
+        const slots = [4, 0, 5, 2, 6, 1, 3];
+        const a = await scoring.aggregate(v, 3, 30_000n, seed, slots);
+        const members = slots.filter((_, i) => a.inCl[i]).sort();
+        const rev = [...v.keys()].reverse();
+        const b = await scoring.aggregate(rev.map((i) => v[i]), 3, 30_000n, seed, rev.map((i) => slots[i]));
+        expect(rev.map((i) => slots[i]).filter((_, k) => b.inCl[k]).sort()).to.deep.equal(members);
+        expect(members.length).to.equal(3);
+        expect(members).to.not.include(4);                        // the 790000 outlier
       }
+    });
+
+    it("exactly half one-value reveals cannot cut a two-outcome round to one outcome (modal ties go to the longer)", async () => {
+      const { scoring } = core;
+      const v = [[900_000n], [900_000n], [600_000n, 400_000n], [610_000n, 390_000n]];
+      const a = await scoring.aggregate(v, 3, 30_000n, seedOf(2), [0, 1, 2, 3]);
+      expect(a.agg.length).to.equal(2);
+      // full round, Small jury (6/5/4/3): all 6 commit, so 5 are promoted with at least 2 of each kind;
+      // two one-value reveals and two pairs are counted
+      const round = await drv.request();
+      await drv.answerAll(round);
+      for (const sl of Object.keys(round.slots).map(Number)) await drv.commit(round, sl, sl % 2 ? [900_000n] : V(600_000 + sl * 1000));
+      if (!round.closing) { await time.increase(Number(await agg.tPlus()) + 1); await drv.closeCommits(round); }
+      await drv.promote(round);
+      const prom = drv.promotedSlots(round);
+      const odd = prom.filter((x) => x % 2), even = prom.filter((x) => x % 2 === 0);
+      expect(odd.length >= 2 && even.length >= 2).to.equal(true);
+      for (const x of [odd[0], even[0], odd[1], even[1]]) await drv.reveal(round, x);
+      const [aggV, , valid] = await agg.getEvaluation(round.aggId);
+      expect(valid).to.equal(true);
+      expect(aggV.length).to.equal(2);
+      expect((await agg.getOutcomeScores(round.aggId, 1))[1]).to.equal(true);
+    });
+
+    it("a one-number round: single-value reveals are counted and finalize with the exact 1-D cluster", async () => {
+      // N = 4, P = 3: reveals 60, 61, 90 and 62 points; the cluster is 60, 61, 62 and the outlier is far
+      const pts = [600_000n, 610_000n, 900_000n, 620_000n];
+      const round = await drv.fullRound({ vectors: (sl) => [pts[sl % 4]], lateReveals: false, settle: false });
+      const [scores, valid] = await agg.getOutcomeScores(round.aggId, 0);
+      expect(valid).to.equal(true);
+      expect(scores.length).to.equal(4);
+      const [agg1] = await agg.getEvaluation(round.aggId);
+      const counted = [...scores];
+      const far = counted.reduce((m, x) => (x > m ? x : m), 0n);
+      const inC = counted.filter((x) => x !== far);
+      expect(agg1.length).to.equal(1);
+      expect(agg1[0]).to.equal(inC.reduce((t, x) => t + x, 0n) / 3n);
+      expect((await agg.getOutcomeScores(round.aggId, 1))[1]).to.equal(false);   // only outcome 0 exists
     });
   });
 });

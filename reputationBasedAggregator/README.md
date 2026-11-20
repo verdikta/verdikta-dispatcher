@@ -13,7 +13,7 @@ arbiter node, the operator contract and the scripts.
 | `ReputationKeeper` | Arbiter registry, stake, unbonding, burns, two scores (Table 1 via `applyOutcomes`, −400 for a live non-committer when the round failed for lack of commits), blocks / bans / 90-day decay (Table 2), hash-chain health calls (each reveal recorded with its block and time), freeze and chain rotation, reputation-weighted selection from a bounded walk of the class list in random order, and the beacon pick. Selection state is checkpointed by block, so a draw reads the state as of the request block (item 9). Answers `isContractApproved`, which every deployed `ArbiterOperator` uses to gate requests |
 | `ReputationAggregator` | Two-phase request (escrow at block B; `drawJury` from B+2, seeded by `blockhash(B+1)`, read through EIP-2935 after 256 blocks; 2 x fee draw reward; `sealSeed`, `cancelUnsealed`), the optional beacon stage, M+ / T+ promotion (closes at the M+-th commit or after T+ with at least M; `promote` from C+2 draws M of all commits), late reveals, settlement after the deadline with one batched keeper call, a settlement queue drained by new requests, `getOutcomeScores` (item 11) |
 | `JuryBeacons` | Item 9's beacon flag, kept out of the aggregator for bytecode: picks 4 beacons through the keeper (which sends each a health call), reads their answers from the keeper, and reports the mix of the first 2 |
-| `ScoringLib` | External library: finalization in one call (v1's length normalization, cluster, mean, quality classes), the promotion draw. The cluster is item 10's nearest-neighbour rule, which replaces v1's greedy one |
+| `ScoringLib` | External library: finalization in one call (v1's length normalization, cluster, mean, quality classes), the promotion draw. One-number answers get the exact 1-D cluster; longer vectors item 10's nearest-neighbour rule, which replaces v1's greedy one |
 | `AggregatorLib` | External library: v1's helpers plus the commit payload builder and a one-call CID/salt parser |
 | `test/TestOperator` | Gas-faithful stand-in for Chainlink's Operator (the real one pins solc 0.8.19), with `ArbiterOperator`'s keeper gate (on by default in the tests). `setBomb` makes it burn all gas |
 | `test/MockHistory` | Stand-in for the EIP-2935 history contract, installed at its address (Hardhat's stub reverts) |
@@ -42,9 +42,13 @@ Tests:
   - M+ / T+ promotion, finalize, late reveals and settlement;
   - the 0..1,000,000 score scale, failed rounds, the freeze dodge, the queue;
   - ETH solvency, item 11 scores, gas griefing, the operator gate;
-  - clustering, quality classes and normalization against a JavaScript reference (and v1's
-    `AggregatorLib` where they must agree), on 420 reproducible random inputs built for ties and
-    duplicates; identical extreme reveals don't pull the cluster from an honest majority.
+  - clustering, quality classes, normalization and the tie order against JavaScript references
+    (and v1's `AggregatorLib` where they must agree): 550 reproducible inputs from a uniform
+    generator, built for ties, duplicates and extremes, with coverage counts for each rule and
+    brute force over every subset for one-number answers; the overflow bounds and the library's
+    input limits; identical extreme reveals don't pull the cluster from an honest majority; ties
+    don't follow reveal order; exactly half one-value reveals can't cut a two-outcome round; a full
+    one-number round.
 - `beacons.test.js`:
   - escrow;
   - the pick and the values, which depend only on the state as of B and B+1 (earlier answers and
@@ -55,8 +59,8 @@ Tests:
     only and same-block ties, the missed quorum and how cheap withholding is;
   - the pool shortage, a jury shortage after the stage, owner changes mid-round, the requester's
     priority, cancel, and a full round with solvency.
-- `gas.test.js`: full rounds for item 15's Small, Medium, Large and Jumbo (with and without beacons)
-  against a 300-arbiter pool, the per-tx cap, and selection cost against pool size.
+- `gas.test.js`: full rounds for item 15's Small, Medium, Large and Jumbo (with and without beacons,
+  with one-number answers, and with 20-outcome answers) against a 300-arbiter pool, the per-tx cap, and selection cost against pool size.
 
 ## Deploy
 
@@ -108,17 +112,29 @@ so each class is a separate deployment. Local networks get a `MockLinkToken` and
   shortlist (60) or `maxScan` (400) entries, and after 2 × min(n, `maxScan`) draws it finishes with
   a sweep of the unvisited entries, so it stays bounded and can reach every entry. About 270 gas per
   entry visited, at any pool size. `pickBeacons` uses the same walk.
-- **The cluster is the tightest nearest-neighbour group.** For each counted reveal, its group is it
-  and its P − 1 nearest; the cluster is the group with the smallest sum of pairwise distances (ties
-  to the earlier reveal). v1's greedy rule let identical colluders seed the cluster and pull its
+- **One-number answers.** A reveal may hold a single value. When that is the most common length among
+  the counted reveals (the requester's question asks for one number), the cluster is exact: the P
+  consecutive values, in sorted order, with the smallest spread (the least trimmed squares location
+  estimate). Longer reveals are cut to their first value. Read the scores with
+  `getOutcomeScores(aggId, 0)`. Two-number reveals stay two-dimensional, since nothing says the two
+  add up. When two lengths are equally common the longer wins (v1 took the shorter), so exactly half
+  the reveals can't cut a round's outcomes: shorter reveals are zero-filled instead.
+- **Otherwise the cluster is the tightest nearest-neighbour group.** For each counted reveal, its group is it
+  and its P − 1 nearest; the cluster is the group with the smallest sum of pairwise distances. v1's greedy rule let identical colluders seed the cluster and pull its
   mean (4 colluders at Jumbo: about 6 points; now about 1). With 2 colluders among Small's or
   Medium's 4 counted reveals no cluster rule helps, an exact one included. A cartel that copies the
   expected consensus still takes more than its share of the bonus under any rule that rewards the
-  tightest group. For P = 2 the cluster is v1's closest pair.
-- **The finalizing reveal pays for clustering.** The N-th counted reveal's `fulfill` runs it: 2.4–2.5M
-  gas at Jumbo with two-outcome vectors, about 5M (estimated) at the maximum 20 outcomes; 0.55M at
-  Small. The arbiter node's job gas limit must cover it, or that reveal reverts and is lost, and so
-  does every later one.
+  tightest group. For P = 2 it is v1's closest pair, up to ties.
+- **Cluster ties go by a seeded order of the slots, not by who revealed first.** Models often give
+  round numbers, so equal scores are common, and under reveal order the bonus would go to the
+  fastest. The order is keccak256(sealed hash, slot): fixed at the draw, and random rather than the
+  selection order (which favours high-weight arbiters).
+- **The finalizing reveal pays for clustering.** The N-th counted reveal's `fulfill` runs it. At
+  Jumbo: 1.30M gas with one-number answers, 2.5–2.6M with two-outcome vectors, 6.9M at the maximum
+  20 outcomes (all measured); 0.56M at Small. The arbiter node's job gas limit must cover the largest
+  answer a class allows, with margin, or that reveal reverts and is lost, and so does every later
+  one. `setConfig` caps N at 40 (at 20 outcomes, clustering 40 reveals is about 8M gas) and
+  `setParams` caps `spreadFloor` at 1e34 (a larger floor would be cut when stored, or overflow).
 - **Fewer than K eligible arbiters at B:** the draw fails the round and refunds (no jury could be
   drawn, so it is no re-roll). Slots never repeat: a repeated arbiter would vote and be charged twice.
 - **`promote` pays its caller 1 x eff** (`promoteRewardFees`, in the escrow), so third parties call it

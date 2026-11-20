@@ -812,6 +812,27 @@ scores N(80, 3), the cartel's best value per rule (a prototype simulation, not c
   14.8%). Any rule that rewards the tightest group rewards identical reports at the centre. Only a
   different bonus rule (the band rule: split among all close reveals) changes that.
 - **With no cartel** its mean sits a little nearer the honest median (0.57 points against 0.75).
+- **One-number answers (adopted 2026-11-19).** In one dimension the tightest P values are always P
+  consecutive values once sorted, so the exact cluster is a sort and one pass (the least trimmed
+  squares location estimate, coverage P; breakdown point (N − P + 1) / N: 41% at Jumbo, 31% at
+  Large, 50% at Small and Medium). It matched brute force over every subset on 3,000 inputs and
+  matched nearest-neighbour's robustness at every size. Two-number reveals can't use it, because
+  nothing says the two add up, so the reveal shape decides: a reveal may now hold one value, and a
+  round whose most common reveal length is 1 gets the exact cluster (89k gas at N = 27, against
+  1.28M for nearest-neighbour; the Jumbo finalizing reveal is 1.30M). The arbiters return one
+  value for one-number questions (item 16); BountyEscrow can then ask for the FUND score alone.
+- **Fixes from the independent review (2026-11-19):**
+  - The clustering tests used a float LCG whose low bits were lost (`rnd(8)` was 0 in 99.6% of
+    calls), so they ran almost only one-value cases and never reached the nearest-neighbour path or
+    the v1 comparison. Replaced by mulberry32 with coverage counts; the earlier scratch fuzzes behind
+    the "identical results" claims had the same flaw, and the reviewer's uniform fuzz confirmed them.
+  - Exactly half the reveals could cut a two-outcome round to one number (most-common-length ties
+    went to the shorter, and one-value reveals became legal). Ties now go to the longer length.
+  - Cluster ties followed reveal order, so equal scores paid the bonus to the fastest. They now go
+    by keccak256(sealed hash, slot).
+  - The 20-outcome Jumbo finalizing reveal is 6.9M (measured), not the estimated 5M; `gas.test.js`
+    pins it. `setConfig` caps N at 40 and `setParams` caps `spreadFloor` at 1e34. The library's
+    public functions check their own input limits (at most 20 values of at most 1e34).
 - **Gas, as adopted:** `bestCluster` is 1.28M at N = 27, P = 17 against the optimized greedy's 0.39M
   (v1's greedy: 5.55M). The Jumbo finalizing reveal is 2.4–2.5M (greedy optimized: 1.69M; before
   either change: 2.88M). Each centre keeps its P nearest sorted while scanning its row, and the
@@ -1229,8 +1250,8 @@ round at 0.006 gwei.
     updates for all 50 slots (item 1) and bonus credits. Measure it the same way. Consider
     finalizing in a separate permissionless call. Measured (2026-11-19): 2.4–2.5M gas in the v2
     contracts with two-outcome vectors and nearest-neighbour clustering (score updates moved to
-    settlement), about 5M estimated at 20 outcomes. Check the arbiter job's gas limit against it
-    (item 16).
+    settlement), 1.30M with one-number answers, 6.9M at 20 outcomes. Check the arbiter job's gas
+    limit against the largest answer a class allows (item 16).
   - **The consumer.** BountyEscrow's read of `getOutcomeScores` at N = 27 is about 146k gas
     (item 11's fit).
 - **Response timeout.** The round waits for the 38th commit and the 27th reveal. Set
@@ -1769,9 +1790,10 @@ The README lists the behaviour; the points below changed or sharpened the design
   head applies to later calls only.
 - **Measured gas, 300-arbiter pool, one full round, all transactions, at 0.006 gwei** (re-measured
   2026-11-18 with the operators' keeper gate and checkpointed chain heads):
-  - Small $0.087, Medium $0.099, Large $0.245, Jumbo $0.553 without beacons and $0.563 with them
-    (2026-11-19, nearest-neighbour clustering).
-  - The finalizing reveal is 0.55M at Small, 1.10M at Large and 2.4–2.5M at Jumbo (before the
+  - Small $0.087, Medium $0.100, Large $0.246, Jumbo $0.555 without beacons and $0.565 with them
+    (2026-11-19, after the clustering review); Jumbo with beacons and one-number answers $0.538,
+    Jumbo with 20-outcome answers $0.764.
+  - The finalizing reveal is 0.56M at Small, 1.14M at Large and 2.5–2.6M at Jumbo (before the
     clustering work: 0.58M, 1.28M and 2.88M). `ScoringLib`'s loops read memory directly, and
     `aggregate` does v1's length normalization itself, saving a library call (the aggregator shrank
     306 B). At N = 27, P = 17: `bestCluster` 1.28M (nearest-neighbour; the greedy rule rewritten the
@@ -2087,6 +2109,9 @@ What each consumer needs (the files are where the v1 calls are today):
   - Answer every keeper `HealthCall` within 60 s with the next chain value (`answerHealthCall`),
     and rotate before the chain runs out (`rotateChain`). Beacon calls are ordinary health calls.
   - The commit / reveal wire format is unchanged. `aggId` is now sequential; check any parsing.
+  - One-number questions: return a single value (`[score]`). Skip any rescaling of outcome scores to
+    add up to 1,000,000 for them, or every answer would be 1,000,000. Decide how a query manifest
+    says it wants one number.
   - Each operator owner calls `addReputationKeeper(<v2 keeper>)` on its `ArbiterOperator`.
 - **Example arbiters** (`applications/example-arbiters`).
   - Registration: `arbiterRegistration.js`, `RegisterArbiterModal.jsx`, `arbiterContracts.js`.
@@ -2105,6 +2130,9 @@ What each consumer needs (the files are where the v1 calls are today):
     - An undrawn round never times out.
     - Some outcomes refund nothing, and refunds go to credit.
   - Item 12's decision rules use item 11's `getOutcomeScores`.
+  - Ask for the FUND score as a one-number answer (exact 1-D cluster) once the arbiters support
+    it: read `getOutcomeScores(aggId, 0)` and accept a one-value vector where `_scoreVector` now
+    requires exactly `[DONT_FUND, FUND]`.
   - The server and client: `contractService.js`, `verdiktaService.js`, `classPolicy.js`, the job,
     class and analytics routes, `BountyDetails.jsx`, `Blockchain.jsx`. Each class points at its own
     aggregator (item 15).

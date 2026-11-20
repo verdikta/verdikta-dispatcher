@@ -533,7 +533,9 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         // ---------------- reveal (accepted until the deadline, also after finalization)
         if (r.phase != PH_REVEAL && r.phase != PH_FINAL) return;   // incl. CLOSING: no reveal requests yet
         if (sl.flags & (S_PROMOTED | S_REVEALED) != S_PROMOTED) return;
-        if (response.length < 2 || response.length > MAX_LIKELIHOOD_LENGTH) return;
+        // one value (a one-number answer: exact 1-D cluster) up to MAX_LIKELIHOOD_LENGTH; a reveal
+        // always has a CID, so a one-value reveal is never taken for a commit
+        if (response.length == 0 || response.length > MAX_LIKELIHOOD_LENGTH) return;
         if (bytes(cid).length > MAX_REVEAL_CID_LENGTH) return;
         (bool ok, string memory cleanCid, uint256 salt) = AggregatorLib.parseCidSalt(cid);
         if (!ok) return;
@@ -615,10 +617,12 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
     function _finalize(Round storage r, uint256 id) internal {
         uint256 n = r.order.length;
         uint256[][] memory ll = new uint256[][](n);
-        for (uint256 i = 0; i < n; i++) ll[i] = r.likes[r.order[i]];
-        // aggregate resizes the vectors to their most common length first (v1's normalizeToModal)
+        uint256[] memory ids = new uint256[](n);
+        for (uint256 i = 0; i < n; i++) (ll[i], ids[i]) = (r.likes[r.order[i]], r.order[i]);
+        // aggregate resizes the vectors to their most common length first, and breaks cluster ties
+        // by a seeded order of the slots, not by who revealed first
         (bool[] memory inCl, uint256[] memory agg, uint8[] memory codes, uint256[] memory med, uint256 spread) =
-            ScoringLib.aggregate(ll, r.P, spreadFloor);
+            ScoringLib.aggregate(ll, r.P, spreadFloor, r.sealedHash, ids);
         uint96 bonus;
         bytes memory just;
         for (uint256 i = 0; i < n; i++) {
@@ -789,7 +793,8 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
     ///         the closest pair, and the escrow only covers B x P bonuses. T+ (seconds) comes from measured
     ///         honest commit latency (mean + 2 SD) and must be below the timeout.
     function setConfig(uint8 _K, uint8 _M, uint8 _N, uint8 _P, uint40 timeout, uint40 tPlus_) external onlyOwner {
-        if (!(_K >= _M && _M >= _N && _N >= _P && _N >= 1 && (_P >= 2 || _N == 1) && _P >= 1) || tPlus_ == 0 || timeout <= tPlus_)
+        // N <= 40: the N-th reveal finalizes, and at 20 outcomes clustering 40 reveals is ~8M gas
+        if (!(_K >= _M && _M >= _N && _N >= _P && _N >= 1 && _N <= 40 && (_P >= 2 || _N == 1) && _P >= 1) || tPlus_ == 0 || timeout <= tPlus_)
             revert InvalidConfig();
         (K, M, N, P, responseTimeoutSeconds, tPlus) = (_K, _M, _N, _P, timeout, tPlus_);
     }
@@ -800,7 +805,8 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         external
         onlyOwner
     {
-        if (bonusMult > 20 || dispatchGas_ < 100_000 || dispatchGas_ > 2_000_000) revert InvalidConfig();
+        if (bonusMult > 20 || dispatchGas_ < 100_000 || dispatchGas_ > 2_000_000 || spreadFloor_ > MAX_SCORE)
+            revert InvalidConfig();
         (bonusMultiplier, settlePerRequest, dispatchGas, spreadFloor, maxOracleFee) =
             (bonusMult, settlePerReq, dispatchGas_, spreadFloor_, maxOracleFee_);
     }

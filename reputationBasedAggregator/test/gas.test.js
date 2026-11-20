@@ -20,9 +20,13 @@ const CLASSES = [
   { name: "Large (21/16/13/10)", K: 21, M: 16, N: 13, P: 10, timeout: 300, tPlus: 155 },
   { name: "Jumbo (50/38/27/17), no beacons", K: 50, M: 38, N: 27, P: 17, timeout: 600, tPlus: 155 },
   { name: "Jumbo (50/38/27/17), beacons (4 polled, first 2 used)", K: 50, M: 38, N: 27, P: 17, timeout: 600, tPlus: 155, beacons: true },
+  { name: "Jumbo (50/38/27/17), beacons, one-number answers", K: 50, M: 38, N: 27, P: 17, timeout: 600, tPlus: 155, beacons: true, scalar: true },
+  { name: "Jumbo (50/38/27/17), 20-outcome answers (the most a reveal may hold)", K: 50, M: 38, N: 27, P: 17, timeout: 600, tPlus: 155, outcomes: 20 },
 ];
 const mPlus = (c) => c.M + Math.ceil((c.K - c.M) / 2);
 const vecs = (sl) => H.vec(600_000 + (sl % 5) * 10_000);
+const scalars = (sl) => [BigInt(600_000 + (sl % 5) * 10_000)];   // one-number answers (exact 1-D cluster)
+const wide = (sl) => Array.from({ length: 20 }, (_, k) => BigInt(780_000 + ((sl * 7919 + k * 104729) % 60_000)));
 
 function stats(xs) {
   const s = [...xs].sort((a, b) => a - b);
@@ -45,9 +49,10 @@ describe("gas and cost (300-arbiter pool)", function () {
       await core.agg.setConfig(c.K, c.M, c.N, c.P, c.timeout, c.tPlus);
       const drv = new RoundDriver(core, arbs, requester, { beacons: !!c.beacons });
       // three complete rounds, each settled explicitly after its deadline
-      for (let i = 0; i < 3; i++) await drv.fullRound({ vectors: vecs });
+      const vv = c.scalar ? scalars : c.outcomes ? wide : vecs;
+      for (let i = 0; i < 3; i++) await drv.fullRound({ vectors: vv });
       // worst-case request: two due rounds in the queue that this request must settle
-      for (let i = 0; i < 2; i++) await drv.fullRound({ settle: false, vectors: vecs });
+      for (let i = 0; i < 2; i++) await drv.fullRound({ settle: false, vectors: vv });
       await time.increase(c.timeout + 1);
       const r = await drv.requestOnly({ kind: "request (escrow) + settle 2 rounds" });
       expect(r.reqRcpt.logs.filter((l) => l.topics[0] === core.agg.interface.getEvent("RoundSettled").topicHash).length).to.equal(2);

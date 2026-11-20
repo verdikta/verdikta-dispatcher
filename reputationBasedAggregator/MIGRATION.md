@@ -41,6 +41,15 @@ comparing the two ABIs and the code that calls them.
   information. A beacon's value is used, and paid one fee, only if it is among the first 2 revealed
   within 120 s of the start. Answering promptly matters: a slow node loses the payment, and one that
   misses the 60 s call deadline is also frozen until it answers.
+- **One-number answers (new).** A reveal may carry a single value (v1 required at least two). For a
+  question that asks for one number, return `[score]`, not a per-outcome vector: the aggregator
+  clusters a round in one dimension, exactly, when single values are strictly the most common
+  length (on a tie the longer length wins), and cuts any longer reveal to its first value. If the node rescales its outcome scores to add up to
+  1,000,000, a one-outcome question would always score 1,000,000: one-number questions need a
+  score mode that skips that step.
+- **Job gas limit.** The N-th counted reveal finalizes the round and pays for it: at Jumbo 1.3M gas
+  with one-number answers, 2.6M with two outcomes, 6.9M at 20 outcomes. Set the job's gas limit
+  above the largest answer the class allows; a reveal that runs out of gas is lost.
 
 ## BountyEscrow / EvaluationWallet (redeploy; item 9's notes)
 

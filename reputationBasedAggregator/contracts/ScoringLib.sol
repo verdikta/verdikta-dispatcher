@@ -6,10 +6,17 @@ pragma solidity ^0.8.23;
  * @notice Pure helpers for finalization, deployed once and reached by DELEGATECALL so their bytecode
  *         does not count against the aggregator's 24 KB limit.
  *
- *  - bestCluster: TODO item 10's nearest-neighbour cluster, replacing v1's greedy one (closest pair,
- *    then the response with the smallest summed distance). Greedy let colluders with identical
- *    reports seed the cluster wherever they liked and pull its mean: at Jumbo (P = 17 of 27) 4
- *    colluders moved it about 6 points, against about 1 now. For P = 2 both give the closest pair.
+ *  - bestCluster for one-number answers (every vector has length 1, the most common length among
+ *    the counted reveals): the exact cluster. In one dimension the P values with the smallest sum of
+ *    pairwise squared differences are always P consecutive values in sorted order, so it sorts and
+ *    takes the window with the smallest P sum(x^2) - (sum x)^2. That is the least trimmed squares
+ *    location estimate with coverage P (breakdown point (n - P + 1) / n). About 90k gas at n = 27.
+ *
+ *  - bestCluster for longer vectors: TODO item 10's nearest-neighbour cluster, replacing v1's greedy
+ *    one (closest pair, then the response with the smallest summed distance). Greedy let colluders
+ *    with identical reports seed the cluster wherever they liked and pull its mean: at Jumbo
+ *    (P = 17 of 27) 4 colluders moved it about 6 points, against about 1 now. For P = 2 both give
+ *    the closest pair.
  *    The inner loops read memory directly, without bounds checks or checked arithmetic.
  *
  *  - Inputs: every value is at most 1e34 (the aggregator caps reveals at MAX_SCORE), at most 255
@@ -18,8 +25,8 @@ pragma solidity ^0.8.23;
  *    JavaScript reference on random inputs, ties included, and with v1's AggregatorLib where v1 is
  *    meant to agree (normalization, and the cluster at P = 2).
  *
- *  - classify: TODO item 14's quality classes. Reveals are likelihood vectors, so the 1-D rule is
- *    generalised: distance d_i = max_j |x_ij - med_j| against the coordinate-wise median, and
+ *  - classify: TODO item 14's quality classes. For one-number answers this is the 1-D rule; for
+ *    vectors it is generalised: distance d_i = max_j |x_ij - med_j| against the coordinate-wise median, and
  *    spread = max(1.4826 x median_i(d_i), floor). For a single coordinate this is exactly
  *    |score - median| and 1.4826 x MAD. close: d <= 1.5 spread, off: d <= 3 spread, far: beyond.
  */
@@ -31,6 +38,10 @@ library ScoringLib {
     error NeedTwo();
     error LengthMismatch();
     error TooMany();
+    error OutOfRange();
+
+    uint256 internal constant MAX_VALUE = 1e34;   // the aggregator's MAX_SCORE cap
+    uint256 internal constant MAX_LEN = 20;       // the aggregator's MAX_LIKELIHOOD_LENGTH
 
     /**
      * @notice The cluster of P counted reveals (TODO item 10, nearest-neighbour rule). For each reveal
@@ -47,6 +58,7 @@ library ScoringLib {
         if (P > n) P = n;
         if (P < 2) P = 2;
         uint256 len = _sameLength(v);
+        if (len == 1) return _cluster1D(v, P);
         uint256[] memory d = new uint256[](n * n);
         unchecked {
             for (uint256 i = 0; i + 1 < n; i++) {
@@ -120,15 +132,103 @@ library ScoringLib {
         for (uint256 x = 0; x < P; x++) inCluster[group[x]] = true;
     }
 
-    /// @dev the common length of the vectors (they must all have it)
-    function _sameLength(uint256[][] memory v) private pure returns (uint256 len) {
-        len = v[0].length;
-        for (uint256 i = 1; i < v.length; i++) if (v[i].length != len) revert LengthMismatch();
+    /**
+     * @dev Exact cluster of one-value vectors: sort the values (ties to the earlier reveal), then the
+     *      window of P consecutive values with the smallest P sum(x^2) - (sum x)^2, which equals its
+     *      sum of pairwise squared differences; the first window on ties. Values are at most 1e34
+     *      (< 2^114) and n <= 256, so the sums stay below 2^247.
+     */
+    function _cluster1D(uint256[][] memory v, uint256 P) private pure returns (bool[] memory inCluster) {
+        uint256 n = v.length;
+        uint256[] memory keys = new uint256[](n);
+        uint256 bestStart;
+        assembly ("memory-safe") {
+            let pk := add(keys, 32)
+            for { let i := 0 } lt(i, n) { i := add(i, 1) } {
+                // key = value << 8 | index, kept sorted as it is built
+                let key := or(shl(8, mload(add(mload(add(v, add(32, shl(5, i)))), 32))), i)
+                let j := i
+                for {} gt(j, 0) {} {
+                    let prev := mload(add(pk, shl(5, sub(j, 1))))
+                    if lt(prev, key) { break }
+                    mstore(add(pk, shl(5, j)), prev)
+                    j := sub(j, 1)
+                }
+                mstore(add(pk, shl(5, j)), key)
+            }
+            let s1 := 0
+            let s2 := 0
+            for { let i := 0 } lt(i, P) { i := add(i, 1) } {
+                let x := shr(8, mload(add(pk, shl(5, i))))
+                s1 := add(s1, x)
+                s2 := add(s2, mul(x, x))
+            }
+            let best := sub(mul(P, s2), mul(s1, s1))
+            for { let s := 1 } iszero(gt(add(s, P), n)) { s := add(s, 1) } {
+                let out := shr(8, mload(add(pk, shl(5, sub(s, 1)))))
+                let inn := shr(8, mload(add(pk, shl(5, add(s, sub(P, 1))))))
+                s1 := add(sub(s1, out), inn)
+                s2 := add(sub(s2, mul(out, out)), mul(inn, inn))
+                let sc := sub(mul(P, s2), mul(s1, s1))
+                if lt(sc, best) {
+                    best := sc
+                    bestStart := s
+                }
+            }
+        }
+        inCluster = new bool[](n);
+        for (uint256 x = bestStart; x < bestStart + P; x++) inCluster[keys[x] & 0xff] = true;
     }
 
     /**
-     * @dev AggregatorLib.normalizeToModal: resize every vector to the most common length (ties to the
-     *      smaller), truncating or zero-filling. Returns `v` itself when the lengths already agree.
+     * @notice The order in which `aggregate` breaks cluster ties: positions 0..n-1 (n <= 256) sorted
+     *         by the top 248 bits of keccak256(abi.encode(seed, ids[i])), then by position.
+     */
+    function tieOrder(bytes32 seed, uint256[] memory ids) public pure returns (uint256[] memory perm) {
+        uint256 n = ids.length;
+        if (n > 256) revert TooMany();
+        perm = new uint256[](n);
+        assembly ("memory-safe") {
+            let pp := add(perm, 32)
+            mstore(0, seed)
+            for { let i := 0 } lt(i, n) { i := add(i, 1) } {
+                mstore(32, mload(add(ids, add(32, shl(5, i)))))
+                let key := or(shl(8, shr(8, keccak256(0, 64))), i)   // hash's top 248 bits, then position
+                let j := i
+                for {} gt(j, 0) {} {
+                    let prev := mload(add(pp, shl(5, sub(j, 1))))
+                    if lt(prev, key) { break }
+                    mstore(add(pp, shl(5, j)), prev)
+                    j := sub(j, 1)
+                }
+                mstore(add(pp, shl(5, j)), key)
+            }
+            for { let i := 0 } lt(i, n) { i := add(i, 1) } {
+                let q := add(pp, shl(5, i))
+                mstore(q, and(mload(q), 0xff))
+            }
+        }
+    }
+
+    /// @dev the common length of the vectors (they must all have it), checking the limits the
+    ///      unchecked loops rely on: at most MAX_LEN values, each at most MAX_VALUE. The aggregator
+    ///      always meets them; the check keeps a direct call from getting a silently wrong answer.
+    function _sameLength(uint256[][] memory v) private pure returns (uint256 len) {
+        len = v[0].length;
+        if (len > MAX_LEN) revert OutOfRange();
+        for (uint256 i = 0; i < v.length; i++) {
+            uint256[] memory x = v[i];
+            if (x.length != len) revert LengthMismatch();
+            for (uint256 j = 0; j < len; j++) if (x[j] > MAX_VALUE) revert OutOfRange();
+        }
+    }
+
+    /**
+     * @dev Resize every vector to the most common length, truncating or zero-filling, as v1's
+     *      AggregatorLib.normalizeToModal but with ties going to the LONGER length: cutting a vector
+     *      drops outcomes a consumer reads, while zero-filling keeps every index valid. Otherwise
+     *      exactly half the reveals could turn a two-outcome round into a one-number round (or cut
+     *      any longer one). Returns `v` itself when the lengths already agree.
      */
     function _normalize(uint256[][] memory v) private pure returns (uint256[][] memory out) {
         uint256 n = v.length;
@@ -148,7 +248,7 @@ library ScoringLib {
             uint256 li = v[i].length;
             uint256 c;
             for (uint256 j = 0; j < n; j++) if (v[j].length == li) c++;
-            if (c > bestCount || (c == bestCount && li < modalLen)) {
+            if (c > bestCount || (c == bestCount && li > modalLen)) {
                 bestCount = c;
                 modalLen = li;
             }
@@ -165,19 +265,31 @@ library ScoringLib {
 
     /**
      * @notice Everything finalization computes from the counted reveals, in one call to keep the
-     *         aggregator small: the vectors resized to their most common length (as v1's
-     *         normalizeToModal), the cluster (P closest; a single reveal is its own cluster), the
-     *         cluster's coordinate-wise mean, and the quality classes.
+     *         aggregator small: the vectors resized to their most common length (_normalize), the
+     *         cluster (a single reveal is its own cluster), the cluster's coordinate-wise mean, and the
+     *         quality classes.
+     * @param seed ties in the cluster go by keccak256(seed, ids[i]), not by position in `v`: the
+     *        aggregator passes the round's sealed hash. Reveal order is an arbiter's to choose (speed,
+     *        gas price), so tied scores (common: models often give round numbers) would otherwise pay
+     *        the bonus to the fastest.
+     * @param ids each reveal's slot, fixed at the draw; the seed makes their order random rather
+     *        than the selection order (which favours high-weight arbiters).
      */
-    function aggregate(uint256[][] memory v, uint256 P, uint256 floor_)
+    function aggregate(uint256[][] memory v, uint256 P, uint256 floor_, bytes32 seed, uint256[] memory ids)
         public
         pure
         returns (bool[] memory inCl, uint256[] memory agg, uint8[] memory codes, uint256[] memory med, uint256 spread)
     {
         v = _normalize(v);
         uint256 n = v.length;
+        if (n != ids.length) revert LengthMismatch();
         if (n >= 2) {
-            inCl = bestCluster(v, P);
+            uint256[] memory perm = tieOrder(seed, ids);
+            uint256[][] memory w = new uint256[][](n);
+            for (uint256 i = 0; i < n; i++) w[i] = v[perm[i]];
+            bool[] memory c = bestCluster(w, P);
+            inCl = new bool[](n);
+            for (uint256 i = 0; i < n; i++) if (c[i]) inCl[perm[i]] = true;
         } else {
             inCl = new bool[](n);
             if (n == 1) inCl[0] = true;
