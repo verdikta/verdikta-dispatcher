@@ -5,9 +5,90 @@ bottom; check items off as they land.
 
 ---
 
+## What's left (2026-11-20)
+
+The v2 contracts on the `beacon` branch implement items 1, 2, 6, 7, 9, 10, 11 and 14. Nothing that
+calls them is ported yet. The numbered items below hold the details; this list is the summary.
+
+### Contracts: still to build or decide before the v2 deploy
+v2 is a breaking redeploy, so changes to the request or the wire format cost least now.
+- **Item 8, the requester-set fee floor.** It is not in v2, and the class limits in items 13 and 15
+  assume it (Option A: $0.25 per arbiter). It needs:
+  - `minOracleFee` in the request and in `maxTotalFee`;
+  - payment of `max(fee, minFee)`;
+  - keeper scoring on that amount, plus the fix for the boost discontinuity;
+  - BountyEscrow passing the floor through.
+
+  README's "Not implemented" doesn't list it yet.
+- **Items 4 and 5: a 128-bit salt, and Keccak instead of SHA-256 for commits.** Both change the
+  node's wire format. Do them now, alongside the node work in item 16, or decide to keep v1's format.
+- **Item 3, the refund beneficiary (`refundTo`).** Optional. It would let BountyEscrow drop the
+  per-submission `EvaluationWallet`. Decide before porting BountyEscrow.
+- **Open decisions:**
+  - **Bonus capture by a mimic cartel** (items 10 and 13). Identical reports at the consensus take
+    23.5% of Jumbo bonus slots against a fair 14.8%, and no clustering rule changes that. Only a
+    bonus rule can, such as splitting the bonus among all close reveals.
+  - **The aggregate `getEvaluation` reports:** the cluster mean, as now, or the mean of all close
+    reveals.
+  - **−400 for a beacon that withholds** when the stage misses its quorum (deferred, 2026-11-19).
+  - **The abstain dodge** (item 14): a cooldown after a late answer, or counting freezes in failed
+    rounds as offenses. Simulate first.
+  - **Item 7's self-service `requestHealthCall`:** not built. Recovery relies on a late answer to the
+    outstanding call, or on the owner's `sendHealthCalls`. Decide whether that is enough.
+  - **The beacon flag for Medium and Large** (item 15): allow it per bounty, or Jumbo only.
+
+### Arbiter node (item 16; first, since every arbiter freezes without it)
+- Generate and store a hash chain, and register with `registerArbiter(..., chainHead)`.
+- Answer `HealthCall`s within 60 s, and rotate the chain with `rotateChain`.
+- One-number answers:
+  - return `[score]`, with no rescaling to 1,000,000;
+  - decide how a query manifest asks for one number.
+- Set the job's gas limit above the largest finalizing reveal the class allows. At Jumbo that is
+  1.3M gas with one-number answers, 2.6M with two outcomes and 6.9M with 20 outcomes.
+- Check any parsing of `aggId`, which is now sequential.
+- Each operator owner calls `addReputationKeeper(<v2 keeper>)`.
+
+### Consumers (items 12, 15 and 16)
+- **BountyEscrow.** The v2 ABI (`MIGRATION.md`), item 12's Q-of-N rules on `getOutcomeScores`, the
+  class presets (K/M/N/P, Q, R, fee floor, bond and beacon flag), one aggregator per class, and the
+  FUND score as a one-number answer. Its server must call `drawJury` and `promote` promptly.
+- **Example arbiters and the example frontend:** registration, exit, views, and the new request flow
+  (request, `drawJury` at B+2, `promote`, result).
+- **Ops scripts.** Port them (`MIGRATION.md` table), including `deploy_aggregatorOnly.sh`,
+  `size-contracts.sh` and `verify.sh`, and update the docs site.
+
+### Testnet (item 16)
+- Deploy to Base Sepolia and run nodes on the `beacon` branch. Done when a Small round and a Jumbo
+  round with beacons complete end to end through BountyEscrow, including a failed round and a
+  settlement.
+- Re-measure with a real `ArbiterOperator`; the figures here come from the test stand-in.
+  - Jumbo's draw: 13.4–13.8M of the 16.8M cap.
+  - `promote`: 5.9M.
+  - The finalizing reveal.
+  - A health answer: 123k.
+
+### Measurements and models before launch (items 13, 14 and 15)
+- **Noise and no-shows.** Re-measure arbiter noise and no-show rates, and re-size the classes. The
+  measured SD-equivalent is 7.1 against the SD 3 assumed, and SD ≥ 5 breaks Option A.
+- **Pool size.** Re-run the sizing at the real pool size: 32 arbiters are registered, against the
+  300 eligible assumed.
+- **Scoring rules.** Check the point values and the 1.5 / 3 spread cutoffs against real score
+  distributions.
+- **Timing.**
+  - Measure T+ for the code classes and a larger pool.
+  - Set each class's response timeout from measured latency at its depth.
+- **The promotion draw.** Test its distribution.
+- **Scripts.** Fold item 12 and 13's search into `scripts/selection_randomness_risk.py`, adding
+  weighted selection and the `--config` check.
+- **Bounty UI and docs.** The class presets, plus each class's expected cost and rounds while
+  blocked. Keep Medium offered at about $1K.
+
+---
+
 ## 1. Batch the keeper calls in finalization to cut gas
 
-**Status:** not started
+**Status:** done in the v2 contracts: score updates moved from finalization to settlement, which makes
+one batched keeper call carrying every slot's outcome code.
 **Scope:** `ReputationAggregator.sol` + `ReputationKeeper.sol` (both must change together)
 
 ### Problem
@@ -56,7 +137,8 @@ gas optimization of how the existing per-oracle score updates are dispatched.
 
 ## 2. Make oracle selection cost independent of registry size
 
-**Status:** not started
+**Status:** done in the v2 contracts: a list per class, walked in random order and bounded by `maxScan`.
+Selection at K = 50 is 2.9M gas with 300 or 3,000 arbiters.
 **Scope:** `ReputationKeeper.sol` (selection indexing) — keeper change
 
 ### Problem
@@ -207,7 +289,9 @@ no-show.
 
 ## 6. Verifiable entropy from arbiter hash chains, to stop selection steering
 
-**Status:** not started (design discussed 2026-10-30)
+**Status:** design discussed 2026-10-30. Implemented in the v2 contracts as item 9's beacon flag: hash
+chains registered with the arbiter, values revealed one step per health call, and the first 2 of 4
+beacon values mixed into the draw seed. Arbiter node not started (item 16).
 **Scope:** `ReputationAggregator.sol` + `ReputationKeeper.sol` + arbiter node (new request mode)
 
 ### Problem
@@ -304,7 +388,10 @@ redeploy of both contracts.
 
 ## 7. Freeze arbiters that fail a hash-chain call; unfreeze on answer
 
-**Status:** not started (design discussed 2026-10-30)
+**Status:** design discussed 2026-10-30. Implemented in the v2 contracts with item 14: health calls
+with a 60 s deadline, a separate frozen state, and unfreezing on a late answer. Not built: the
+self-service `requestHealthCall` (the owner's `sendHealthCalls` stands in). Arbiter node not
+started (item 16).
 **Scope:** `ReputationKeeper.sol` + `ReputationAggregator.sol` + arbiter node (shares item 6's request mode)
 
 ### Problem
@@ -867,7 +954,8 @@ per-round cost (`fee × (K + B×P)`) and latency: the round waits for the (2P)-t
 
 ## 11. Per-arbiter score getter, so consumers can apply a Q-of-N threshold
 
-**Status:** not started (design discussed 2026-11-09)
+**Status:** design discussed 2026-11-09. Implemented in the v2 contracts (`getOutcomeScores`); the
+BountyEscrow side is item 12.
 **Scope:** `ReputationAggregator.sol` (one new view) + consumers (`BountyEscrow.sol`). Needs an
 aggregator redeploy. No arbiter-node or keeper change, and no new storage.
 
