@@ -7,13 +7,26 @@ bottom; check items off as they land.
 
 ## What's left (2026-11-20)
 
-The v2 contracts on the `beacon` branch implement items 1, 2, 4, 5, 6, 7, 8, 9, 10, 11 and 14. Nothing that
-calls them is ported yet. The numbered items below hold the details; this list is the summary.
+The v2 contracts on the `beacon` branch implement items 1, 2, 4, 5, 6, 7, 8, 9, 10, 11 and 14.
+Nothing that calls them is ported yet. The numbered items below hold the details; this list is the
+summary.
 
 ### Contracts: still to build or decide before the v2 deploy
 v2 is a breaking redeploy, so changes to the request or the wire format cost least now.
-- **Item 3, the refund beneficiary (`refundTo`).** Optional. It would let BountyEscrow drop the
-  per-submission `EvaluationWallet`. Decide before porting BountyEscrow.
+- **Item 3, the refund beneficiary (`refundTo`).** The only numbered contract item not built, and
+  optional. It would let BountyEscrow drop the per-submission `EvaluationWallet`. Decide before
+  porting BountyEscrow.
+- **Bytecode budget.** The aggregator has 383 B of headroom under the 24,576 B limit. A new bonus rule
+  or another request field may need code moved into a library first.
+- **`setContracts` does not check** that the beacon contract uses the same keeper. `deploy/` deploys
+  them as a pair, so this matters only for a manual swap. A one-line check if bytecode allows.
+- **Review and audit.** The v2 contracts are not audited.
+  - The last whole-contract review was the second review (2026-11-19). The clustering review the same
+    day covered only `ScoringLib` and its callers.
+  - Not independently reviewed since: the random-order walk, slot reuse, exits while frozen, the fee
+    floor, and the commit format with its assembly parser.
+  - Run a fresh review of the whole of v2 once the open decisions below are settled, then an
+    external audit before mainnet.
 - **Open decisions:**
   - **Bonus capture by a mimic cartel** (items 10 and 13). Identical reports at the consensus take
     23.5% of Jumbo bonus slots against a fair 14.8%, and no clustering rule changes that. Only a
@@ -28,6 +41,11 @@ v2 is a breaking redeploy, so changes to the request or the wire format cost lea
   - **The beacon flag for Medium and Large** (item 15): allow it per bounty, or Jumbo only.
 
 ### Arbiter node (item 16; first, since every arbiter freezes without it)
+- **The new commit and reveal format (items 4 and 5).**
+  - Commit: `keccak256(abi.encode(aggId, operator, response, salt))`, sent in full.
+  - Salt: 16 random bytes, revealed as `cid:<32 hex>`.
+  - The reveal request carries `2:<64 hex>`.
+  - A malformed reveal uses up the request, so there is no retry.
 - Generate and store a hash chain, and register with `registerArbiter(..., chainHead)`.
 - Answer `HealthCall`s within 60 s, and rotate the chain with `rotateChain`.
 - One-number answers:
@@ -56,7 +74,8 @@ v2 is a breaking redeploy, so changes to the request or the wire format cost lea
   round with beacons complete end to end through BountyEscrow, including a failed round and a
   settlement.
 - Re-measure with a real `ArbiterOperator`; the figures here come from the test stand-in.
-  - Jumbo's draw: 12.3–13.2M of the 16.8M cap.
+  - Jumbo's draw: 12.3–13.2M of the 16.8M cap. Also re-measure how many gas-burning jurors fit:
+    33 with beacons and 35 without, measured with the stand-in.
   - `promote`: 5.1M.
   - The finalizing reveal.
   - A health answer: 123k.
