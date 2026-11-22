@@ -2,12 +2,16 @@
 
 Step-by-step deployment procedures for each Verdikta Dispatcher component, deployed contract addresses, environment variable configuration, and post-deployment verification.
 
+!!! note "Checked against the code"
+    Revised on 2026-11-22 against the deploy scripts in this repository and against the contracts deployed on Base mainnet and Base Sepolia. The ReputationAggregator is paid in ETH. ReputationSingleton and SimpleContract are legacy contracts that are still paid in LINK. Addresses of deployed contracts were read from the chain with the functions named next to them.
+
 ## Prerequisites
 
 - **Node.js** (v18+) and npm
 - **Hardhat** with `hardhat-deploy` and `@nomicfoundation/hardhat-toolbox`
 - **Private keys** for deployer accounts (two accounts recommended: deployer + oracle operator)
-- **LINK tokens** on the target network
+- **ETH** on the target network: for gas, and for the evaluation fees of test requests to the ReputationAggregator
+- **LINK tokens** on the target network, only if you deploy or test the legacy ReputationSingleton or SimpleContract. The ReputationAggregator needs none
 - **VDKA tokens** (Wrapped Verdikta) for oracle staking
 - **Infura API key** for RPC access
 - **Etherscan/Basescan API key** for contract verification (optional but recommended)
@@ -20,6 +24,8 @@ Step-by-step deployment procedures for each Verdikta Dispatcher component, deplo
 | **Base** (mainnet) | 8453 | `0x88Fb150BDc53A65fe94Dea0c9BA0a6dAf8C6e196` | Production |
 | **Ethereum Sepolia** (testnet) | 11155111 | `0x779877A7B0D9E8603169DdbD7836e478b4624789` | Legacy testnet |
 | localhost / hardhat | 31337 | N/A | Local development |
+
+The ReputationAggregator takes the LINK token address in its constructor because its requests still travel over the Chainlink request path (with a LINK amount of zero). It does not mean a requester has to hold or approve LINK.
 
 ## Environment Variables
 
@@ -61,19 +67,25 @@ Create a `.env` file in each subproject directory.
 | Contract/Token | Address |
 |----------------|---------|
 | ReputationAggregator (ETH-funded) | `0xe8a385E473EA710c5a88Cc72681a16a26fe380e4` |
-| LINK Token | `0xE4aB69C077896252FAFBD49EFD26B5D171A32410` |
+| ReputationKeeper (returned by that aggregator's `reputationKeeper()`; also the keeper in the Singleton's `deployment-addresses.json`) | `0xE09821277D9af702F7910a57e85EaC6D83e4d794` |
+| Wrapped Verdikta Token staked in that keeper (its `verdiktaToken()`) | `0x94e3c031fe9403c80E14DaFbCb73f191C683c2B1` |
+| LINK Token (Chainlink request path, legacy contracts) | `0xE4aB69C077896252FAFBD49EFD26B5D171A32410` |
 | Verdikta Token | `0xe46F6b494F111d958CDBB52536AD78c4eEeB0149` |
-| Wrapped Verdikta Token (Aggregator) | `0x2F1d1aF9d5C25A48C29f56f57c7BAFFa7cc910a3` |
-| Wrapped Verdikta Token (Singleton) | `0x94e3c031fe9403c80E14DaFbCb73f191C683c2B1` |
-| ReputationKeeper (Singleton) | `0xE09821277D9af702F7910a57e85EaC6D83e4d794` |
+| Earlier aggregator, not the ETH-funded contract (its `commitOraclesToPoll()` returns 5 and it has no `paused()`) | `0x65863e5e0B2c2968dBbD1c95BDC2e0EA598E5e02` |
+| Wrapped Verdikta Token staked in the earlier aggregator's keeper | `0x2F1d1aF9d5C25A48C29f56f57c7BAFFa7cc910a3` |
+
+On 2026-11-22 the ETH-funded aggregator on Base Sepolia returned K, M, N, P = 6, 4, 3, 2, a bonus multiplier of 3, a fee ceiling of 0.0004 ETH and a timeout of 900 seconds (`responseTimeoutSeconds()`).
 
 ### Base (Mainnet)
 
 | Contract/Token | Address |
 |----------------|---------|
 | ReputationAggregator (ETH-funded) | `0xd8F38bCBEE43bE3bd31655a563f20c9B3e67142a` |
-| LINK Token | `0x88Fb150BDc53A65fe94Dea0c9BA0a6dAf8C6e196` |
-| Wrapped Verdikta Token | `0x1EA68D018a11236E07D5647175DAA8ca1C3D0280` |
+| ReputationKeeper (returned by the aggregator's `reputationKeeper()`) | `0x2D96cc4F6619d08FC14b7ee0eec02d1F3eE1d0b0` |
+| Wrapped Verdikta Token (the keeper's `verdiktaToken()`) | `0x1EA68D018a11236E07D5647175DAA8ca1C3D0280` |
+| LINK Token (Chainlink request path, legacy contracts) | `0x88Fb150BDc53A65fe94Dea0c9BA0a6dAf8C6e196` |
+
+On 2026-11-22 the aggregator on Base mainnet returned K, M, N, P = 6, 4, 3, 2, a bonus multiplier of 3, a fee ceiling of 0.0004 ETH and a timeout of 300 seconds.
 
 ### Ethereum Sepolia (Testnet)
 
@@ -107,10 +119,11 @@ npx hardhat deploy --tags aggregator --network base_sepolia
 
 Constructor args: `(linkTokenAddress, address(0))`
 
-The LINK token address is resolved by network:
+The LINK token address is needed for the Chainlink request path only; the contract is paid in ETH. It is resolved by network:
 - Base Sepolia: `0xE4aB69C077896252FAFBD49EFD26B5D171A32410`
 - Base mainnet: `0x88Fb150BDc53A65fe94Dea0c9BA0a6dAf8C6e196`
-- Sepolia: `0x779877A7B0D9E8603169DdbD7836e478b4624789`
+
+The script has entries for Base, Base Sepolia and local networks. On any other network, Ethereum Sepolia included, it stops with `No LINK token address configured for network`.
 
 #### Step 2: Deploy ReputationKeeper (`deploy/02_keeper.js`)
 
@@ -135,7 +148,7 @@ Sets operational parameters on both contracts:
 
 1. Verifies/sets the VDKA token address in the keeper
 2. Calls `aggregator.setConfig(6, 4, 3, 2, 300)` — K=6, M=4, N=3, P=2, timeout=300s
-3. Calls `aggregator.setMaxOracleFee(0.05 LINK)`
+3. Calls `aggregator.setMaxOracleFee(0.0004 ETH)` — the highest fee, in ETH wei (`4e14`), that one oracle may charge
 
 ```bash
 npx hardhat deploy --tags config --network base_sepolia
@@ -149,9 +162,9 @@ npx hardhat deploy --network base_sepolia
 
 This runs all three scripts in order (01 → 02 → 03) via `hardhat-deploy` dependency resolution.
 
-### 2. ReputationSingleton
+### 2. ReputationSingleton (legacy, LINK)
 
-Located in `reputationBasedSingleton/`. Uses an **existing** ReputationKeeper deployment.
+Located in `reputationBasedSingleton/`. A legacy contract that is paid in LINK. Uses an **existing** ReputationKeeper deployment.
 
 ```bash
 cd reputationBasedSingleton
@@ -206,9 +219,9 @@ npx hardhat run scripts/manageReputationKeepers.js --network base_sepolia
 npx hardhat run scripts/setAuthorizedSenders.js --network base_sepolia
 ```
 
-### 4. SimpleContract
+### 4. SimpleContract (legacy, LINK)
 
-Located in `simpleContract/`. Pre-configured with a fixed oracle.
+Located in `simpleContract/`. A legacy development and test contract that is paid in LINK. Pre-configured with a fixed oracle.
 
 ```bash
 cd simpleContract
@@ -227,7 +240,7 @@ Current hardcoded defaults for Base Sepolia:
 
 ### 5. DemoClient
 
-Located in `demoClient/`. A test client contract for end-to-end verification.
+Located in `demoClient/`. A test client contract for end-to-end verification. It is funded with ETH: each request passes on the ETH it is called with, and there is no LINK to transfer or approve.
 
 ```bash
 cd demoClient
@@ -235,11 +248,12 @@ npm install
 npx hardhat deploy --network base_sepolia
 ```
 
-Edit `deploy/01_demo_client.js` to set the aggregator address and LINK token address.
+Edit `deploy/01_demo_client.js` to set the aggregator address before deploying. The constructor takes that one argument.
 
-Current hardcoded defaults for Base Sepolia:
-- Aggregator: `0x65863e5e0B2c2968dBbD1c95BDC2e0EA598E5e02`
-- LINK: `0xE4aB69C077896252FAFBD49EFD26B5D171A32410`
+The `AGGREGATOR` constant in that file is still `0x65863e5e0B2c2968dBbD1c95BDC2e0EA598E5e02`, an earlier aggregator on Base Sepolia that is not the ETH-funded contract. Replace it with the ETH-funded aggregator:
+
+- Base Sepolia: `0xe8a385E473EA710c5a88Cc72681a16a26fe380e4`
+- Base mainnet: `0xd8F38bCBEE43bE3bd31655a563f20c9B3e67142a`
 
 ## Post-Deployment Verification
 
@@ -250,8 +264,10 @@ All deploy scripts include automatic verification via Etherscan V2 API with retr
 ```bash
 npx hardhat verify --network base_sepolia \
   --contract contracts/ReputationAggregator.sol:ReputationAggregator \
-  <address> <linkToken> <keeperAddress>
+  <address> <linkToken> 0x0000000000000000000000000000000000000000
 ```
+
+The arguments are the ones the contract was deployed with. `deploy/01_aggregator.js` deploys the aggregator with the zero address as keeper and the real keeper is set afterwards with `setReputationKeeper()`.
 
 ### Smoke Test Checklist
 
@@ -273,11 +289,25 @@ npx hardhat verify --network base_sepolia \
    // Should be >= 1
    ```
 
-4. **LINK funding:** Transfer LINK to a test account and run a demo query:
+4. **Fee settings:**
+   ```javascript
+   const ceiling = await aggregator.maxOracleFee();
+   // Should be 400000000000000 (0.0004 ETH)
+   const prepayment = await aggregator.maxTotalFee(ceiling);
+   // Should be 12 × ceiling with K=6, B=3, P=2
+   ```
+
+5. **Demo query:** Run a request through the DemoClient. The script reads the prepayment from the client's `quote()` and sends it as ETH with the request, so the account only needs ETH:
    ```bash
    cd demoClient
-   npx hardhat run scripts/transfer-link.js --network base_sepolia -- <demoClientAddress> 0.5
-   npx hardhat run scripts/query-demo.js --network base_sepolia -- <demoClientAddress>
+   HARDHAT_NETWORK=base_sepolia node scripts/query-demo.js <demoClientAddress>
+   ```
+
+   Or send a request straight to the aggregator and, if it times out, close the round and take the refund:
+   ```bash
+   cd reputationBasedAggregator
+   ./single-query.sh              # base_sepolia by default
+   ./refund.sh 0x<aggId>          # finalizeEvaluationTimeout, then withdrawEth
    ```
 
 ### Oracle Registration Verification
@@ -298,15 +328,15 @@ npx hardhat run scripts/monitor-contracts.js --network base_sepolia
 | reputationBasedSingleton | 0.8.30 | 200 runs | Yes |
 | arbiterOperator | 0.8.19 | 200 runs | No |
 | simpleContract | 0.8.21 | 200 runs | No |
-| demoClient | 0.8.19 | 200 runs | No |
+| demoClient | 0.8.30 | 200 runs | Yes |
 
 ## Network-Specific Notes
 
 ### Base Sepolia
 
-- Recommended gas price: 300 Mwei (`gasPrice: 300_000_000` in hardhat config)
+- Gas price in the hardhat config: 1 gwei in `reputationBasedAggregator` (`gasPrice: 1_000_000_000`), 300 Mwei in `demoClient` (`gasPrice: 300_000_000`)
 - Block confirmations: 2
-- LINK faucet: Available via Chainlink faucet
+- LINK faucet: Available via Chainlink faucet (needed for the legacy LINK-paid contracts only)
 
 ### Base Mainnet
 
@@ -330,10 +360,11 @@ The `reputationBasedAggregator/scripts/` directory contains several operational 
 | `unregister-oracle.js` | Deregister an oracle |
 | `monitor-contracts.js` | Monitor contract state and events |
 | `oracle-poller.js` | Poll oracle status |
-| `approve-link.js` | Approve LINK spending |
+| `approve-link.js` | Approve LINK spending (legacy; the ETH-funded aggregator needs no approval) |
 | `configure-contracts.js` | Update contract configuration |
 | `reset-reputations-cl.js` | Reset all reputation scores |
-| `single-query.js` | Submit a single test query |
+| `single-query.js` | Submit a single test query, paid in ETH sent with the request |
+| `refund.js` | Close a timed-out round (`finalizeEvaluationTimeout`) and withdraw the caller's ETH credit (`withdrawEth`) |
 | `agg-history.js` | View aggregation history |
 | `withdraw-link-from-oracle.js` | Withdraw LINK from oracle contract |
 | `show-gas.js` | Display gas usage statistics |
