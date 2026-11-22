@@ -19,7 +19,7 @@ Every registered oracle is checked against four conditions. An oracle is eligibl
 | Condition | Check | Rationale |
 |-----------|-------|-----------|
 | Active | `isActive == true` | Paused oracles (via `setOracleActive`) are excluded |
-| Fee within budget | `fee <= maxFee` | Oracle's registered LINK fee must not exceed the caller's limit |
+| Fee within budget | `fee <= maxFee` | Oracle's registered fee must not exceed the caller's limit. The ReputationAggregator passes `min(_maxOracleFee, maxOracleFee())` here, in ETH wei, so a request cannot raise the limit above the contract's own ceiling |
 | Not blocked | `!(blocked && block.timestamp < lockedUntil)` | Oracles under active penalty lock are excluded. Oracles whose lock has expired are eligible even if `blocked` is still true (they get auto-unblocked on next score update). |
 | Supports class | `_hasClass(classes, requestedClass)` | Oracle must list the requested evaluation class in its registered `classes` array (up to 5 classes per oracle) |
 
@@ -84,10 +84,12 @@ finalScore = weightedScore × feeWeightingFactor / 1e18
 
 **Effect:** An oracle charging fees close to `estimatedBaseCost` gets a higher scaling factor (up to `maxFeeBasedScalingFactor`), while an oracle at `maxFee` gets a factor of 1.0×. This makes cheaper oracles more likely to be selected without excluding expensive ones entirely.
 
-**Example:** With `maxFee = 0.05 LINK`, `estimatedBaseCost = 0.0005 LINK`, `maxFeeBasedScalingFactor = 5`:
-- Oracle at 0.001 LINK fee → factor ≈ 5× (capped at max)
-- Oracle at 0.025 LINK fee → factor ≈ 2×
-- Oracle at 0.05 LINK fee → factor = 1×
+**Example:** With `maxFee = 0.00015 ETH`, `estimatedBaseCost = 0.000000008 ETH` (`8e9` wei) and `maxFeeBasedScalingFactor = 5`, the values used by `reputationBasedAggregator/scripts/single-query.js`:
+- Oracle at 0.00002 ETH fee → ratio ≈ 7.5, so factor = 5× (capped at max)
+- Oracle at 0.000075 ETH fee → factor ≈ 2×
+- Oracle at 0.00015 ETH fee → factor = 1×
+
+On 2026-11-22 all 40 oracles registered on Base mainnet charged the same fee, 0.00002 ETH (read from the ReputationKeeper with `registeredOracles(i)` and `getOracleInfo(operator, jobId)`). When every eligible oracle charges the same fee the factor is the same for all of them, and selection is decided by the reputation scores alone.
 
 ### Entropy Source
 
@@ -171,7 +173,7 @@ This is a fallback for when K exceeds the number of available oracles.
 |-----------|------|-------------|
 | `count` | `uint256` | Number of oracles to select (K for ReputationAggregator, 1 for ReputationSingleton) |
 | `alpha` | `uint256` | Reputation weight factor (0–1000). Higher values weight timeliness more heavily. |
-| `maxFee` | `uint256` | Maximum LINK fee per oracle. Oracles above this are filtered out in Stage 1. |
+| `maxFee` | `uint256` | Maximum fee per oracle, in the currency of the calling contract: ETH wei for the ReputationAggregator, LINK for the legacy ReputationSingleton. Oracles above this are filtered out in Stage 1. |
 | `estimatedBaseCost` | `uint256` | Base cost estimate for fee weighting calculation. Must be < `maxFee`. |
 | `maxFeeBasedScalingFactor` | `uint256` | Cap on the fee advantage for cheap oracles (must be ≥ 1) |
 | `requestedClass` | `uint64` | Evaluation class the oracle must support |
@@ -188,8 +190,8 @@ This is a fallback for when K exceeds the number of available oracles.
 
 | Contract | Oracles Selected | Selection Method |
 |----------|-----------------|-----------------|
-| ReputationAggregator | K (default 6) | `selectOracles(K, alpha, maxFee, ...)` via ReputationKeeper |
-| ReputationSingleton | 1 | `selectOracles(1, alpha, maxFee, ...)` via ReputationKeeper |
+| ReputationAggregator | K (default 6) | `selectOracles(K, alpha, min(_maxOracleFee, maxOracleFee), ...)` via ReputationKeeper. The call must return exactly K oracles or the request reverts with `BadSelectionCount()` |
+| ReputationSingleton (legacy, LINK) | 1 | `selectOracles(1, alpha, maxFee, ...)` via ReputationKeeper |
 | SimpleContract | 0 (pre-configured) | Fixed oracle set at deployment; no dynamic selection |
 
 ## Practical Guidance
@@ -204,8 +206,8 @@ This is a fallback for when K exceeds the number of available oracles.
 
 ### Fee Parameters
 
-- Set `maxFee` to the most you are willing to pay per oracle. Higher values increase the eligible oracle pool but cost more.
-- Set `estimatedBaseCost` to a small fraction of `maxFee` (e.g., 1%). This serves as a floor for the fee weighting curve.
+- Set `maxFee` to the most you are willing to pay per oracle. Higher values increase the eligible oracle pool but cost more. With the ReputationAggregator this is `_maxOracleFee`, in ETH wei: it also sets the prepayment (`maxTotalFee(_maxOracleFee)`), and a value above the contract's `maxOracleFee()` (0.0004 ETH on Base mainnet) is lowered to it.
+- Set `estimatedBaseCost` to a small fraction of `maxFee` (e.g., 1%), in the same currency. It must be lower than the fee limit in effect. This serves as a floor for the fee weighting curve.
 - Set `maxFeeBasedScalingFactor` to control how much cheaper oracles are preferred (typical: 5–10). A value of 1 disables fee-based preference.
 
 For the full fee mechanics, see [Fee Mechanisms](fees.md). For how scores are computed and updated, see [Reputation System](reputation.md).
