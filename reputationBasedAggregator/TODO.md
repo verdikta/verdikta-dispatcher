@@ -69,6 +69,44 @@ v2 is a breaking redeploy, so changes to the request or the wire format cost lea
 - **Ops scripts.** Port them (`MIGRATION.md` table), including `deploy_aggregatorOnly.sh`,
   `size-contracts.sh` and `verify.sh`, and update the docs site.
 
+### Server: upgrade Ubuntu 25.04 → 26.04 LTS before the v2 rollout (added 2026-11-22)
+The droplet (134.199.203.20) runs Ubuntu 25.04, which has had no security updates since 2026-01-19.
+DigitalOcean's PHP, Java and NGINX notices of November 2026 all trace back to that. Do this before
+deploying v2 here, so the new release isn't the first thing to run on a freshly upgraded OS.
+- **Done (2026-11-22):**
+  - The agents API (:5007) now runs as `verdikta-agents-server.service`. Until then it was started
+    by hand and would not have come back after a reboot. Use `systemctl restart
+    verdikta-agents-server`, not `startServer.sh` / `stopServer.sh`.
+  - PHP is removed (it served only an old proxy, also removed).
+  - The 25.04 updates are installed.
+  - A full backup: `/root/backups/pre-upgrade-full-20261122.tar.gz`, all code and data except
+    `node_modules`, plus `/etc` and `/var/www`.
+- **On the day:**
+  - Take a fresh backup, since the 2026-11-22 one will be stale.
+  - Take a DigitalOcean snapshot: Droplet → Backups & Snapshots → Take live snapshot. Restoring it
+    is the rollback.
+  - Upgrade 25.04 → 25.10 (EOL too, so via `old-releases.ubuntu.com`), reboot; then 25.10 → 26.04,
+    reboot. About 1–2 hours, with a few minutes of downtime at each reboot.
+  - Re-enable the Tailscale apt source with the new codename.
+- **Check afterwards:**
+  - All Verdikta sites and the Alva Museum sites (membership, fallfestival, crackercowboy) load.
+  - All `verdikta-*` services and `alva-membership` are running.
+  - The membership sign-in email arrives.
+  - `certbot renew --dry-run` passes.
+  - The fallfestival analytics cron (GoAccess) runs.
+- **Why it should be low-risk:**
+  - Every app runs on nvm's Node 22, which the OS upgrade does not touch.
+  - No app uses native add-ons.
+  - nginx's own config files are unmodified.
+- **Keep HTTP/2 off** in nginx until the upgrade (CVE-2026-123633 / -123007). No site enables it now.
+- **Loose ends to decide (not blocking):**
+  - `agents.verdikta.org` DNS now points to another server (198.211.106.46, Caddy), so this
+    droplet's copy gets no public traffic and its certificate renewal fails every night. Retire the
+    copy here (the service, the nginx vhost and the certificate) once it's confirmed the move is
+    permanent.
+  - Root SSH login with a password is enabled. Switch to key-only login, carefully: done wrong, it
+    locks everyone out.
+
 ### Testnet (item 16)
 - Deploy to Base Sepolia and run nodes on the `beacon` branch. Done when a Small round and a Jumbo
   round with beacons complete end to end through BountyEscrow, including a failed round and a
@@ -2278,6 +2316,81 @@ What each consumer needs (the files are where the v1 calls are today):
   - Generate and store a hash chain (item 6), and register with `registerArbiter(..., chainHead)`.
   - Answer every keeper `HealthCall` within 60 s with the next chain value (`answerHealthCall`),
     and rotate before the chain runs out (`rotateChain`). Beacon calls are ordinary health calls.
+  - **How the node answers (owner, 2026-11-20): through the Chainlink node, with a cron job per
+    arbiter job.**
+    - Every 5–10 s the cron job asks the external adapter, over the existing `verdikta-ai` bridge,
+      whether a health call is pending for its key.
+    - The adapter watches the keeper's `HealthCall` events and holds the hash chain. It returns the
+      encoded `answerHealthCall(key, preimage)`, or nothing.
+    - A conditional task skips empty runs; an `ethtx` task sends the answer from the node's own key.
+    - Every transaction still comes from the Chainlink node: no new key, no nonce conflicts, no
+      Chainlink API credentials in the adapter.
+    - Rejected:
+      - the existing `directrequest` job, which starts only on the operator's `OracleRequest`;
+      - health calls as oracle requests, about 100k gas each, which would push a Jumbo draw past the
+        cap;
+      - a dedicated key;
+      - a webhook job, which would need API credentials in the adapter.
+  - **Other node decisions (owner, 2026-11-20):**
+    - No v1 compatibility: the node switches to v2 outright.
+    - One-number mode waits, since it needs a `@verdikta/common` release.
+    - Where the old way still works, keep it: the responder lives in the adapter, the commit store
+      stays in memory, and registration keeps its signer, stake, fee and classes.
+    - Upgrades keep job IDs: a template change replaces the job in place rather than
+      re-registering, which in v2 would lock the stake for 2 days and reset scores.
+    - The job gas limit becomes 9M.
+    - The keeper gains a view, so the node can recover its place in the chain. Built as
+      `healthState(key)` (pending, sent at, current head), so the job needs one `ethcall`.
+  - **Built on the arbiter's `beacon` branch (2026-11-20):**
+    - the v2 commit and reveal;
+    - the hash-chain store and the health responder in the external adapter;
+    - the cron job template `chainlink-node/healthJobSpec`;
+    - `register-oracle-cl.js` on `registerArbiter`, creating each job's chain first.
+
+    A scratch run drove the adapter's responder against the real keeper: 40 calls, two rotations, all
+    accepted.
+  - **The installer step, built on the arbiter's `beacon` branch (2026-11-20):**
+    - **Health jobs.** `installer/util/apply-health-jobs.sh` (`--check` / `--apply`) creates a health
+      job for each registered job and replaces stale ones.
+      - It reads `health-chains/registrations.json`, which `register-oracle-cl.js` writes: keeper,
+        chain ID and each job's key.
+      - Registration runs it, the install runs it once its copies are in place, and upgrades run it
+        after their restart.
+      - The health job sends from any of the node's keys, as the arbiter job already does after an
+        in-place replacement.
+    - **The exit.** `unregister-oracle-cl.js` does whichever step is due for each job: `requestExit`,
+      or `completeExit` after the unbonding period. It prints when the next step is.
+    - **The keeper**, for the exit and the query script:
+      - `getArbiter` returns `exitAt`;
+      - a second `requestExit` reverts (`AlreadyExiting`), since it would have restarted the clock;
+      - a new `arbiterClasses(key)` view.
+    - **The 9M gas limit** is in `basicJobSpec`. `apply-job-timeouts.sh` raises live jobs in place,
+      keeping their IDs, and the upgrade treats a template change in the gas limit like one in the
+      timeouts.
+    - **Upgrades never re-register.** A registered node is refused both template regeneration and
+      the arbiter-count change before anything is stopped: new job IDs are new keys. An
+      unregistered node regenerates and registers afterwards.
+    - **Doctor:** `cfg.health_chains` (each registered job's chain file, 0600) and
+      `svc.health_jobs`.
+    - **Checked:**
+      - tests for the new tool, the doctor checks, the gas limit and the upgrade paths;
+      - an end-to-end run on a local chain with the real v2 contracts and a real `ArbiterOperator`:
+        registration, a repeat run, the query, three health calls answered from the node's
+        authorized key, the two-step exit with the stake refunded, and re-registration of an exited
+        job (its old chain retired).
+  - **Still to do on the arbiter:**
+    - Check `healthJobSpec` on the real Chainlink 2.23 binary: add a health-job case to
+      `job-timeouts.integration.sh`, which CI runs. To confirm:
+      - how `bytes32` reaches the bridge (the adapter takes `0x`-hex or decimal);
+      - that an `ethtx` without `from` picks an authorized key;
+      - what the runs a false `conditional` stops (most of them) cost in logs, the database and
+        the watchdog.
+    - Monitoring and e2e: `analyze-commits.js`, `analyze-aggregator-events.js`,
+      `check-events-simple.sh`, `quick-contract-check.sh`, `e2e/src/l4` and its stub chain, and
+      `canaryFault/measure.js` move to the v2 calls and events.
+    - Changing the arbiter count on a registered node while keeping the existing job IDs (add jobs,
+      or exit the removed ones). It is refused for now.
+    - A job that exits stays in `registrations.json`, so its health job keeps polling (harmless).
   - The new commit and reveal format (items 4 and 5, `MIGRATION.md`):
     - the commit is `keccak256(abi.encode(aggId, operator, response, salt))` in full;
     - the salt is 128 bits, written as 32 hex characters;

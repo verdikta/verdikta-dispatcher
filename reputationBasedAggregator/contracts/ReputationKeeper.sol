@@ -139,6 +139,7 @@ contract ReputationKeeper is Ownable {
     error NotApproved();
     error NotArbiterOwner();
     error AlreadyRegistered();
+    error AlreadyExiting();
     error NotRegistered();
     error BadClasses();
     error BadParams();
@@ -360,6 +361,7 @@ contract ReputationKeeper is Ownable {
     function requestExit(bytes32 key) external {
         Meta storage m = _onlyArbiterOwner(key);
         Ck memory c = _cur(key);
+        if (c.flags & F_EXITING != 0) revert AlreadyExiting();   // a second request would restart the clock
         c.flags |= F_EXITING;
         _write(key, c);
         m.exitAt = uint40(block.timestamp) + unbondingPeriod;
@@ -809,21 +811,38 @@ contract ReputationKeeper is Ownable {
         uint256 callAnsweredAt;
         uint256 stake;
         uint256 checkpoints;
+        uint256 exitAt;          // when completeExit is allowed (0 = not exiting)
     }
 
     function getArbiter(bytes32 key) external view returns (ArbiterView memory v) {
         Ck memory c = _cur(key);
         Meta storage m = metas[key];
         v = ArbiterView(m.oracle, c.quality, c.timeliness, m.offenses, c.flags, c.blockedUntil, c.fee,
-            c.callSentAt, c.callAnsweredAt, m.stake, cks[key].length);
+            c.callSentAt, c.callAnsweredAt, m.stake, cks[key].length, m.exitAt);
     }
 
     function jobIdOf(bytes32 key) external view returns (bytes32) {
         return metas[key].jobId;
     }
 
+    /// @notice The classes the arbiter is registered in (emptied by completeExit; its slots are freed).
+    function arbiterClasses(bytes32 key) external view returns (uint64[] memory) {
+        return classesOf[key];
+    }
+
     function isFrozen(bytes32 key) external view returns (bool) {
         return _frozenAt(_cur(key), block.timestamp);
+    }
+
+    /// @notice What an arbiter's node needs to answer its health calls: whether a call is outstanding,
+    ///         when it was sent, and the current hash-chain head (the next answer is its preimage).
+    ///         One call, so a Chainlink job can read it with a single ethcall (TODO item 16).
+    function healthState(bytes32 key) external view returns (bool pending, uint256 sentAt, bytes32 head) {
+        Ck memory c = _cur(key);
+        pending = c.flags & F_CALL_PENDING != 0;
+        sentAt = c.callSentAt;
+        HeadCk[] storage a = heads[key];
+        if (a.length > 0) head = a[a.length - 1].head;
     }
 
     function isEligible(bytes32 key, uint256 maxFee) external view returns (bool) {

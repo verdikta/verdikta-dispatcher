@@ -44,6 +44,17 @@ comparing the two ABIs and the code that calls them.
 - **Health calls** (`HealthCall(key, sentAt)` from the keeper).
   - Answer with `answerHealthCall(key, nextPreimage)` within `callDeadline` (60 s), from an authorized
     sender of the operator or its owner. Otherwise the arbiter is frozen until it answers.
+  - `getArbiter` also returns `exitAt` (when `completeExit` is allowed), a second `requestExit`
+    reverts with `AlreadyExiting`, and `arbiterClasses(key)` lists an arbiter's classes.
+  - The node sends the answer from the Chainlink node's own key (TODO item 16).
+    - A cron job per arbiter job reads `healthState(key)` (pending, sent at, current head) with one
+      `ethcall`.
+    - While a call is pending, it asks the external adapter over the `verdikta-ai` bridge for the
+      preimage.
+    - It sends `rotateChain(key, preimage, newHead)`. With `newHead == preimage` that is
+      `answerHealthCall`.
+    - Implemented on the arbiter's `beacon` branch: `external-adapter/src/health/`,
+      `chainlink-node/healthJobSpec`.
   - Rotate the chain before it runs out with `rotateChain`.
   - Calls go to every drawn juror, to `liveRandom` other shortlisted arbiters, and to beacons.
 - **Beacon calls need no extra code.** A beacon call is a keeper `HealthCall`, and the answer to it is

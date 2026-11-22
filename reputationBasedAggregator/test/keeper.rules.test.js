@@ -209,10 +209,17 @@ describe("ReputationKeeper rules (item 14)", function () {
       const [lock, decay, dead] = [await keeper.lockDuration(), await keeper.decayPeriod(), await keeper.callDeadline()];
       await expect(keeper.setTiming(lock, decay, dead, 2 * DAY - 1)).to.be.revertedWithCustomError(keeper, "BadParams");
       await keeper.requestExit(arbs[0].key);                   // 2 days
+      const at0 = BigInt(await time.latest()) + BigInt(2 * DAY);
+      expect((await keeper.getArbiter(arbs[0].key)).exitAt).to.equal(at0);           // readable by the node's scripts
+      expect((await keeper.getArbiter(arbs[2].key)).exitAt).to.equal(0n);
+      // a second request would restart the clock: refused
+      await expect(keeper.requestExit(arbs[0].key)).to.be.revertedWithCustomError(keeper, "AlreadyExiting");
       await keeper.setTiming(lock, decay, dead, 5 * DAY);
       await keeper.requestExit(arbs[1].key);                   // 5 days
       await time.increase(2 * DAY + 1);
+      expect(await keeper.arbiterClasses(arbs[0].key)).to.deep.equal([1n]);
       await keeper.completeExit(arbs[0].key);
+      expect(await keeper.arbiterClasses(arbs[0].key)).to.deep.equal([]);           // its slots are freed
       await expect(keeper.completeExit(arbs[1].key)).to.be.revertedWithCustomError(keeper, "StillBonded");
       await time.increase(3 * DAY);
       await keeper.completeExit(arbs[1].key);
@@ -400,6 +407,25 @@ describe("ReputationKeeper rules (item 14)", function () {
       await keeper.connect(a.node).answerHealthCall(a.key, fresh.next());
       await time.increase(61);
       expect(await keeper.isFrozen(a.key)).to.equal(false);
+    });
+
+    it("healthState reports the pending call, when it was sent, and the current head (after answers and a rotation)", async () => {
+      const a = arbs[0];
+      let [pending, sentAt, head] = await keeper.healthState(a.key);
+      expect([pending, sentAt, head]).to.deep.equal([false, 0n, a.ch.head]);
+      await keeper.sendHealthCalls([a.key]);
+      const t = BigInt(await time.latest());
+      [pending, sentAt, head] = await keeper.healthState(a.key);
+      expect([pending, sentAt, head]).to.deep.equal([true, t, a.ch.head]);
+      const v = a.ch.next();
+      await keeper.connect(a.node).answerHealthCall(a.key, v);
+      [pending, , head] = await keeper.healthState(a.key);
+      expect([pending, head]).to.deep.equal([false, v]);                     // the answer is the new head
+      await keeper.sendHealthCalls([a.key]);
+      const fresh = H.makeChain();
+      await keeper.connect(a.node).rotateChain(a.key, a.ch.next(), fresh.head);
+      [pending, , head] = await keeper.healthState(a.key);
+      expect([pending, head]).to.deep.equal([false, fresh.head]);            // a rotation leaves the new head
     });
 
     it("the owner can send health calls to many arbiters at once", async () => {
