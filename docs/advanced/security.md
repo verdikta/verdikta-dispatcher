@@ -13,13 +13,16 @@ All core contracts use OpenZeppelin's `Ownable` for administrative functions. Th
 
 **ReputationAggregator** (inherits `Ownable`):
 - `setConfig(K, M, N, P, timeout)` — phase parameters and timeout
-- `setMaxOracleFee(uint256)` — oracle fee ceiling
+- `setMaxOracleFee(uint256)` — oracle fee ceiling, in wei of ETH
 - `setBonusMultiplier(uint256)` — bonus multiplier (0–20×)
 - `setMaxLikelihoodLength(uint256)` — response array length cap
 - `setResponseTimeout(uint256)` — timeout window
 - `setReputationKeeper(address)` — keeper contract reference
 - `setScoreDeltas(...)` — reputation score delta parameters
-- `withdrawLink(address, uint256)` — emergency LINK recovery
+- `pause()` / `unpause()` — stop and resume new requests
+- `withdrawLink(address, uint256)` — recovery of LINK sent to the contract by mistake (the contract holds no LINK in normal operation)
+
+The owner has no function that takes ETH out of the ReputationAggregator. The one owner power over ETH is `withdrawEthFor(payee)`, which the owner or the payee can call and which always sends the payee's balance to the payee. See [ETH Escrow and Withdrawals](#eth-escrow-and-withdrawals).
 
 **ReputationKeeper** (inherits `Ownable`):
 - `approveContract(address)` / `removeContract(address)` — aggregator allowlist
@@ -32,7 +35,7 @@ All core contracts use OpenZeppelin's `Ownable` for administrative functions. Th
 - `setMaxScoreForSelection(uint256)` / `setMinScoreForSelection(uint256)` — score clamping
 - `setVerdiktaToken(address)` — VDKA token contract address
 
-**ReputationSingleton** (inherits `Ownable`):
+**ReputationSingleton** (legacy contract paid in LINK, inherits `Ownable`):
 - `setAlpha(uint256)` / `setMaxOracleFee(uint256)` / `setBaseFeePct(uint256)`
 - `setMaxFeeBasedScalingFactor(uint256)` / `setResponseTimeout(uint256)`
 - `setReputationKeeper(address)` / `setChainlinkToken(address)`
@@ -76,8 +79,12 @@ Both `ReputationAggregator` and `ReputationSingleton` inherit OpenZeppelin's `Re
 | `requestAIEvaluationWithApproval()` | ReputationAggregator | `nonReentrant` |
 | `fulfill()` | ReputationAggregator | `nonReentrant` |
 | `finalizeEvaluationTimeout()` | ReputationAggregator | `nonReentrant` |
+| `withdrawEth()` | ReputationAggregator | `nonReentrant` |
+| `withdrawEthFor()` | ReputationAggregator | `nonReentrant` |
 | `requestAIEvaluationWithApproval()` | ReputationSingleton | `nonReentrant` |
 | `finalizeEvaluationTimeout()` | ReputationSingleton | `nonReentrant` |
+
+The aggregator's `dispatchOracleRequest()` is deliberately not marked `nonReentrant`: only the aggregator itself can call it (`OnlySelf()` otherwise), and it runs inside the guard of the function that called it.
 
 Note: ReputationSingleton's `fulfill()` is **not** marked `nonReentrant` — it relies on Chainlink's `recordChainlinkFulfillment` modifier (which deletes the pending request, preventing replay) and the `done` flag check.
 
@@ -113,11 +120,12 @@ Invalid reveals emit diagnostic events but do **not** revert the transaction. Th
 | Hash mismatch | `RevealHashMismatch` |
 | Malformed CID:salt format | `InvalidRevealFormat` |
 | Too many scores (> `maxLikelihoodLength`) | `RevealTooManyScores` |
-| Wrong score count (doesn't match first reveal) | `RevealWrongScoreCount` |
-| Too few scores (< 2) | `RevealTooFewScores` |
+| CID:salt string longer than `MAX_REVEAL_CID_LENGTH` (121 bytes) | `RevealCidTooLong` |
 | Duplicate reveal for same slot | Silently ignored (no event) |
 
 Rejected oracles are treated as non-responders during finalization and penalized accordingly.
+
+A reveal whose number of scores differs from the other reveals is not rejected at this point. Any length from 2 to `maxLikelihoodLength` is stored, and when the round is finalized every reveal is brought to the most common length (`AggregatorLib.normalizeToModal`: longer ones are cut, shorter ones filled with zeros). A reveal of an unusual length then falls outside the cluster because of its distance from the others. The events `RevealWrongScoreCount` and `RevealTooFewScores` are still declared, but the current code does not emit them: a response with fewer than 2 scores and a non-empty CID reverts with `MalformedPayload()`.
 
 ## Request Validation
 
@@ -140,8 +148,8 @@ All request entry points validate:
 
 During fulfillment, the contract validates:
 - Payload shape distinguishes commit from reveal (1 element + empty CID vs. 2+ elements + non-empty CID)
-- First reveal establishes the expected array length; all subsequent reveals must match
-- CID:salt format validation via `_isValidCidSalt()` before parsing
+- Each reveal has between 2 and `maxLikelihoodLength` scores; differing lengths are reconciled at finalization (see above)
+- CID:salt format validation via `AggregatorLib.isValidCidSalt()` before parsing
 
 ## Gas Safety
 
@@ -156,6 +164,19 @@ The `maxLikelihoodLength` parameter (default: 20) caps the number of scores an o
 ### Score Value Clamping
 
 Individual likelihood scores are clamped to `MAX_ARBITER_RETURN_SCORE` (1e34) to prevent overflow when scores are summed during aggregation.
+
+## ETH Escrow and Withdrawals
+
+The ReputationAggregator is paid in ETH. The LINK allowance problem described in earlier versions of this page (a requester's LINK approval running out before the bonus was pulled, `BonusTransferFailed()`) does not exist in the current contract, because nothing is pulled from the requester after the request.
+
+- **Prepayment.** The requester sends the worst case for the round, `maxTotalFee(_maxOracleFee)`, with the request (`msg.value` plus any credit the requester already has). Too little reverts with `InsufficientPayment()`.
+- **Ledger, not transfers.** Base fees, bonuses and refunds are entries in the `ethOwed` mapping. Settling a round sends no ETH and makes no call to a payee, so a payee cannot block a round from settling.
+- **One way out.** ETH leaves the contract only in `_withdrawTo(payee)`, reached through `withdrawEth()` and `withdrawEthFor(payee)`. The balance is set to zero before the ETH is sent, both functions are `nonReentrant`, and the destination is always the credited address.
+- **Fixed payee and bonus rate.** The owner of each oracle's operator contract is read once, when the request is made, and both the base fee and the bonus go to that address. The bonus multiplier is also recorded at request time (`bonusMultiplierSnap`), so a later `setBonusMultiplier()` cannot make a bonus larger than the round's reserve.
+- **Count check.** The request reverts with `BadSelectionCount()` if the keeper returns a number of oracles other than K, because the prepayment is sized for exactly K base fees.
+- **Pause.** `pause()` stops new requests only. Rounds in progress, timeout finalization and withdrawals keep working, so pausing cannot hold back ETH that is already in the contract.
+
+The contract comments state the invariant the design is built on: the contract's balance equals the sum of all `ethOwed` entries plus the ETH still reserved in open rounds (`getEthAccounting(aggId)` returns the reserve of one round).
 
 ## Known Attack Surfaces
 
@@ -174,9 +195,13 @@ Oracle selection uses `block.prevrandao` and `block.timestamp` which are partial
 - **Two-slot entropy buffer** in ReputationKeeper preventing same-block manipulation
 - **Selection counter** incremented per call provides additional mixing
 
-### LINK Allowance Griefing
+### Prepayment Reserved Until a Timed-Out Round Is Finalized
 
-If a requester's LINK approval expires or is reduced between request creation and bonus payment (ReputationAggregator), the bonus transfer fails with `BonusTransferFailed()`. The evaluation still completes with valid results, but clustered oracles may not receive their bonuses. There is no mechanism to retry bonus payments.
+Nothing closes a round automatically. If the oracles do not deliver enough answers within `responseTimeoutSeconds()`, the round stays open, and the unspent part of the requester's prepayment stays reserved in it, until someone calls `finalizeEvaluationTimeout(aggId)`. Anyone may call it. A requester, or the application acting for the requester, has to make that call to get the credit back. The base fees credited to the polled oracles when the request was made stay with them.
+
+### A Payee That Cannot Receive ETH
+
+If the address credited in `ethOwed` cannot accept ETH (for example a contract without a `receive()` function), its withdrawal reverts with `EthTransferFailed()` and the credit stays in the ledger. Only that payee is affected. A client contract that requests evaluations is itself the requester, so refunds are credited to the contract: it needs a way to call `withdrawEth()` and to receive and pass on the ETH, or its refunds can only be used to pay for its own later requests.
 
 ### Oracle Registration Spam
 
@@ -209,5 +234,7 @@ None of the contracts use proxy patterns or upgradeable storage. Upgrades requir
 - **Replace aggregator/singleton**: Deploy new contract, call `setReputationKeeper()` on it, call `approveContract(newAddress)` + `removeContract(oldAddress)` on the keeper
 - **Replace keeper**: Deploy new keeper, call `approveContract()` for each aggregator, call `setReputationKeeper()` on each aggregator, re-register all oracles and re-approve all contracts
 - **Replace operator**: Deploy new ArbiterOperator, call `addReputationKeeper()` on it, register new oracle identity with keeper
+
+ETH credits live in the aggregator contract that received the prepayment. Replacing the aggregator does not move them: payees and requesters withdraw what they are owed from the old contract with `withdrawEth()`.
 
 Oracle registrations and reputation scores live in the ReputationKeeper. Replacing the keeper requires re-registering all oracles (scores start at 0). The owner can use `resetAllReputations()` to zero scores on the existing keeper without re-registering.
