@@ -37,6 +37,8 @@ comparing the two ABIs and the code that calls them.
     pulled from the caller, and the caller must be the keeper owner or the operator's `owner()`.
   - The node generates a hash chain (item 6: seed `s`, `v_{i-1} = keccak256(v_i)`) and registers the
     head.
+  - **A head of 0 is allowed** (registration from a browser, which cannot hold the chain). The arbiter
+    starts frozen in re-sync (flag 64), and the node sets its chain as below.
   - `requestExit` + `completeExit` (after the unbonding period: 2 days by default, never less)
     replace `deregisterOracle`. Either the operator owner or the keeper owner may run both, also for
     a frozen arbiter. `setPaused` replaces `setOracleActive`.
@@ -56,6 +58,19 @@ comparing the two ABIs and the code that calls them.
     - Implemented on the arbiter's `beacon` branch: `external-adapter/src/health/`,
       `chainlink-node/healthJobSpec`.
   - Rotate the chain before it runs out with `rotateChain`.
+  - **Chain re-sync (added 2026-11-23).** `answerHealthCall` with a value that does not hash to the head
+    no longer reverts. The keeper adopts the value as the head, emits `ChainResynced(key)`, sets flag 64
+    and freezes the arbiter at once.
+    - The arbiter stays frozen until it answers a call sent *after* the re-sync: from selection, the
+      owner's `sendHealthCalls`, or the node's own `requestHealthCall(key)` (new; the operator's owner
+      or an authorized sender).
+    - Valid answers before that call move the head but do not unfreeze. `healthState` reports
+      `pending = false` during a re-sync, so the cron job doesn't spend chain values on it.
+    - `rotateChain` never re-syncs: a wrong preimage still reverts `BadPreimage`.
+    - A re-synced value is never a beacon value (`revealAfter` takes only a value that hashes to the
+      head before it). A re-sync is not retroactive: a round that ended before it is judged as it was.
+    - The node re-syncs when its chain does not match the head (registered with head 0, or its chain
+      files lost): send its next value with `answerHealthCall`, then `requestHealthCall`, then answer.
   - Calls go to every drawn juror, to `liveRandom` other shortlisted arbiters, and to beacons.
 - **Beacon calls need no extra code.** A beacon call is a keeper `HealthCall`, and the answer to it is
   the beacon value. `JuryBeacons` emits `BeaconCalled(aggregator, aggId, index, key, deadline)` for
@@ -86,7 +101,7 @@ comparing the two ABIs and the code that calls them.
 | `maxTotalFee(maxFee)` | `maxTotalFee(maxFee, minFee, withBeacons)`: `max(eff, minFee) × (K + B×P [+ 2]) + eff × (2 + 1)` |
 | (none) | `drawJury(aggId)` from block B+2: a passthrough on the wallet, like `startEvaluation`, so the draw reward reaches the hunter. With beacons, call it twice: once to start the stage, then again once 2 beacon values are in |
 | `finalizeEvaluationTimeout(aggId)` | `settle(aggId)` after the round's deadline. Anyone may call it, and new requests settle due rounds too |
-| `getAggregationStatus(aggId)` → `isComplete, failed, …` | `getRoundInfo(aggId)` → `phase, …`. Settled = phase 7 (settled) or 8 (failed); `isFailed(aggId)` |
+| `getAggregationStatus(aggId)` → `isComplete, failed, …` | `getRoundInfo(aggId)` → `phase, …`. Settled = phase 7 (settled) or 8 (failed); `isFailed(aggId)`. After the escrow fields it also returns `deadline` (0 until the draw; `settle` is due after it), `windowEnd` (T+ after the draw), `commits` and `requestTime` (added 2026-11-23, for consumers' on-chain views) |
 | `getEvaluation(aggId)` | same; valid from finalization (phase 6), before settlement |
 | `responseTimeoutSeconds()` (uint256) | uint40 (ABI-compatible); runs from the draw, not the request |
 

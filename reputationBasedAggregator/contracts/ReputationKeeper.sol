@@ -61,6 +61,7 @@ contract ReputationKeeper is Ownable {
     uint8 private constant F_EXITING = 8;
     uint8 private constant F_CALL_PENDING = 16;   // a health call is outstanding
     uint8 private constant F_UNDERSTAKED = 32;    // stake below the requirement (checkpointed, item 9)
+    uint8 private constant F_RESYNC = 64;         // chain re-synced: frozen until a later call is answered
 
     uint8 public constant T_NONE = 0;
     uint8 public constant T_DELIVERED = 1;      // promoted and the reveal arrived (even late)
@@ -158,6 +159,7 @@ contract ReputationKeeper is Ownable {
     event ArbiterRemoved(bytes32 indexed key, uint256 refunded);
     event HealthCall(bytes32 indexed key, uint256 sentAt);
     event HealthAnswered(bytes32 indexed key, uint256 answeredAt);
+    event ChainResynced(bytes32 indexed key);
     event ScoresUpdated(bytes32 indexed key, uint256 quality, uint256 timeliness);
     event ArbiterBlocked(bytes32 indexed key, uint256 until, uint256 offenses, uint256 burned);
     event ArbiterBanned(bytes32 indexed key, uint256 burned);
@@ -297,6 +299,8 @@ contract ReputationKeeper is Ownable {
         c.fee = fee;
         c.callSentAt = 0;
         c.callAnsweredAt = 0;
+        // head 0: the node sets its chain with its first answer (a re-sync); frozen until then
+        if (chainHead == bytes32(0)) _resyncFreeze(c);
         _write(key, c);
         // a freed slot first (see the contract notes), else append. A returning arbiter's slots were
         // freed at its exit, so it takes its classes from this registration like a new one
@@ -402,40 +406,79 @@ contract ReputationKeeper is Ownable {
     /// @notice Answer the outstanding health call by revealing the next hash-chain preimage (exactly one
     ///         step). Sent by the node (an authorized sender of its operator) or the arbiter's owner.
     ///         Answering at any time after a freeze unfreezes the arbiter.
+    ///         A value that does not hash to the head re-syncs the chain instead (see _answer): a node
+    ///         whose chain does not match the head (registered with head 0, or its chain files lost)
+    ///         sends its own next value and is frozen until it answers a call sent after that.
     function answerHealthCall(bytes32 key, bytes32 preimage) external {
-        if (!_answer(key, preimage, preimage, msg.sender)) revert BadPreimage();
+        _answer(key, preimage, preimage, msg.sender, true);
     }
 
     /// @notice Answer (as above) and replace the hash chain in the same transaction, before the current
     ///         one runs out. The answer comes from the old chain; the new head applies to later calls
     ///         only, so a rotation cannot choose the value of a call already sent.
     function rotateChain(bytes32 key, bytes32 preimage, bytes32 newHead) external {
-        if (!_answer(key, preimage, newHead, msg.sender)) revert BadPreimage();
+        _answer(key, preimage, newHead, msg.sender, false);
     }
 
-    /// @dev returns false, changing nothing, if `preimage` does not hash to the current head
-    function _answer(bytes32 key, bytes32 preimage, bytes32 nextHead, address responder) internal returns (bool) {
+    /// @notice Item 7's self-service health call: the arbiter's owner or node asks for a call, to end a
+    ///         re-sync or after a restart, so recovery does not wait for selection or the keeper owner.
+    function requestHealthCall(bytes32 key) external {
+        Meta storage m = metas[key];
+        if (_cur(key).flags & F_REGISTERED == 0) revert NotRegistered();
+        _onlyResponder(m.oracle, msg.sender);
+        _call(key);
+    }
+
+    function _onlyResponder(address oracle, address responder) internal view {
+        if (responder == IOracleOwner(oracle).owner()) return;
+        try IAuthorizedSenders(oracle).isAuthorizedSender(responder) returns (bool ok) {
+            if (!ok) revert NotAuthorizedResponder();
+        } catch {
+            revert NotAuthorizedResponder();
+        }
+    }
+
+    /**
+     * @dev An answer. A preimage of the head is revealed (readable by revealAfter) and, unless the chain
+     *      is re-syncing, ends an outstanding call. Otherwise: a rotation reverts; a plain answer re-syncs.
+     *      A re-sync pushes the value as the new head and freezes the arbiter until it answers a call sent
+     *      after it. It is never a beacon value: revealAfter takes only a value that hashes to the head
+     *      before it, so a beacon that re-syncs after B+1 counts as having withheld. The next value was
+     *      fixed at the re-sync, as at a rotation, and the freeze is one the arbiter could get by not
+     *      answering. So a re-sync gives no choice of beacon value and no dodge it does not have already.
+     */
+    function _answer(bytes32 key, bytes32 preimage, bytes32 nextHead, address responder, bool mayResync) internal {
         Meta storage m = metas[key];
         Ck memory c = _cur(key);
         if (c.flags & F_REGISTERED == 0) revert NotRegistered();
-        if (responder != IOracleOwner(m.oracle).owner()) {
-            try IAuthorizedSenders(m.oracle).isAuthorizedSender(responder) returns (bool ok) {
-                if (!ok) revert NotAuthorizedResponder();
-            } catch {
-                revert NotAuthorizedResponder();
-            }
+        _onlyResponder(m.oracle, responder);
+        if (keccak256(abi.encodePacked(preimage)) != _headAt(key, block.number)) {
+            if (!mayResync) revert BadPreimage();
+            _setHead(key, preimage);                     // not a reveal: revealAfter's keccak check skips it
+            _resyncFreeze(c);
+            _write(key, c);
+            emit ChainResynced(key);
+            return;
         }
-        if (keccak256(abi.encodePacked(preimage)) != _headAt(key, block.number)) return false;
         _setHead(key, preimage);                         // the revealed value, readable by revealAfter
         if (nextHead != preimage) _setHead(key, nextHead);   // a rotation: the new chain applies from here
-        // only an answer to an outstanding call moves callAnsweredAt (round-end freeze checks rely on it)
-        if (c.flags & F_CALL_PENDING != 0) {
+        // only an answer to an outstanding call moves callAnsweredAt (round-end freeze checks rely on it);
+        // during a re-sync no call is outstanding until one is sent after it (_call clears F_RESYNC)
+        if (c.flags & (F_CALL_PENDING | F_RESYNC) == F_CALL_PENDING) {
             c.callAnsweredAt = uint40(block.timestamp);
             c.flags &= ~F_CALL_PENDING;
             _write(key, c);
         }
         emit HealthAnswered(key, block.timestamp);
-        return true;
+    }
+
+    /// @dev frozen from now on (not before: callSentAt + D is moved to now - 1 at the latest, so a past
+    ///      round end is judged as it was), with a call pending that only a later call can be answered for
+    function _resyncFreeze(Ck memory c) internal view {
+        uint256 d = uint256(callDeadline) + 1;
+        uint256 back = block.timestamp > d ? block.timestamp - d : 0;
+        if (c.flags & F_CALL_PENDING == 0 || c.callSentAt > back) c.callSentAt = uint40(back);
+        c.flags |= F_CALL_PENDING | F_RESYNC;
     }
 
     /// @notice Owner: send health calls to many arbiters at once (e.g. after a wide outage).
@@ -492,6 +535,11 @@ contract ReputationKeeper is Ownable {
         if (c.flags & F_CALL_PENDING == 0) {
             c.callSentAt = uint40(block.timestamp);
             c.flags |= F_CALL_PENDING;
+            _write(key, c);
+            emit HealthCall(key, block.timestamp);
+        } else if (c.flags & F_RESYNC != 0) {
+            // the call a re-sync waits for: answerable now; the arbiter stays frozen until it is answered
+            c.flags &= ~F_RESYNC;
             _write(key, c);
             emit HealthCall(key, block.timestamp);
         }
@@ -839,7 +887,7 @@ contract ReputationKeeper is Ownable {
     ///         One call, so a Chainlink job can read it with a single ethcall (TODO item 16).
     function healthState(bytes32 key) external view returns (bool pending, uint256 sentAt, bytes32 head) {
         Ck memory c = _cur(key);
-        pending = c.flags & F_CALL_PENDING != 0;
+        pending = c.flags & (F_CALL_PENDING | F_RESYNC) == F_CALL_PENDING;   // re-syncing: no call to answer yet
         sentAt = c.callSentAt;
         HeadCk[] storage a = heads[key];
         if (a.length > 0) head = a[a.length - 1].head;

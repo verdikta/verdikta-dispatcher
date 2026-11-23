@@ -775,14 +775,19 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
     /// @notice phase (1 draw, 2 beacons, 3 commit, 4 closing, 5 reveal, 6 final, 7 settled, 8 failed,
     ///         9 cancelled), draw blocks, and the escrow: received, base fees, bonuses, rewards (draw,
     ///         promote, beacons). Received minus the three credited amounts is refunded at the end.
+    ///         Then the timing a consumer's view needs: the round deadline (0 until the draw; settle
+    ///         is due after it), the commit window's end (T+ after the draw), the commits received,
+    ///         and the request time (drawJury's 1-day limit and cancelUnsealed run from it).
     function getRoundInfo(bytes32 aggId)
         external
         view
         returns (uint8 phase, uint256 requestBlock, bytes32 sealedHash, uint256 closeBlock,
-                 uint256 received, uint256 baseFees, uint256 bonuses, uint256 rewards)
+                 uint256 received, uint256 baseFees, uint256 bonuses, uint256 rewards,
+                 uint256 deadline, uint256 windowEnd, uint256 commits, uint256 requestTime)
     {
         Round storage r = rounds[uint256(aggId)];
-        return (r.phase, r.requestBlock, r.sealedHash, r.closeBlock, r.ethReceived, r.baseCredited, r.bonusCredited, r.rewardCredited);
+        return (r.phase, r.requestBlock, r.sealedHash, r.closeBlock, r.ethReceived, r.baseCredited, r.bonusCredited,
+                r.rewardCredited, r.deadline, r.windowEnd, r.commits, r.requestTime);
     }
 
     function isFailed(bytes32 aggId) external view returns (bool) {

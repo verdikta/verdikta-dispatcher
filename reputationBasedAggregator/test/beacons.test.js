@@ -75,6 +75,18 @@ describe("JuryBeacons (item 9's beacon flag)", function () {
     await expect(agg.drawJury(r.aggId)).to.be.revertedWithCustomError(agg, "WrongPhase");
   });
 
+  it("a beacon that re-syncs its chain during the stage has withheld: no value for the round, even after it answers", async () => {
+    const r = await drv.requestOnly();
+    await drv.beaconStage(r, { answering: 0 });
+    const b = r.beacons[0];
+    const V = await valueBlock(r);
+    const other = H.makeChain();
+    await expect(keeper.connect(b.arb.node).answerHealthCall(b.key, other.head)).to.emit(keeper, "ChainResynced");
+    await keeper.connect(b.arb.node).requestHealthCall(b.key);
+    await keeper.connect(b.arb.node).answerHealthCall(b.key, other.next());   // a valid answer, after the re-sync
+    expect((await keeper.revealAfter(b.key, V)).value).to.equal(ethers.ZeroHash);
+  });
+
   it("a beacon answers its health call like any arbiter: verified, by the arbiter only; the answer is the value", async () => {
     const r = await drv.requestOnly();
     await drv.beaconStage(r, { answering: 0 });
@@ -85,9 +97,10 @@ describe("JuryBeacons (item 9's beacon flag)", function () {
     const v = ch.chain[ch.chain.length - 2 - ch.used];                          // its next value
     await expect(keeper.connect(stranger).answerHealthCall(b.key, v))
       .to.be.revertedWithCustomError(keeper, "NotAuthorizedResponder");
-    await expect(keeper.connect(b.arb.node).answerHealthCall(b.key, ethers.ZeroHash))
+    // verified: a wrong value can't be revealed (a plain answer would re-sync instead; see below)
+    await expect(keeper.connect(b.arb.node).rotateChain(b.key, ethers.ZeroHash, ethers.ZeroHash))
       .to.be.revertedWithCustomError(keeper, "BadPreimage");
-    await expect(keeper.connect(b.arb.node).answerHealthCall(b.key, ch.preimageOf(v)))   // skips a value
+    await expect(keeper.connect(b.arb.node).rotateChain(b.key, ch.preimageOf(v), ch.preimageOf(v)))   // skips a value
       .to.be.revertedWithCustomError(keeper, "BadPreimage");
     expect((await keeper.revealAfter(b.key, V)).value).to.equal(ethers.ZeroHash);
     const rc = await drv.answerBeacon(r, 0);

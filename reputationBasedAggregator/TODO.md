@@ -36,8 +36,9 @@ v2 is a breaking redeploy, so changes to the request or the wire format cost lea
   - **−400 for a beacon that withholds** when the stage misses its quorum (deferred, 2026-11-19).
   - **The abstain dodge** (item 14): a cooldown after a late answer, or counting freezes in failed
     rounds as offenses. Simulate first.
-  - **Item 7's self-service `requestHealthCall`:** not built. Recovery relies on a late answer to the
-    outstanding call, or on the owner's `sendHealthCalls`. Decide whether that is enough.
+  - **Item 7's self-service `requestHealthCall`:** built 2026-11-23, with the chain re-sync (see
+    MIGRATION.md, "Chain re-sync"): a re-synced arbiter stays frozen until it answers a call sent after
+    the re-sync, and `requestHealthCall` lets its node ask for that call.
   - **The beacon flag for Medium and Large** (item 15): allow it per bounty, or Jumbo only.
 
 ### Arbiter node (item 16; first, since every arbiter freezes without it)
@@ -494,9 +495,11 @@ redeploy of both contracts.
 ## 7. Freeze arbiters that fail a hash-chain call; unfreeze on answer
 
 **Status:** design discussed 2026-10-30. Implemented in the v2 contracts with item 14: health calls
-with a 60 s deadline, a separate frozen state, and unfreezing on a late answer. Not built: the
-self-service `requestHealthCall` (the owner's `sendHealthCalls` stands in). Arbiter node not
-started (item 16).
+with a 60 s deadline, a separate frozen state, and unfreezing on a late answer. The self-service
+`requestHealthCall` was built 2026-11-23 with the chain re-sync: a mismatched answer adopts the value as
+the head and freezes the arbiter until it answers a later call (owner's decision, 2026-11-23, so that an
+arbiter can register from a browser with head 0 and its node can recover lost chain files). Arbiter node
+in progress (item 16).
 **Scope:** `ReputationKeeper.sol` + `ReputationAggregator.sol` + arbiter node (shares item 6's request mode)
 
 ### Problem

@@ -347,8 +347,8 @@ describe("ReputationKeeper rules (item 14)", function () {
       await expect(apply([a.key], [H.code(H.T.MISS_FAILED)])).to.emit(keeper, "OutcomeSkippedFrozen");
       expect((await info(a.key)).timeliness).to.equal(500n);
 
-      // wrong preimage and unauthorized senders are rejected
-      await expect(keeper.connect(a.node).answerHealthCall(a.key, ethers.ZeroHash))
+      // a rotation needs the right preimage, and unauthorized senders are rejected
+      await expect(keeper.connect(a.node).rotateChain(a.key, ethers.ZeroHash, ethers.ZeroHash))
         .to.be.revertedWithCustomError(keeper, "BadPreimage");
       const stranger = (await ethers.getSigners())[3];
       await expect(keeper.connect(stranger).answerHealthCall(a.key, a.ch.chain[a.ch.chain.length - 2]))
@@ -403,7 +403,7 @@ describe("ReputationKeeper rules (item 14)", function () {
       await keeper.connect(a.node).rotateChain(a.key, a.ch.next(), fresh.head);
       expect(await keeper.isFrozen(a.key)).to.equal(false);
       await keeper.sendHealthCalls([a.key]);
-      await expect(keeper.connect(a.node).answerHealthCall(a.key, a.ch.next())).to.be.revertedWithCustomError(keeper, "BadPreimage");
+      await expect(keeper.connect(a.node).rotateChain(a.key, a.ch.next(), fresh.head)).to.be.revertedWithCustomError(keeper, "BadPreimage");
       await keeper.connect(a.node).answerHealthCall(a.key, fresh.next());
       await time.increase(61);
       expect(await keeper.isFrozen(a.key)).to.equal(false);
@@ -432,6 +432,125 @@ describe("ReputationKeeper rules (item 14)", function () {
       await keeper.sendHealthCalls(arbs.map((a) => a.key));
       await time.increase(61);
       expect(await keeper.eligibleCount(1, H.MAX_FEE)).to.equal(0n);
+    });
+  });
+
+  describe("chain re-sync (a mismatched answer)", () => {
+    // A node whose chain does not match the keeper's head (registered from a browser with head 0,
+    // or its chain files lost) answers with its own next value: the keeper adopts it as the head
+    // and freezes the arbiter until it answers a health call sent after the re-sync.
+    const RESYNC = 64n;
+    const flagsOf = async (k) => (await info(k)).flags;
+
+    it("a mismatched answer adopts the value as the head and freezes the arbiter at once", async () => {
+      const a = arbs[0];
+      const other = H.makeChain();
+      await expect(keeper.connect(a.node).answerHealthCall(a.key, other.head))
+        .to.emit(keeper, "ChainResynced").withArgs(a.key);
+      expect(await keeper.isFrozen(a.key)).to.equal(true);
+      expect(await keeper.isEligible(a.key, H.MAX_FEE)).to.equal(false);
+      expect((await flagsOf(a.key)) & RESYNC).to.equal(RESYNC);
+      const [pending, , head] = await keeper.healthState(a.key);
+      expect(pending).to.equal(false);                                        // no call to answer yet
+      expect(head).to.equal(other.head);
+    });
+
+    it("valid answers before a new call move the head but do not unfreeze; the next call's answer does", async () => {
+      const a = arbs[0];
+      const other = H.makeChain();
+      await keeper.connect(a.node).answerHealthCall(a.key, other.head);
+      await keeper.connect(a.node).answerHealthCall(a.key, other.next());
+      expect(await keeper.isFrozen(a.key)).to.equal(true);
+      expect((await keeper.healthState(a.key))[2]).to.equal(other.chain[other.chain.length - 2]);
+
+      await expect(keeper.connect(a.node).requestHealthCall(a.key)).to.emit(keeper, "HealthCall");
+      expect((await flagsOf(a.key)) & RESYNC).to.equal(0n);
+      expect((await keeper.healthState(a.key))[0]).to.equal(true);          // now a call to answer
+      expect(await keeper.isFrozen(a.key)).to.equal(true);                    // still frozen until answered
+      await keeper.connect(a.node).answerHealthCall(a.key, other.next());
+      expect(await keeper.isFrozen(a.key)).to.equal(false);
+      expect(await keeper.isEligible(a.key, H.MAX_FEE)).to.equal(true);
+    });
+
+    it("a call from selection or the owner also ends the re-sync", async () => {
+      const a = arbs[0];
+      const other = H.makeChain();
+      await keeper.connect(a.node).answerHealthCall(a.key, other.head);
+      await keeper.sendHealthCalls([a.key]);
+      await keeper.connect(a.node).answerHealthCall(a.key, other.next());
+      expect(await keeper.isFrozen(a.key)).to.equal(false);
+    });
+
+    it("a re-sync is never a beacon value: revealAfter skips it, and counts the next valid answer", async () => {
+      const a = arbs[0];
+      const other = H.makeChain();
+      const b0 = BigInt(await ethers.provider.getBlockNumber());
+      await keeper.connect(a.node).answerHealthCall(a.key, other.head);      // re-sync after b0
+      let [v] = await keeper.revealAfter(a.key, b0);
+      expect(v).to.equal(ethers.ZeroHash);                                    // withheld, as far as b0 goes
+      const b1 = BigInt(await ethers.provider.getBlockNumber());
+      const x = other.next();
+      await keeper.connect(a.node).answerHealthCall(a.key, x);
+      [v] = await keeper.revealAfter(a.key, b1);
+      expect(v).to.equal(x);                                                  // fixed at the re-sync, before b1
+      [v] = await keeper.revealAfter(a.key, b0);
+      expect(v).to.equal(ethers.ZeroHash);
+    });
+
+    it("rotateChain never re-syncs: a wrong preimage reverts and changes nothing", async () => {
+      const a = arbs[0];
+      const fresh = H.makeChain();
+      await expect(keeper.connect(a.node).rotateChain(a.key, fresh.head, fresh.head))
+        .to.be.revertedWithCustomError(keeper, "BadPreimage");
+      expect((await keeper.healthState(a.key))[2]).to.equal(a.ch.head);
+      expect(await keeper.isFrozen(a.key)).to.equal(false);
+    });
+
+    it("only the operator's owner or an authorized sender may re-sync or request a call", async () => {
+      const a = arbs[0];
+      const stranger = (await ethers.getSigners())[3];
+      await expect(keeper.connect(stranger).answerHealthCall(a.key, ethers.ZeroHash))
+        .to.be.revertedWithCustomError(keeper, "NotAuthorizedResponder");
+      await expect(keeper.connect(stranger).requestHealthCall(a.key))
+        .to.be.revertedWithCustomError(keeper, "NotAuthorizedResponder");
+    });
+
+    it("requestHealthCall with nothing pending sends a call like the owner's", async () => {
+      const a = arbs[0];
+      await keeper.connect(a.node).requestHealthCall(a.key);
+      const t = BigInt(await time.latest());
+      expect(await keeper.healthState(a.key)).to.deep.equal([true, t, a.ch.head]);
+      await time.increase(61);
+      expect(await keeper.isFrozen(a.key)).to.equal(true);
+      await keeper.connect(a.node).answerHealthCall(a.key, a.ch.next());
+      expect(await keeper.isFrozen(a.key)).to.equal(false);
+    });
+
+    it("a re-sync does not reach back: a round that ended before it is still scored", async () => {
+      const a = arbs[0];
+      const end = await time.latest();
+      await time.increase(10);
+      await keeper.connect(a.node).answerHealthCall(a.key, H.makeChain().head);
+      await apply([a.key], [H.code(H.T.NOCOMMIT_FAILED)], end);
+      expect((await info(a.key)).timeliness).to.equal(100n);
+    });
+
+    it("registering with head 0 starts frozen in re-sync; the node's re-sync, a call and an answer make it eligible", async () => {
+      const OpF = await ethers.getContractFactory("TestOperator");
+      const node = (await ethers.getSigners())[5];
+      const op = await OpF.deploy(await core.link.getAddress(), ethers.Wallet.createRandom().address, node.address);
+      const jobId = ethers.zeroPadValue(ethers.toBeHex(99), 32);
+      await keeper.registerArbiter(await op.getAddress(), jobId, H.FEE, [1], ethers.ZeroHash);
+      const key = await keeper.keyOf(await op.getAddress(), jobId);
+      expect(await keeper.isFrozen(key)).to.equal(true);
+      expect((await flagsOf(key)) & RESYNC).to.equal(RESYNC);
+      expect((await keeper.healthState(key))[0]).to.equal(false);
+
+      const ch = H.makeChain();
+      await keeper.connect(node).answerHealthCall(key, ch.head);              // the node's own chain
+      await keeper.connect(node).requestHealthCall(key);
+      await keeper.connect(node).answerHealthCall(key, ch.next());
+      expect(await keeper.isEligible(key, H.MAX_FEE)).to.equal(true);
     });
   });
 

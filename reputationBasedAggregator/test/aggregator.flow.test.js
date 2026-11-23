@@ -1032,4 +1032,45 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
       expect((await agg.getOutcomeScores(round.aggId, 1))[1]).to.equal(false);   // only outcome 0 exists
     });
   });
+
+  describe("getRoundInfo timing fields (for consumers' views)", () => {
+    // getRoundInfo returns, after the escrow fields: deadline, windowEnd, commits, requestTime
+    const info = async (r) => {
+      const v = await agg.getRoundInfo(r.aggId);
+      return { phase: v[0], deadline: v[8], windowEnd: v[9], commits: v[10], requestTime: v[11] };
+    };
+    const blockTime = async (rcpt) => BigInt((await ethers.provider.getBlock(rcpt.blockNumber)).timestamp);
+
+    it("requestTime is set at the request; deadline and windowEnd only from the draw", async () => {
+      const r = await drv.requestOnly();
+      let i = await info(r);
+      expect(i.phase).to.equal(1n);
+      expect(i.requestTime).to.equal(await blockTime(r.reqRcpt));
+      expect(i.deadline).to.equal(0n);
+      expect(i.windowEnd).to.equal(0n);
+      expect(i.commits).to.equal(0n);
+
+      const rc = await drv.draw(r);
+      const t = await blockTime(rc);
+      i = await info(r);
+      expect(i.phase).to.equal(3n);
+      expect(i.deadline).to.equal(t + (await agg.responseTimeoutSeconds()));
+      expect(i.windowEnd).to.equal(t + (await agg.tPlus()));
+    });
+
+    it("commits counts the commits received, and promote() extends the deadline to at least now + revealWindow", async () => {
+      await agg.setConfig(6, 5, 4, 3, 200, 155);
+      const r = await drv.request();
+      await drv.answerAll(r);
+      await commitAll(r, [0, 1]);
+      expect((await info(r)).commits).to.equal(2n);
+      await commitAll(r, [2, 3, 4, 5]);                                       // the M+-th closes
+      expect((await info(r)).phase).to.equal(4n);
+      await time.increase(150);
+      const rc = await drv.promote(r);
+      const i = await info(r);
+      expect(i.phase).to.equal(5n);
+      expect(i.deadline).to.be.at.least((await blockTime(rc)) + (await agg.revealWindow()));
+    });
+  });
 });
