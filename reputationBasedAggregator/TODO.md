@@ -69,54 +69,62 @@ v2 is a breaking redeploy, so changes to the request or the wire format cost lea
 - **Ops scripts.** Port them (`MIGRATION.md` table), including `deploy_aggregatorOnly.sh`,
   `size-contracts.sh` and `verify.sh`, and update the docs site.
 
-### Server: upgrade Ubuntu 25.04 → 26.04 LTS before the v2 rollout (added 2026-11-22)
-The droplet (134.199.203.20) runs Ubuntu 25.04, which has had no security updates since 2026-01-19.
-DigitalOcean's PHP, Java and NGINX notices of November 2026 all trace back to that. Do this before
-deploying v2 here, so the new release isn't the first thing to run on a freshly upgraded OS.
-- **Done (2026-11-22):**
-  - The agents API (:5007) now runs as `verdikta-agents-server.service`. Until then it was started
-    by hand and would not have come back after a reboot. Use `systemctl restart
-    verdikta-agents-server`, not `startServer.sh` / `stopServer.sh`.
-  - PHP is removed (it served only an old proxy, also removed).
-  - The 25.04 updates are installed.
-  - A full backup: `/root/backups/pre-upgrade-full-20261122.tar.gz`, all code and data except
-    `node_modules`, plus `/etc` and `/var/www`.
-- **On the day:**
-  - Take a fresh backup, since the 2026-11-22 one will be stale.
-  - Take a DigitalOcean snapshot: Droplet → Backups & Snapshots → Take live snapshot. Restoring it
-    is the rollback.
-  - Upgrade 25.04 → 25.10 (EOL too, so via `old-releases.ubuntu.com`), reboot; then 25.10 → 26.04,
-    reboot. About 1–2 hours, with a few minutes of downtime at each reboot.
-  - Re-enable the Tailscale apt source with the new codename.
-- **Check afterwards:**
-  - All Verdikta sites and the Alva Museum sites (membership, fallfestival, crackercowboy) load.
-  - All `verdikta-*` services and `alva-membership` are running.
-  - The membership sign-in email arrives.
-  - `certbot renew --dry-run` passes.
-  - The fallfestival analytics cron (GoAccess) runs.
-- **Why it should be low-risk:**
-  - Every app runs on nvm's Node 22, which the OS upgrade does not touch.
-  - No app uses native add-ons.
-  - nginx's own config files are unmodified.
-- **Keep HTTP/2 off** in nginx until the upgrade (CVE-2026-123633 / -123007). No site enables it now.
-- **Loose ends to decide (not blocking):**
-  - `agents.verdikta.org` DNS now points to another server (198.211.106.46, Caddy), so this
-    droplet's copy gets no public traffic and its certificate renewal fails every night. Retire the
-    copy here (the service, the nginx vhost and the certificate) once it's confirmed the move is
-    permanent.
-  - Root SSH login with a password is enabled. Switch to key-only login, carefully: done wrong, it
-    locks everyone out.
-- **Follow-up: move from Node 22 to Node 24 LTS (added 2026-11-23).** Node 22 reaches end of life on
-  2027-04-30, after which it gets no security fixes. Finish the move before then.
-  - Now: every service on the droplet (the `verdikta-*` units and `alva-membership`) runs
-    `/opt/node22/bin/node`. That is a symlink to nvm's v22.23.5, installed 2026-11-23.
-  - Install Node 24 with nvm alongside 22. Rebuild each app's `node_modules` on 24 and test it there
-    (client builds, server start, the apps' own tests) before switching any unit.
-  - Check `alva-membership` separately: it uses `node:sqlite`, which is still experimental.
-  - Switch one unit at a time, with 22 kept for rollback, as was done for 22.23.5. The steps and
-    rollback are in `/root/pre-upgrade-2026-11-22/POST-UPGRADE-NOTES.md`.
-  - Do it separately from the v2 rollout, so that if something breaks, it's clear which change
-    caused it.
+### Server: Ubuntu 26.04 LTS upgrade, done 2026-11-22 (updated 2026-11-23)
+The droplet (134.199.203.20) ran Ubuntu 25.04, which had no security updates after 2026-01-19. That was
+behind DigitalOcean's PHP, Java and NGINX notices of November 2026. It now runs 26.04.1 LTS (kernel
+7.0.0-44), so v2 won't be the first thing to run on a freshly upgraded OS. The plan is in
+`/root/pre-upgrade-2026-11-22/HANDOFF.md`. The follow-up work and rollback steps are in
+`POST-UPGRADE-NOTES.md`, in the same folder.
+- **How it went:**
+  - Took a DigitalOcean snapshot first, as the rollback.
+  - One direct jump, 25.04 → 26.04, with `do-release-upgrade`. The 26.04 upgrader accepts 25.04, so
+    25.10 was skipped.
+  - Re-enabled the Tailscale and DigitalOcean agent apt sources afterwards.
+- **Checked afterwards, all passing:**
+  - All Verdikta sites and the Alva Museum sites load.
+  - All services are running.
+  - `certbot renew --dry-run` passes, 7 of 7.
+  - The fallfestival analytics cron and the weekly membership backup run on 26.04.
+  - `/root/pre-upgrade-2026-11-22/post-upgrade.sh` passes.
+  - **Still to check by hand:**
+    - The membership sign-in email arrives.
+    - A real membership signup and a real bounty submission work end to end.
+- **Fixed after the upgrade:**
+  - GoAccess 1.9.4 changed its HTML, and the "Who is coming?" analytics panel was silently dropped.
+    `visit_analysis.sh` now handles both versions.
+  - Every service moved from Node 22.20.0 to 22.23.5, picking up 6 missed security releases. They
+    now start through the fixed path `/opt/node22`.
+  - New `verdikta-arbiters-client.service`: the arbiters client rebuilds on change again. Its
+    hand-started watcher died at the reboot.
+  - Purged leftover packages; nothing is waiting to upgrade.
+- **Loose ends, now settled:**
+  - **agents.verdikta.org has moved to another server (198.211.106.46, Caddy) for good.** Retired here:
+    - the nginx vhost is disabled (the file stays in `sites-available`);
+    - the certificate is deleted;
+    - `verdikta-agents-server` is stopped and disabled (the unit and code are kept).
+  - **Root SSH login with a password stays** (owner's decision, 2026-11-23).
+    - fail2ban now guards it: 5 failures within 10 minutes bans an IP for 1 hour.
+    - The owner's home IP and Tailscale are never banned.
+- **HTTP/2:** 26.04's nginx (1.28.3) has the fixes for CVE-2026-123633 and -123007, so it is safe to
+  enable HTTP/2 again. No site enables it yet.
+- **Still open:**
+  - **A DigitalOcean cloud firewall** allowing only 22, 80 and 443 TCP and 41641 UDP. Until it's in
+    place, the Node ports 3001, 5000, 5005, 5006 and 5008 are open to the internet. The rules are in
+    `POST-UPGRADE-NOTES.md`.
+  - **Backups off the droplet.** Enable DigitalOcean weekly backups: `/root/backups` is on the same
+    disk as the data.
+  - **The pre-upgrade snapshot.** Delete it after a few days of normal running.
+  - **The CVE-2026-98432 stopgap** (`cve-2026-98432-mitigation`). Keep it until a kernel changelog
+    lists the fix.
+  - **Move from Node 22 to Node 24 LTS** (added 2026-11-23). Node 22 reaches end of life on
+    2027-04-30, after which it gets no security fixes. Finish the move before then.
+    - Install Node 24 with nvm alongside 22. Rebuild each app's `node_modules` on 24 and test it there
+      (client builds, server start, the apps' own tests) before switching any unit.
+    - Check `alva-membership` separately: it uses `node:sqlite`, which is still experimental.
+    - Switch one unit at a time, with 22 kept for rollback, as was done for 22.23.5 (steps in
+      `POST-UPGRADE-NOTES.md`).
+    - Do it separately from the v2 rollout, so that if something breaks, it's clear which change
+      caused it.
 
 ### Testnet (item 16)
 - Deploy to Base Sepolia and run nodes on the `beacon` branch. Done when a Small round and a Jumbo
