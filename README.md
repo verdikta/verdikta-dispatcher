@@ -87,7 +87,7 @@ LINK addresses below are retained for Chainlink transport and legacy deployments
 |----------|---------|
 | ReputationAggregator (ETH-funded) | `0xe8a385E473EA710c5a88Cc72681a16a26fe380e4` |
 | LINK Token (transport / legacy) | `0xE4aB69C077896252FAFBD49EFD26B5D171A32410` |
-| Verdikta Token | `0x50f0C663931A5F9caDF36EFd0BE4E4D18196200e` |
+| Verdikta Token | `0xe46F6b494F111d958CDBB52536AD78c4eEeB0149` |
 | Wrapped Verdikta Token (Aggregator) | `0x2F1d1aF9d5C25A48C29f56f57c7BAFFa7cc910a3` |
 | Wrapped Verdikta Token (Singleton) | `0x94e3c031fe9403c80E14DaFbCb73f191C683c2B1` |
 | ReputationKeeper (Singleton) | `0xE09821277D9af702F7910a57e85EaC6D83e4d794` |

@@ -21,7 +21,8 @@ const INCREMENT_DURATION  = 30_000;      // ms between polling rounds
 
 const JOB_CLASS           = 128;   // must match a class your ETH arbiters registered for (128 is proven working)
 // const JOB_CLASS           = 717;
-// ETH-denominated (wei). Request ceiling must be >= the arbiters' fee (0.0001 ETH)
+// ETH-denominated (wei). Request ceiling must be >= the arbiters' fee (0.00002 ETH on
+// Base and Base Sepolia on 2026-11-22; read it from the keeper's getOracleInfo)
 // and <= the aggregator's maxOracleFee (0.0004 ETH); base cost must be < the ceiling.
 const MAX_ORACLE_FEE      = ethers.parseEther("0.0001");      // typical fee
 const ESTIMATE_BASE_FEE   = ethers.parseEther("0.000000008"); // 8e9 wei
