@@ -106,6 +106,17 @@ deploying v2 here, so the new release isn't the first thing to run on a freshly 
     permanent.
   - Root SSH login with a password is enabled. Switch to key-only login, carefully: done wrong, it
     locks everyone out.
+- **Follow-up: move from Node 22 to Node 24 LTS (added 2026-11-23).** Node 22 reaches end of life on
+  2027-04-30, after which it gets no security fixes. Finish the move before then.
+  - Now: every service on the droplet (the `verdikta-*` units and `alva-membership`) runs
+    `/opt/node22/bin/node`. That is a symlink to nvm's v22.23.5, installed 2026-11-23.
+  - Install Node 24 with nvm alongside 22. Rebuild each app's `node_modules` on 24 and test it there
+    (client builds, server start, the apps' own tests) before switching any unit.
+  - Check `alva-membership` separately: it uses `node:sqlite`, which is still experimental.
+  - Switch one unit at a time, with 22 kept for rollback, as was done for 22.23.5. The steps and
+    rollback are in `/root/pre-upgrade-2026-11-22/POST-UPGRADE-NOTES.md`.
+  - Do it separately from the v2 rollout, so that if something breaks, it's clear which change
+    caused it.
 
 ### Testnet (item 16)
 - Deploy to Base Sepolia and run nodes on the `beacon` branch. Done when a Small round and a Jumbo
