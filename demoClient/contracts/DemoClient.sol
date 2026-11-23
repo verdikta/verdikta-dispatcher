@@ -41,7 +41,7 @@ contract DemoClient {
 
     /// @notice Start an evaluation, funding it with the attached ETH (and/or this contract's
     ///         accumulated refund credit inside the aggregator). Fee params are ETH-wei:
-    ///         request ceiling 0.00015 ETH (>= the 0.0001 arbiter fee, <= the 0.0004 cap),
+    ///         request ceiling 0.00015 ETH (>= the 0.00002 arbiter fee, <= the 0.0004 cap),
     ///         base cost 8e9 wei.
     function request() external payable {
         require(currentAggId == bytes32(0), "already pending");

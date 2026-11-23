@@ -45,7 +45,7 @@ function registerOracle(
 |-----------|------|-------------|
 | `_oracle` | `address` | ArbiterOperator contract address |
 | `_jobId` | `bytes32` | Unique job identifier for this oracle service |
-| `fee` | `uint256` | LINK fee required per request |
+| `fee` | `uint256` | Fee the oracle charges per request (must be greater than 0). The keeper stores it as a plain number and takes no payment itself: the contract that selects the oracle decides what the number means. The ReputationAggregator reads it as wei of ETH; the legacy ReputationSingleton reads it as LINK |
 | `_classes` | `uint64[]` | Oracle classes/specializations (max 5) |
 
 #### Requirements
@@ -148,7 +148,7 @@ struct OracleInfo {
     uint256 stakeAmount;      // VDKA tokens staked
     bool isActive;            // Available for selection
     bytes32 jobId;            // Job identifier
-    uint256 fee;              // LINK fee per request
+    uint256 fee;              // Fee per request, in the unit of the calling contract (wei of ETH for the ReputationAggregator)
     uint256 callCount;        // Total requests served
     ScoreRecord[] recentScores; // Performance history
     uint256 lockedUntil;      // Lock expiration timestamp
@@ -249,8 +249,9 @@ contract MyDispatcher {
         return reputationKeeper.selectOracles(
             count,
             500,        // 50% weight on timeliness
-            0.1 ether,  // max 0.1 LINK fee
-            0.01 ether, // base cost
+            4e14,       // highest fee accepted, in the same unit as the oracles' registered fees
+                        // (wei of ETH for the ReputationAggregator: 4e14 = 0.0004 ETH)
+            8e9,        // base cost, lower than the highest fee
             5,          // max 5x scaling
             oracleClass
         );

@@ -14,7 +14,8 @@ const AGG   = process.env.AGG || (hre.network.name === 'base'
 const CID   = process.env.CID || 'Qma8vc6pEHEgFQkjS6qZbK4Ue8S7SkdhQ6eqLV2hcrDD53';
 const JOB   = 128;
 const ALPHA = 500;
-// ETH-denominated (wei). Request ceiling must be >= the arbiters' fee (0.0001 ETH)
+// ETH-denominated (wei). Request ceiling must be >= the arbiters' fee (0.00002 ETH on
+// Base and Base Sepolia on 2026-11-22; read it from the keeper's getOracleInfo)
 // and <= the aggregator's maxOracleFee (0.0004 ETH); base cost must be < the ceiling.
 const FEE   = 150_000_000_000_000n;   // 1.5e14 wei = 0.00015 ETH requested ceiling
 const BASE  = 8_000_000_000n;         // 8e9 wei estimated base cost

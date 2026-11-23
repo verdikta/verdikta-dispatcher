@@ -87,7 +87,7 @@ LINK addresses below are retained for Chainlink transport and legacy deployments
 |----------|---------|
 | ReputationAggregator (ETH-funded) | `0xe8a385E473EA710c5a88Cc72681a16a26fe380e4` |
 | LINK Token (transport / legacy) | `0xE4aB69C077896252FAFBD49EFD26B5D171A32410` |
-| Verdikta Token | `0x50f0C663931A5F9caDF36EFd0BE4E4D18196200e` |
+| Verdikta Token | `0xe46F6b494F111d958CDBB52536AD78c4eEeB0149` |
 | Wrapped Verdikta Token (Aggregator) | `0x2F1d1aF9d5C25A48C29f56f57c7BAFFa7cc910a3` |
 | Wrapped Verdikta Token (Singleton) | `0x94e3c031fe9403c80E14DaFbCb73f191C683c2B1` |
 | ReputationKeeper (Singleton) | `0xE09821277D9af702F7910a57e85EaC6D83e4d794` |
@@ -141,8 +141,9 @@ Key pages:
 - [Oracle Selection](docs/advanced/oracle-selection.md) — weighted selection algorithm
 - [ETH Payment Implementation](docs/advanced/eth-payment-migration.md) — current aggregator funding, credits, settlement, and withdrawals; read the implementation notes before the historical design sections
 - [Current Query Example](reputationBasedAggregator/scripts/single-query.js) — attach ETH after accounting for existing credit
-- [Legacy Fee Mechanisms](docs/advanced/fees.md) — historical LINK-payment and VDKA-staking reference; LINK payment instructions do not apply to the current ETH aggregator
-- [Legacy Integration Walkthrough](docs/examples/integration.md) — historical LINK-based client example; use the ETH implementation notes and current query script for new integrations
+- [Fee Mechanisms](docs/advanced/fees.md) — ETH fees, prepayment and refunds for the aggregator; LINK fees for the legacy contracts
+- [Integration Walkthrough](docs/examples/integration.md) — the ETH-funded DemoClient step by step: funding a request, timeouts and refunds
+- [Integration Examples](docs/examples/index.md) — client contracts, a Hardhat test and frontend code for the ETH-funded aggregator
 
 ## Contributing
 

@@ -94,7 +94,18 @@ if (!TARGET) {
     // as a credit it holds for the DemoClient). No LINK approval is needed any more.
     const value = await demo.quote();
     console.log("attaching value (wei):", value.toString());
-    const txReq = await demo.request({ value, gasLimit: 3_000_000n });
+    // Estimate gas per call (+50% headroom), as reputationBasedAggregator/scripts/single-query.js
+    // does: the request cost grows with the oracle registry and varies with the randomized
+    // selection, so a fixed limit goes stale (3,000,000 ran out of gas on forks of Base and
+    // Base Sepolia on 2026-11-22). Fall back to a fixed limit if the estimate call itself fails.
+    let gasLimit;
+    try {
+      gasLimit = ((await demo.request.estimateGas({ value })) * 150n) / 100n;
+    } catch {
+      gasLimit = 6_000_000n;
+    }
+    console.log("gasLimit:", gasLimit.toString());
+    const txReq = await demo.request({ value, gasLimit });
     console.log("request tx:", txReq.hash);
     const rcpt = await txReq.wait(1);
     
