@@ -446,6 +446,8 @@ class VerdiktaDispatcher {
         return tx.wait();
     }
 
+    // Each callback is called with one argument, the event: with a filter
+    // object ethers v6 does not spread the values, they are in event.args
     watchProgress(aggregatorId, callbacks = {}) {
         const filters = {
             commitReceived: this.contract.filters.CommitReceived(aggregatorId),

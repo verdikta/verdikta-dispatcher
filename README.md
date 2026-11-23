@@ -141,8 +141,9 @@ Key pages:
 - [Oracle Selection](docs/advanced/oracle-selection.md) — weighted selection algorithm
 - [ETH Payment Implementation](docs/advanced/eth-payment-migration.md) — current aggregator funding, credits, settlement, and withdrawals; read the implementation notes before the historical design sections
 - [Current Query Example](reputationBasedAggregator/scripts/single-query.js) — attach ETH after accounting for existing credit
-- [Legacy Fee Mechanisms](docs/advanced/fees.md) — historical LINK-payment and VDKA-staking reference; LINK payment instructions do not apply to the current ETH aggregator
-- [Legacy Integration Walkthrough](docs/examples/integration.md) — historical LINK-based client example; use the ETH implementation notes and current query script for new integrations
+- [Fee Mechanisms](docs/advanced/fees.md) — ETH fees, prepayment and refunds for the aggregator; LINK fees for the legacy contracts
+- [Integration Walkthrough](docs/examples/integration.md) — the ETH-funded DemoClient step by step: funding a request, timeouts and refunds
+- [Integration Examples](docs/examples/index.md) — client contracts, a Hardhat test and frontend code for the ETH-funded aggregator
 
 ## Contributing
 
