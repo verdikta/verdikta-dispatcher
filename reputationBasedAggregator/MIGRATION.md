@@ -38,7 +38,8 @@ comparing the two ABIs and the code that calls them.
   - The node generates a hash chain (item 6: seed `s`, `v_{i-1} = keccak256(v_i)`) and registers the
     head.
   - **A head of 0 is allowed** (registration from a browser, which cannot hold the chain). The arbiter
-    starts frozen in re-sync (flag 64), and the node sets its chain as below.
+    starts frozen in re-sync (flag 64, with a call pending), and its node's health job sets its chain as
+    below.
   - `requestExit` + `completeExit` (after the unbonding period: 2 days by default, never less)
     replace `deregisterOracle`. Either the operator owner or the keeper owner may run both, also for
     a frozen arbiter. `setPaused` replaces `setOracleActive`.
@@ -58,20 +59,20 @@ comparing the two ABIs and the code that calls them.
     - Implemented on the arbiter's `beacon` branch: `external-adapter/src/health/`,
       `chainlink-node/healthJobSpec`.
   - Rotate the chain before it runs out with `rotateChain`.
-  - **Chain re-sync (added 2026-11-23).** `answerHealthCall` with a value that does not hash to the head
-    no longer reverts. The keeper adopts the value as the head, emits `ChainResynced(key)`, sets flag 64
-    and freezes the arbiter at once.
-    - The arbiter stays frozen until it answers a call sent *after* the re-sync: from selection, the
-      owner's `sendHealthCalls`, or the node's own `requestHealthCall(key)` (new; the operator's owner
-      or an authorized sender).
-    - Valid answers before that call move the head but do not unfreeze. `healthState` reports
-      `pending = false` during a re-sync, so the cron job doesn't spend chain values on it.
-    - `rotateChain` never re-syncs: a wrong preimage still reverts `BadPreimage`.
+  - **Chain re-sync (added 2026-11-23).** An answer whose value does not hash to the head no longer
+    reverts: `answerHealthCall(key, v)`, or `rotateChain(key, v, v)` (the health job's form). The keeper
+    adopts `v` as the head, emits `ChainResynced(key)`, sets flag 64 and freezes the arbiter at once.
+    - It stays frozen until it answers a call sent *after* the re-sync. That call comes from selection,
+      the owner's `sendHealthCalls`, `requestHealthCall(key)` (new; the operator's owner or an authorized
+      sender), or the arbiter's own first valid answer after the re-sync, which sends it. So the health
+      job alone recovers: re-sync, answer (sends the call), answer (unfreezes).
+    - `healthState` keeps reporting `pending = true` throughout, so the job keeps calling the adapter.
+    - A rotation to a different head still needs a valid preimage (`BadPreimage`).
     - A re-synced value is never a beacon value (`revealAfter` takes only a value that hashes to the
       head before it). A re-sync is not retroactive: a round that ended before it is judged as it was.
-    - The node re-syncs when its chain does not match the head (registered with head 0, or its chain
-      files lost): send its next value with `answerHealthCall`, then `requestHealthCall`, then answer.
-  - Calls go to every drawn juror, to `liveRandom` other shortlisted arbiters, and to beacons.
+    - The adapter re-syncs onto a **fresh** chain when the keeper's head is on none of its stored chains
+      (registered with head 0, or the chain files lost) or its chain is used up. Reusing a chain whose
+      values were already revealed would make the arbiter's beacon values predictable.
 - **Beacon calls need no extra code.** A beacon call is a keeper `HealthCall`, and the answer to it is
   the beacon value. `JuryBeacons` emits `BeaconCalled(aggregator, aggId, index, key, deadline)` for
   information. A beacon's value is used, and paid one fee, only if it is among the first 2 revealed

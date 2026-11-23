@@ -82,8 +82,8 @@ describe("JuryBeacons (item 9's beacon flag)", function () {
     const V = await valueBlock(r);
     const other = H.makeChain();
     await expect(keeper.connect(b.arb.node).answerHealthCall(b.key, other.head)).to.emit(keeper, "ChainResynced");
-    await keeper.connect(b.arb.node).requestHealthCall(b.key);
-    await keeper.connect(b.arb.node).answerHealthCall(b.key, other.next());   // a valid answer, after the re-sync
+    await keeper.connect(b.arb.node).answerHealthCall(b.key, other.next());   // valid answers, after the re-sync
+    await keeper.connect(b.arb.node).answerHealthCall(b.key, other.next());
     expect((await keeper.revealAfter(b.key, V)).value).to.equal(ethers.ZeroHash);
   });
 
@@ -98,9 +98,9 @@ describe("JuryBeacons (item 9's beacon flag)", function () {
     await expect(keeper.connect(stranger).answerHealthCall(b.key, v))
       .to.be.revertedWithCustomError(keeper, "NotAuthorizedResponder");
     // verified: a wrong value can't be revealed (a plain answer would re-sync instead; see below)
-    await expect(keeper.connect(b.arb.node).rotateChain(b.key, ethers.ZeroHash, ethers.ZeroHash))
+    await expect(keeper.connect(b.arb.node).rotateChain(b.key, ethers.ZeroHash, H.makeChain().head))
       .to.be.revertedWithCustomError(keeper, "BadPreimage");
-    await expect(keeper.connect(b.arb.node).rotateChain(b.key, ch.preimageOf(v), ch.preimageOf(v)))   // skips a value
+    await expect(keeper.connect(b.arb.node).rotateChain(b.key, ch.preimageOf(v), H.makeChain().head))   // skips a value
       .to.be.revertedWithCustomError(keeper, "BadPreimage");
     expect((await keeper.revealAfter(b.key, V)).value).to.equal(ethers.ZeroHash);
     const rc = await drv.answerBeacon(r, 0);

@@ -61,7 +61,7 @@ contract ReputationKeeper is Ownable {
     uint8 private constant F_EXITING = 8;
     uint8 private constant F_CALL_PENDING = 16;   // a health call is outstanding
     uint8 private constant F_UNDERSTAKED = 32;    // stake below the requirement (checkpointed, item 9)
-    uint8 private constant F_RESYNC = 64;         // chain re-synced: frozen until a later call is answered
+    uint8 private constant F_RESYNC = 64;         // chain re-synced: frozen until a call sent after it is answered
 
     uint8 public constant T_NONE = 0;
     uint8 public constant T_DELIVERED = 1;      // promoted and the reveal arrived (even late)
@@ -408,16 +408,18 @@ contract ReputationKeeper is Ownable {
     ///         Answering at any time after a freeze unfreezes the arbiter.
     ///         A value that does not hash to the head re-syncs the chain instead (see _answer): a node
     ///         whose chain does not match the head (registered with head 0, or its chain files lost)
-    ///         sends its own next value and is frozen until it answers a call sent after that.
+    ///         sends the head of a fresh chain and is frozen until it answers a call sent after that.
     function answerHealthCall(bytes32 key, bytes32 preimage) external {
-        _answer(key, preimage, preimage, msg.sender, true);
+        _answer(key, preimage, preimage, msg.sender);
     }
 
     /// @notice Answer (as above) and replace the hash chain in the same transaction, before the current
     ///         one runs out. The answer comes from the old chain; the new head applies to later calls
     ///         only, so a rotation cannot choose the value of a call already sent.
+    ///         With newHead == preimage it is exactly answerHealthCall (the node's health job always sends
+    ///         rotateChain), re-sync included. A rotation to a different head needs a valid preimage.
     function rotateChain(bytes32 key, bytes32 preimage, bytes32 newHead) external {
-        _answer(key, preimage, newHead, msg.sender, false);
+        _answer(key, preimage, newHead, msg.sender);
     }
 
     /// @notice Item 7's self-service health call: the arbiter's owner or node asks for a call, to end a
@@ -439,21 +441,23 @@ contract ReputationKeeper is Ownable {
     }
 
     /**
-     * @dev An answer. A preimage of the head is revealed (readable by revealAfter) and, unless the chain
-     *      is re-syncing, ends an outstanding call. Otherwise: a rotation reverts; a plain answer re-syncs.
-     *      A re-sync pushes the value as the new head and freezes the arbiter until it answers a call sent
-     *      after it. It is never a beacon value: revealAfter takes only a value that hashes to the head
+     * @dev An answer. A preimage of the head is revealed (readable by revealAfter) and ends an outstanding
+     *      call. A value that is not one re-syncs the chain (a rotation to another head reverts instead):
+     *      it becomes the new head and the arbiter is frozen until it answers a call sent after the
+     *      re-sync. That call comes from selection, the owner, requestHealthCall, or the arbiter's first
+     *      valid answer after the re-sync, which sends it (so a node needs no other transaction).
+     *      A re-synced value is never a beacon value: revealAfter takes only a value that hashes to the head
      *      before it, so a beacon that re-syncs after B+1 counts as having withheld. The next value was
      *      fixed at the re-sync, as at a rotation, and the freeze is one the arbiter could get by not
      *      answering. So a re-sync gives no choice of beacon value and no dodge it does not have already.
      */
-    function _answer(bytes32 key, bytes32 preimage, bytes32 nextHead, address responder, bool mayResync) internal {
+    function _answer(bytes32 key, bytes32 preimage, bytes32 nextHead, address responder) internal {
         Meta storage m = metas[key];
         Ck memory c = _cur(key);
         if (c.flags & F_REGISTERED == 0) revert NotRegistered();
         _onlyResponder(m.oracle, responder);
         if (keccak256(abi.encodePacked(preimage)) != _headAt(key, block.number)) {
-            if (!mayResync) revert BadPreimage();
+            if (nextHead != preimage) revert BadPreimage();
             _setHead(key, preimage);                     // not a reveal: revealAfter's keccak check skips it
             _resyncFreeze(c);
             _write(key, c);
@@ -462,9 +466,13 @@ contract ReputationKeeper is Ownable {
         }
         _setHead(key, preimage);                         // the revealed value, readable by revealAfter
         if (nextHead != preimage) _setHead(key, nextHead);   // a rotation: the new chain applies from here
-        // only an answer to an outstanding call moves callAnsweredAt (round-end freeze checks rely on it);
-        // during a re-sync no call is outstanding until one is sent after it (_call clears F_RESYNC)
-        if (c.flags & (F_CALL_PENDING | F_RESYNC) == F_CALL_PENDING) {
+        if (c.flags & F_RESYNC != 0) {
+            // the first valid answer after a re-sync sends the call it waits for; still frozen until answered
+            c.flags &= ~F_RESYNC;
+            _write(key, c);
+            emit HealthCall(key, block.timestamp);
+        } else if (c.flags & F_CALL_PENDING != 0) {
+            // only an answer to an outstanding call moves callAnsweredAt (round-end freeze checks rely on it)
             c.callAnsweredAt = uint40(block.timestamp);
             c.flags &= ~F_CALL_PENDING;
             _write(key, c);
@@ -887,7 +895,7 @@ contract ReputationKeeper is Ownable {
     ///         One call, so a Chainlink job can read it with a single ethcall (TODO item 16).
     function healthState(bytes32 key) external view returns (bool pending, uint256 sentAt, bytes32 head) {
         Ck memory c = _cur(key);
-        pending = c.flags & (F_CALL_PENDING | F_RESYNC) == F_CALL_PENDING;   // re-syncing: no call to answer yet
+        pending = c.flags & F_CALL_PENDING != 0;         // also while re-syncing: the next answer sends the call
         sentAt = c.callSentAt;
         HeadCk[] storage a = heads[key];
         if (a.length > 0) head = a[a.length - 1].head;

@@ -348,7 +348,7 @@ describe("ReputationKeeper rules (item 14)", function () {
       expect((await info(a.key)).timeliness).to.equal(500n);
 
       // a rotation needs the right preimage, and unauthorized senders are rejected
-      await expect(keeper.connect(a.node).rotateChain(a.key, ethers.ZeroHash, ethers.ZeroHash))
+      await expect(keeper.connect(a.node).rotateChain(a.key, ethers.ZeroHash, H.makeChain().head))
         .to.be.revertedWithCustomError(keeper, "BadPreimage");
       const stranger = (await ethers.getSigners())[3];
       await expect(keeper.connect(stranger).answerHealthCall(a.key, a.ch.chain[a.ch.chain.length - 2]))
@@ -437,8 +437,9 @@ describe("ReputationKeeper rules (item 14)", function () {
 
   describe("chain re-sync (a mismatched answer)", () => {
     // A node whose chain does not match the keeper's head (registered from a browser with head 0,
-    // or its chain files lost) answers with its own next value: the keeper adopts it as the head
-    // and freezes the arbiter until it answers a health call sent after the re-sync.
+    // or its chain files lost) answers with a fresh chain's head: the keeper adopts it as the head
+    // and freezes the arbiter until it answers a health call sent after the re-sync. The node's first
+    // valid answer after the re-sync sends that call, so its health job needs no other transaction.
     const RESYNC = 64n;
     const flagsOf = async (k) => (await info(k)).flags;
 
@@ -451,25 +452,35 @@ describe("ReputationKeeper rules (item 14)", function () {
       expect(await keeper.isEligible(a.key, H.MAX_FEE)).to.equal(false);
       expect((await flagsOf(a.key)) & RESYNC).to.equal(RESYNC);
       const [pending, , head] = await keeper.healthState(a.key);
-      expect(pending).to.equal(false);                                        // no call to answer yet
+      expect(pending).to.equal(true);                                         // the node's job keeps answering
       expect(head).to.equal(other.head);
     });
 
-    it("valid answers before a new call move the head but do not unfreeze; the next call's answer does", async () => {
+    it("the first valid answer after a re-sync sends the call (still frozen); answering it unfreezes", async () => {
+      const a = arbs[0];
+      const other = H.makeChain();
+      await keeper.connect(a.node).rotateChain(a.key, other.head, other.head);   // the job's form
+      await expect(keeper.connect(a.node).rotateChain(a.key, other.next(), other.chain[other.chain.length - 2]))
+        .to.emit(keeper, "HealthCall");
+      expect((await flagsOf(a.key)) & RESYNC).to.equal(0n);
+      expect(await keeper.isFrozen(a.key)).to.equal(true);                    // until the call is answered
+      expect((await keeper.healthState(a.key))[0]).to.equal(true);
+      const v = other.next();
+      await keeper.connect(a.node).rotateChain(a.key, v, v);
+      expect(await keeper.isFrozen(a.key)).to.equal(false);
+      expect(await keeper.isEligible(a.key, H.MAX_FEE)).to.equal(true);
+      expect((await keeper.healthState(a.key))[0]).to.equal(false);
+    });
+
+    it("requestHealthCall after a re-sync sends the call; answering it unfreezes", async () => {
       const a = arbs[0];
       const other = H.makeChain();
       await keeper.connect(a.node).answerHealthCall(a.key, other.head);
-      await keeper.connect(a.node).answerHealthCall(a.key, other.next());
-      expect(await keeper.isFrozen(a.key)).to.equal(true);
-      expect((await keeper.healthState(a.key))[2]).to.equal(other.chain[other.chain.length - 2]);
-
       await expect(keeper.connect(a.node).requestHealthCall(a.key)).to.emit(keeper, "HealthCall");
       expect((await flagsOf(a.key)) & RESYNC).to.equal(0n);
-      expect((await keeper.healthState(a.key))[0]).to.equal(true);          // now a call to answer
-      expect(await keeper.isFrozen(a.key)).to.equal(true);                    // still frozen until answered
+      expect(await keeper.isFrozen(a.key)).to.equal(true);
       await keeper.connect(a.node).answerHealthCall(a.key, other.next());
       expect(await keeper.isFrozen(a.key)).to.equal(false);
-      expect(await keeper.isEligible(a.key, H.MAX_FEE)).to.equal(true);
     });
 
     it("a call from selection or the owner also ends the re-sync", async () => {
@@ -490,17 +501,17 @@ describe("ReputationKeeper rules (item 14)", function () {
       expect(v).to.equal(ethers.ZeroHash);                                    // withheld, as far as b0 goes
       const b1 = BigInt(await ethers.provider.getBlockNumber());
       const x = other.next();
-      await keeper.connect(a.node).answerHealthCall(a.key, x);
+      await keeper.connect(a.node).answerHealthCall(a.key, x);                // ends the re-sync (sends the call)
       [v] = await keeper.revealAfter(a.key, b1);
       expect(v).to.equal(x);                                                  // fixed at the re-sync, before b1
       [v] = await keeper.revealAfter(a.key, b0);
       expect(v).to.equal(ethers.ZeroHash);
     });
 
-    it("rotateChain never re-syncs: a wrong preimage reverts and changes nothing", async () => {
+    it("a rotation to a different head never re-syncs: a wrong preimage reverts and changes nothing", async () => {
       const a = arbs[0];
       const fresh = H.makeChain();
-      await expect(keeper.connect(a.node).rotateChain(a.key, fresh.head, fresh.head))
+      await expect(keeper.connect(a.node).rotateChain(a.key, fresh.head, H.makeChain().head))
         .to.be.revertedWithCustomError(keeper, "BadPreimage");
       expect((await keeper.healthState(a.key))[2]).to.equal(a.ch.head);
       expect(await keeper.isFrozen(a.key)).to.equal(false);
@@ -544,12 +555,13 @@ describe("ReputationKeeper rules (item 14)", function () {
       const key = await keeper.keyOf(await op.getAddress(), jobId);
       expect(await keeper.isFrozen(key)).to.equal(true);
       expect((await flagsOf(key)) & RESYNC).to.equal(RESYNC);
-      expect((await keeper.healthState(key))[0]).to.equal(false);
+      expect((await keeper.healthState(key))[0]).to.equal(true);             // so the node's job runs
 
       const ch = H.makeChain();
       await keeper.connect(node).answerHealthCall(key, ch.head);              // the node's own chain
-      await keeper.connect(node).requestHealthCall(key);
-      await keeper.connect(node).answerHealthCall(key, ch.next());
+      await keeper.connect(node).answerHealthCall(key, ch.next());            // sends the call
+      expect(await keeper.isEligible(key, H.MAX_FEE)).to.equal(false);
+      await keeper.connect(node).answerHealthCall(key, ch.next());            // answers it
       expect(await keeper.isEligible(key, H.MAX_FEE)).to.equal(true);
     });
   });
