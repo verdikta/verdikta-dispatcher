@@ -160,14 +160,34 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
       for (const s of drv.promotedSlots(r).slice(0, 4)) await drv.reveal(r, s);
       expect((await agg.getEvaluation(r.aggId))[2]).to.equal(true);
       await time.increase(301);
-      await drv.requestOnly({ value: await agg.maxTotalFee(H.MAX_FEE, 0, false) });    // settles r via the queue
+      await drv.requestOnly({ value: await H.quote(agg, H.MAX_FEE, 0, false) });    // settles r via the queue
       expect((await agg.getRoundInfo(r.aggId))[0]).to.equal(7n);              // PH_SETTLED
     });
 
     it("rejects a scaling factor that would not fit its uint16 field", async () => {
-      const v = await agg.maxTotalFee(H.MAX_FEE, 0, false);
-      await expect(agg.connect(requester).requestAIEvaluationWithApproval(["Qm"], "", 500, H.MAX_FEE, 0, H.BASE_COST, 65536, 1, false, { value: v }))
+      const v = await H.quote(agg, H.MAX_FEE, 0, false);
+      await expect(agg.connect(requester).requestAIEvaluationWithApproval(["Qm"], "", 500, H.MAX_FEE, 0, H.BASE_COST, 65536, 1, false, H.JURY, { value: v }))
         .to.be.revertedWithCustomError(agg, "BadInput");
+    });
+
+    it("a request settles due rounds within settlePerRequest x its own K slots; a round too big waits, in order", async () => {
+      drv.jury = H.jury(12, 9, 8, 5, 300);                                    // 12 slots
+      const big = await drv.fullRound({ settle: false });
+      drv.jury = H.JURY;                                                       // 6 slots
+      const small = await drv.fullRound({ settle: false });
+      await time.increase(301);
+      const settled = (rc) => eventArgs(rc, "RoundSettled").map((a) => a.aggRequestId);
+      // K = 5: a budget of 10 slots, below the big round at the head, which is not skipped
+      expect(settled((await drv.requestOnly({ jury: H.jury(5, 5, 4, 3) })).reqRcpt)).to.deep.equal([]);
+      // K = 6: 12 slots, the big round exactly, then nothing left for the small one
+      expect(settled((await drv.requestOnly()).reqRcpt)).to.deep.equal([big.aggId]);
+      expect(settled((await drv.requestOnly()).reqRcpt)).to.deep.equal([small.aggId]);
+      // anyone may settle a round the queue is holding back
+      drv.jury = H.jury(12, 9, 8, 5, 300);
+      const big2 = await drv.fullRound({ settle: false });
+      await time.increase(301);
+      await agg.connect(stranger).settle(big2.aggId);
+      expect((await agg.getRoundInfo(big2.aggId))[0]).to.equal(7n);
     });
 
     it("undrawn rounds do not hold up the settlement queue", async () => {
@@ -181,7 +201,7 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
 
   describe("M+ / T+ promotion (item 14)", () => {
     beforeEach(async () => {
-      await agg.setConfig(8, 5, 4, 3, 300, 155);                                   // Medium: M+ = 5 + ceil(3/2) = 7
+      drv.jury = H.jury(8, 5, 4, 3, 300);                                          // Medium: M+ = 5 + ceil(3/2) = 7
     });
 
     it("the M+-th commit closes the commit phase; promote() at C+2 draws M of the commits; later commits are ignored", async () => {
@@ -204,7 +224,7 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
     });
 
     it("the promoted set is the same whoever calls promote() and whenever, also past 256 blocks via EIP-2935", async () => {
-      await agg.setConfig(8, 5, 4, 3, 1000, 155);                                  // Hardhat mines 1 s per block
+      drv.jury = H.jury(8, 5, 4, 3, 1000);                                         // Hardhat mines 1 s per block
       const r = await drv.request();
       await drv.answerAll(r);
       await commitAll(r, [0, 1, 2, 3, 4, 5, 6]);
@@ -403,7 +423,7 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
     });
 
     it("M commits but nobody closed the phase after T+: the round fails, nobody is charged, and the prepay goes to the treasury", async () => {
-      await agg.setConfig(8, 5, 4, 3, 300, 155);
+      drv.jury = H.jury(8, 5, 4, 3, 300);
       const r = await drv.request();
       await drv.answerAll(r);
       await commitAll(r, [0, 1, 2, 3, 4]);                                    // M commits, before T+; nobody closes
@@ -422,7 +442,7 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
     });
 
     it("a commit that closes the phase in the deadline's last second still leaves time to promote", async () => {
-      await agg.setConfig(8, 5, 4, 3, 300, 155);
+      drv.jury = H.jury(8, 5, 4, 3, 300);
       const r = await drv.request();
       const t0 = (await ethers.provider.getBlock(r.rcpt.blockNumber)).timestamp;
       await drv.answerAll(r);
@@ -464,7 +484,7 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
 
     it("credit covers only what msg.value does not, and an overpayment returns to credit", async () => {
       await drv.fullRound();
-      const required = await agg.maxTotalFee(H.MAX_FEE, 0, false);
+      const required = await H.quote(agg, H.MAX_FEE, 0, false);
       const c0 = await agg.ethOwed(requester.address);
       expect(c0 > 0n && c0 < required).to.equal(true);                        // the refund and draw reward
       const x = await drv.requestOnly({ value: required });                   // fully paid: credit untouched
@@ -691,24 +711,24 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
   });
 
   describe("fee floor (item 8)", () => {
-    const B = 3n, Pn = 3n, Kn = 6n;   // the defaults: bonus multiplier, P, K
+    const B = 3n, Pn = 3n, Kn = 6n;   // the default bonus multiplier, and H.JURY's P and K
     const basePaid = (rcpt) => eventArgs(rcpt, "BasePayment").map((a) => a.amount);
 
     it("maxTotalFee: a floor at or below the ceiling changes nothing; above it, jurors are sized on the floor and rewards on the ceiling", async () => {
-      const plain = await agg.maxTotalFee(H.MAX_FEE, 0, false);
+      const plain = await H.quote(agg, H.MAX_FEE, 0, false);
       expect(plain).to.equal(H.MAX_FEE * (Kn + B * Pn + 3n));                  // + draw (2) and promote (1) rewards
-      expect(await agg.maxTotalFee(H.MAX_FEE, H.MAX_FEE, false)).to.equal(plain);
-      expect(await agg.maxTotalFee(H.MAX_FEE, H.MAX_FEE / 2n, false)).to.equal(plain);
+      expect(await H.quote(agg, H.MAX_FEE, H.MAX_FEE, false)).to.equal(plain);
+      expect(await H.quote(agg, H.MAX_FEE, H.MAX_FEE / 2n, false)).to.equal(plain);
       const f = 10n * H.MAX_FEE;                                               // above the ceiling: allowed
-      expect(await agg.maxTotalFee(H.MAX_FEE, f, false)).to.equal(f * (Kn + B * Pn) + H.MAX_FEE * 3n);
+      expect(await H.quote(agg, H.MAX_FEE, f, false)).to.equal(f * (Kn + B * Pn) + H.MAX_FEE * 3n);
       // the global ceiling applies to the requester's ceiling, never to the floor
       await agg.setParams(3, 2, 250_000, 30_000, H.MAX_FEE / 2n);
-      expect(await agg.maxTotalFee(H.MAX_FEE, f, false)).to.equal(f * (Kn + B * Pn) + (H.MAX_FEE / 2n) * 3n);
+      expect(await H.quote(agg, H.MAX_FEE, f, false)).to.equal(f * (Kn + B * Pn) + (H.MAX_FEE / 2n) * 3n);
     });
 
     it("a floor above every posted fee (and above the ceiling) pays each juror the floor and each cluster member B x the floor; the rest is refunded", async () => {
       const f = 10n * H.MAX_FEE;
-      const required = await agg.maxTotalFee(H.MAX_FEE, f, false);
+      const required = await H.quote(agg, H.MAX_FEE, f, false);
       const c0 = await agg.ethOwed(requester.address);
       const r = await drv.fullRound({ request: { minFee: f, value: required } });
       expect(basePaid(r.rcpt)).to.deep.equal(Array(6).fill(f));
@@ -738,7 +758,7 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
 
     it("rejects a floor whose escrow would not fit in 88 bits (the narrowest credited total)", async () => {
       const f = 2n ** 88n / 15n;                                               // x (K + B x P) = 15, plus the rewards, passes 2^88
-      await expect(agg.connect(requester).requestAIEvaluationWithApproval(["Qm"], "", 500, H.MAX_FEE, f, H.BASE_COST, 5, 1, false))
+      await expect(agg.connect(requester).requestAIEvaluationWithApproval(["Qm"], "", 500, H.MAX_FEE, f, H.BASE_COST, 5, 1, false, H.JURY))
         .to.be.revertedWithCustomError(agg, "BadInput");
     });
 
@@ -753,14 +773,49 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
     });
   });
 
-  describe("configuration", () => {
-    it("rejects P = 1 with N > 1, and a timeout not above T+", async () => {
-      await expect(agg.setConfig(6, 5, 4, 1, 300, 155)).to.be.revertedWithCustomError(agg, "InvalidConfig");
-      await expect(agg.setConfig(6, 5, 4, 3, 155, 155)).to.be.revertedWithCustomError(agg, "InvalidConfig");
-      await agg.setConfig(1, 1, 1, 1, 300, 155);
-      await expect(agg.setConfig(1, 1, 1, 1, 300, 300)).to.be.revertedWithCustomError(agg, "InvalidConfig");
-      await agg.setConfig(1, 1, 1, 1, 300, 120);
-      expect(await agg.tPlus()).to.equal(120n);
+  describe("the request's jury (item 15)", () => {
+    const ask = (j, value) => agg.connect(requester).requestAIEvaluationWithApproval(
+      ["Qm"], "", 500, H.MAX_FEE, 0, H.BASE_COST, 5, 1, false, j, { value: value ?? 10n ** 17n });
+    const lib = () => core.aggLib;
+
+    it("refuses an unordered jury, P = 1 with N > 1, N above 40, and a timeout not above T+ or above maxTimeout", async () => {
+      for (const j of [H.jury(6, 5, 4, 1), H.jury(4, 5, 4, 3), H.jury(6, 5, 6, 3), H.jury(6, 5, 4, 5), H.jury(0, 0, 0, 0),
+                       H.jury(6, 5, 4, 3, 155), H.jury(6, 5, 4, 3, 3601), H.jury(50, 45, 41, 17, 600)]) {
+        await expect(ask(j)).to.be.revertedWithCustomError(lib(), "BadJury");
+      }
+      await ask(H.jury(1, 1, 1, 1, 300));                                       // one arbiter, one answer
+      await ask(H.jury(50, 45, 40, 17, 600));                                   // N = 40 is the most
+    });
+
+    it("refuses K above maxJury or above the keeper's shortlist, so a big jury never fills with repeats", async () => {
+      await agg.setLimits(8, 3600, 155);
+      await expect(ask(H.jury(9, 5, 4, 3))).to.be.revertedWithCustomError(lib(), "BadJury");
+      await ask(H.jury(8, 5, 4, 3));
+      await agg.setLimits(50, 3600, 155);
+      await keeper.setSelection(7, 400, 3);                                    // the shortlist below the jury
+      await expect(ask(H.jury(8, 5, 4, 3))).to.be.revertedWithCustomError(lib(), "BadJury");
+      await ask(H.jury(7, 5, 4, 3));
+    });
+
+    it("each round keeps the jury it was requested with: getJury, its M+, its N-th reveal and its own deadline", async () => {
+      const small = await drv.request();
+      drv.jury = H.jury(8, 5, 4, 3, 400);
+      const medium = await drv.request();
+      expect(await agg.getJury(small.aggId)).to.deep.equal([6n, 5n, 4n, 3n, 300n]);
+      expect(await agg.getJury(medium.aggId)).to.deep.equal([8n, 5n, 4n, 3n, 400n]);
+      expect(Object.keys(medium.slots)).to.have.length(8);
+      const t = BigInt((await ethers.provider.getBlock(medium.rcpt.blockNumber)).timestamp);
+      expect((await agg.getRoundInfo(medium.aggId)).deadline).to.equal(t + 400n);
+      expect(await agg.getJury(ethers.zeroPadValue("0x99", 32))).to.deep.equal([0n, 0n, 0n, 0n, 0n]);
+    });
+
+    it("setLimits: a jury of at least 1, T+ above 0 and below the longest timeout", async () => {
+      await expect(agg.setLimits(0, 3600, 155)).to.be.revertedWithCustomError(agg, "InvalidConfig");
+      await expect(agg.setLimits(50, 155, 155)).to.be.revertedWithCustomError(agg, "InvalidConfig");
+      await expect(agg.setLimits(50, 3600, 0)).to.be.revertedWithCustomError(agg, "InvalidConfig");
+      await expect(agg.connect(requester).setLimits(50, 3600, 155)).to.be.revertedWithCustomError(agg, "OwnableUnauthorizedAccount");
+      await agg.setLimits(50, 3600, 120);
+      expect([await agg.maxJury(), await agg.maxTimeout(), await agg.tPlus()]).to.deep.equal([50n, 3600n, 120n]);
     });
   });
 
@@ -948,14 +1003,12 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
       expect([...(await scoring.bestCluster(d, 2))]).to.deep.equal([false, true, true, false, false]);
     });
 
-    it("limits: the library refuses values above 1e34 or more than 20; the owner can't set N above 40 or a floor above 1e34", async () => {
+    it("limits: the library refuses values above 1e34 or more than 20; the owner can't set a floor above 1e34 (N above 40: the request's jury)", async () => {
       const { scoring } = core;
       await expect(scoring.bestCluster([[MAX + 1n], [0n], [1n]], 2)).to.be.revertedWithCustomError(scoring, "OutOfRange");
       await expect(scoring.classify([[0n, MAX + 1n], [0n, 0n]], 0)).to.be.revertedWithCustomError(scoring, "OutOfRange");
       await expect(scoring.bestCluster([Array(21).fill(0n), Array(21).fill(1n)], 2)).to.be.revertedWithCustomError(scoring, "OutOfRange");
       await expect(scoring.aggregate([[1n], [2n]], 2, 0, seedOf(1), [0])).to.be.revertedWithCustomError(scoring, "LengthMismatch");
-      await expect(agg.setConfig(50, 45, 41, 17, 600, 155)).to.be.revertedWithCustomError(agg, "InvalidConfig");
-      await agg.setConfig(50, 45, 40, 17, 600, 155);
       const p = [await agg.bonusMultiplier(), await agg.settlePerRequest(), await agg.dispatchGas(), 0, await agg.maxOracleFee()];
       await expect(agg.setParams(p[0], p[1], p[2], MAX + 1n, p[4])).to.be.revertedWithCustomError(agg, "InvalidConfig");
       await agg.setParams(p[0], p[1], p[2], MAX, p[4]);
@@ -1054,12 +1107,12 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
       const t = await blockTime(rc);
       i = await info(r);
       expect(i.phase).to.equal(3n);
-      expect(i.deadline).to.equal(t + (await agg.responseTimeoutSeconds()));
+      expect(i.deadline).to.equal(t + 300n);                                  // H.JURY's timeout
       expect(i.windowEnd).to.equal(t + (await agg.tPlus()));
     });
 
     it("commits counts the commits received, and promote() extends the deadline to at least now + revealWindow", async () => {
-      await agg.setConfig(6, 5, 4, 3, 200, 155);
+      drv.jury = H.jury(6, 5, 4, 3, 200);
       const r = await drv.request();
       await drv.answerAll(r);
       await commitAll(r, [0, 1]);

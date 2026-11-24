@@ -231,6 +231,20 @@ library AggregatorLib {
     // ----------------------------------------------------------------------
 
     /// @dev 64 lowercase hex chars, no prefix (the reveal request's "2:<commit hash>")
+    error BadJury();
+
+    /// @dev The jury rules, per request (item 15): K >= M >= N >= P >= 1, N <= 40 (the N-th reveal finalizes,
+    ///      and at 20 outcomes clustering 40 reveals is ~8M gas), P >= 2 unless N = 1 (the cluster holds at
+    ///      least the closest pair, and the escrow covers bonusMultiplier x P bonuses), K at most maxJury and
+    ///      the keeper's shortlist (a larger K would fill with repeats from a full pool), and a timeout above
+    ///      T+ and at most maxTimeout.
+    function checkJury(uint8 K, uint8 M, uint8 N, uint8 P, uint40 timeout, uint40 tPlus, uint8 maxJury, uint40 maxTimeout,
+        uint256 shortlist) public pure
+    {
+        if (!(K >= M && M >= N && N >= P && N >= 1 && N <= 40 && (P >= 2 || N == 1) && P >= 1) || K > maxJury
+            || K > shortlist || timeout <= tPlus || timeout > maxTimeout) revert BadJury();
+    }
+
     function bytes32ToHexLower(bytes32 data) public pure returns (string memory) {
         bytes memory s = new bytes(64);
         _hex64(data, s, 0);

@@ -46,8 +46,8 @@ describe("gas and cost (300-arbiter pool)", function () {
 
   for (const c of CLASSES) {
     it(`${c.name}: full rounds stay under the per-tx cap`, async () => {
-      await core.agg.setConfig(c.K, c.M, c.N, c.P, c.timeout, c.tPlus);
-      const drv = new RoundDriver(core, arbs, requester, { beacons: !!c.beacons });
+      await core.agg.setLimits(50, 3600, c.tPlus);
+      const drv = new RoundDriver(core, arbs, requester, { beacons: !!c.beacons, jury: H.jury(c.K, c.M, c.N, c.P, c.timeout) });
       // three complete rounds, each settled explicitly after its deadline
       const vv = c.scalar ? scalars : c.outcomes ? wide : vecs;
       for (let i = 0; i < 3; i++) await drv.fullRound({ vectors: vv });

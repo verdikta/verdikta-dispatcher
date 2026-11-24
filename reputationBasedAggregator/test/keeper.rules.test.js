@@ -600,11 +600,22 @@ describe("ReputationKeeper rules (item 14)", function () {
       expect(await keeper.eligibleCount(1, H.MAX_FEE)).to.equal(7n);
     });
 
-    it("reverts when fewer than K are eligible (no repeated slots), and when none are", async () => {
+    it("a thin pool fills the jury with repeats in draw order (slot k = pick k mod m), each called once; none eligible reverts", async () => {
       await keeper.sendHealthCalls(arbs.slice(0, 9).map((a) => a.key));
       await time.increase(61);
-      await expect(select(6)).to.be.revertedWithCustomError(keeper, "NotEnoughEligible");   // 3 eligible
-      await keeper.sendHealthCalls(arbs.slice(9).map((a) => a.key));
+      const eligible = new Set(arbs.slice(9).map((a) => a.key));                    // 3 eligible
+      const keys = await selectedKeys(6);
+      expect(keys).to.have.length(6);
+      expect(new Set(keys)).to.deep.equal(eligible);
+      for (let k = 3; k < 6; k++) expect(keys[k]).to.equal(keys[k % 3]);
+      // a single eligible arbiter takes every slot, and gets one health call, not six
+      await keeper.sendHealthCalls(arbs.slice(9, 11).map((a) => a.key));
+      await time.increase(61);
+      expect(await selectedKeys(6)).to.deep.equal(Array(6).fill(arbs[11].key));
+      const rc = await (await select(6)).wait();
+      const calls = rc.logs.filter((l) => l.topics[0] === keeper.interface.getEvent("HealthCall").topicHash);
+      expect(calls.map((l) => l.topics[1])).to.deep.equal([arbs[11].key]);
+      await time.increase(61);                                                  // its call unanswered: frozen too
       await time.increase(61);
       await expect(select(6)).to.be.revertedWithCustomError(keeper, "NoEligibleArbiters");
     });

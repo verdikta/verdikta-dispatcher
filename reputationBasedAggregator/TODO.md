@@ -63,7 +63,7 @@ v2 is a breaking redeploy, so changes to the request or the wire format cost lea
   - The bounty creator's fee floor (item 8), passed into every request for the bounty.
   - Item 12's Q-of-N rules on `getOutcomeScores`.
   - The class presets: K/M/N/P, Q, R, fee floor, bond and beacon flag.
-  - One aggregator per class.
+  - One aggregator for every class: the bounty's jury goes with each request (2026-11-24).
   - The FUND score as a one-number answer. Its server must call `drawJury` and `promote` promptly.
 - **Example arbiters and the example frontend:** registration, exit, views, and the new request flow
   (request, `drawJury` at B+2, `promote`, result).
@@ -2302,9 +2302,10 @@ call `promote` first; the draw reward goes back to the hunter.
 - **Medium's margin against repeated submissions.** 8/5/4's repeated-submission limit ($1,445) is
   close to its $1,004 sequencer limit, and both rest on assumptions (cartel share, SD 3, the $1,000
   bribe). Keep Medium offered at ~$1K, not above.
-- **Configs per class.** K/M/N is per aggregator today (item 13), so five classes need several
-  aggregator deployments or a per-request config. Large needs `shortlistSize` ≥ 21 (60 is planned,
-  item 14).
+- **Configs per class: done (2026-11-24) as a per-request jury.** Each request carries K/M/N/P and
+  its timeout, bounded by `setLimits` and the keeper's shortlist (60), so one aggregator serves every
+  class. Settlement per request is budgeted in slots (`settlePerRequest × K`), so a small request never
+  settles a Jumbo round. Several deployments stay available for a harder separation later.
 - **Beacon flag per class or per bounty.** The class preset sets the flag. Whether a requester may
   also turn it on for Medium or Large is open: at their juries it raises the sequencer limit but
   weakens the honest-hunter figures (table above). Item 9's stricter variant (all 4 beacon values

@@ -22,10 +22,10 @@ arbiter node, the operator contract and the scripts.
 ## Run
 
 ```
-npx hardhat test                       # all 107 tests, ~3 min
+npx hardhat test                       # all 147 tests, ~4 min
 npx hardhat test test/gas.test.js      # gas and cost report per class
 npx hardhat test test/beacons.test.js  # the beacon stage
-AGG_CLASS=jumbo npx hardhat deploy --tags aggregator,keeper,config   # in-process deploy check
+npx hardhat deploy --tags aggregator,keeper,config   # in-process deploy check
 ```
 
 `hardhat.config.js` loads the deploy secrets like v1's config does. The tests use only the in-process
@@ -71,8 +71,9 @@ keeper and `JuryBeacons` and wires the three:
 - `JuryBeacons` approves the aggregator;
 - `setContracts` sets the keeper, beacons and treasury (`TREASURY_ADDRESS`, else the deployer).
 
-`03_config.js` sets the jury for `AGG_CLASS` (small, medium, large, jumbo). The jury is per aggregator,
-so each class is a separate deployment. Local networks get a `MockLinkToken` and a `TestToken`.
+`03_config.js` sets the bounds a request's jury must keep to (`setLimits`: K up to 50, timeouts up to
+3,600 s, T+ 155 s) and the shared parameters. Each request carries its own jury (K/M/N/P and the
+timeout), so one deployment serves every class. Local networks get a `MockLinkToken` and a `TestToken`.
 
 ## Behaviour worth knowing
 
@@ -145,10 +146,19 @@ so each class is a separate deployment. Local networks get a `MockLinkToken` and
   Jumbo: 1.30M gas with one-number answers, 2.5–2.6M with two-outcome vectors, 6.9M at the maximum
   20 outcomes (all measured); 0.54M at Small. The arbiter node's job gas limit must cover the largest
   answer a class allows, with margin, or that reveal reverts and is lost, and so does every later
-  one. `setConfig` caps N at 40 (at 20 outcomes, clustering 40 reveals is about 8M gas) and
+  one. A request's jury may have N up to 40 (at 20 outcomes, clustering 40 reveals is about 8M gas), and
   `setParams` caps `spreadFloor` at 1e34 (a larger floor would be cut when stored, or overflow).
-- **Fewer than K eligible arbiters at B:** the draw fails the round and refunds (no jury could be
-  drawn, so it is no re-roll). Slots never repeat: a repeated arbiter would vote and be charged twice.
+- **Fewer than K eligible arbiters at B:** the jury fills with repeats. All m eligible arbiters are
+  drawn and slot k holds pick k mod m, so a thin pool (testing, start-up, a niche class) still
+  answers. A repeated arbiter answers, is paid and is scored once per slot, and can decide a round
+  alone; with hundreds of arbiters per class it never happens. Only when none is eligible does the draw
+  fail the round and refund (no jury could be drawn, so it is no re-roll). K is capped at the keeper's
+  shortlist per request, so a full pool never fills with repeats.
+- **The jury is the request's** (`requestAIEvaluationWithApproval(…, withBeacons, jury)`, with
+  `jury = (K, M, N, P, timeout)`; `getJury(aggId)` reads it back). The owner bounds it with
+  `setLimits(maxJury, maxTimeout, tPlus)`. Each new request settles due rounds up to
+  `settlePerRequest × its own K` slots, in queue order: a round too big for that budget waits for a
+  bigger request or anyone's `settle()`, so a small request never pays to settle a Jumbo round.
 - **`promote` pays its caller 1 x eff** (`promoteRewardFees`, in the escrow), so third parties call it
   and a requester cannot withhold it. A round that closed but was never promoted sends its unspent
   prepay to the treasury, not back to the requester, so aborting a promotion draw buys no refund.
@@ -261,8 +271,6 @@ so each class is a separate deployment. Local networks get a `MockLinkToken` and
 
 ## Not implemented
 
-- **Per-class configuration.** K/M/N/P, T+ and the timeout are per aggregator: one deployment per
-  class (item 15).
 - **The abstain dodge.** A cartel that blocks by never committing and also ignores its health call is
   frozen at round end and so escapes the −400. Being frozen costs it only being unselectable until it
   answers. The simulator lets colluders always answer calls, so it does not model this. Options: a

@@ -45,14 +45,14 @@ describe("JuryBeacons (item 9's beacon flag)", function () {
   });
 
   it("a flagged request escrows the beacon quorum on top; without a beacon contract it is refused", async () => {
-    const off = await agg.maxTotalFee(H.MAX_FEE, 0, false);
-    const on = await agg.maxTotalFee(H.MAX_FEE, 0, true);
+    const off = await H.quote(agg, H.MAX_FEE, 0, false);
+    const on = await H.quote(agg, H.MAX_FEE, 0, true);
     expect(on - off).to.equal(2n * H.MAX_FEE);
-    await expect(agg.connect(requester).requestAIEvaluationWithApproval(["Qm"], "", 500, H.MAX_FEE, 0, H.BASE_COST, 5, 1, true, { value: off }))
+    await expect(agg.connect(requester).requestAIEvaluationWithApproval(["Qm"], "", 500, H.MAX_FEE, 0, H.BASE_COST, 5, 1, true, H.JURY, { value: off }))
       .to.be.revertedWithCustomError(agg, "InsufficientPayment");
     await agg.setContracts(keeper.target, ethers.ZeroAddress, deployer.address);
-    await expect(agg.maxTotalFee(H.MAX_FEE, 0, true)).to.be.reverted;
-    await expect(agg.connect(requester).requestAIEvaluationWithApproval(["Qm"], "", 500, H.MAX_FEE, 0, H.BASE_COST, 5, 1, true, { value: on }))
+    await expect(H.quote(agg, H.MAX_FEE, 0, true)).to.be.reverted;
+    await expect(agg.connect(requester).requestAIEvaluationWithApproval(["Qm"], "", 500, H.MAX_FEE, 0, H.BASE_COST, 5, 1, true, H.JURY, { value: on }))
       .to.be.reverted;
   });
 
@@ -126,10 +126,10 @@ describe("JuryBeacons (item 9's beacon flag)", function () {
     await expect(beacons.setParams(17, 2, 120)).to.be.revertedWithCustomError(beacons, "InvalidConfig");
     await expect(beacons.connect(stranger).setParams(4, 4, 120)).to.be.revertedWithCustomError(beacons, "OwnableUnauthorizedAccount");
     await beacons.setParams(4, 4, 120);                                       // the stricter variant: all 4 values
-    expect((await agg.maxTotalFee(H.MAX_FEE, 0, true)) - (await agg.maxTotalFee(H.MAX_FEE, 0, false))).to.equal(4n * H.MAX_FEE);
+    expect((await H.quote(agg, H.MAX_FEE, 0, true)) - (await H.quote(agg, H.MAX_FEE, 0, false))).to.equal(4n * H.MAX_FEE);
     // item 8: a beacon is paid as a juror, so a floor above the ceiling sizes the quorum's share
     const f = 10n * H.MAX_FEE;
-    expect((await agg.maxTotalFee(H.MAX_FEE, f, true)) - (await agg.maxTotalFee(H.MAX_FEE, f, false))).to.equal(4n * f);
+    expect((await H.quote(agg, H.MAX_FEE, f, true)) - (await H.quote(agg, H.MAX_FEE, f, false))).to.equal(4n * f);
   });
 
   it("the first 2 values are paid one fee each; later ones count for liveness only", async () => {
@@ -154,7 +154,7 @@ describe("JuryBeacons (item 9's beacon flag)", function () {
     for (const p of paid) expect(p.amount).to.equal(f);
     const [, , , , received, , , rewards] = await agg.getRoundInfo(r.aggId);
     expect(rewards).to.equal(2n * H.MAX_FEE + 2n * f);                       // 2 x draw reward + 2 beacons
-    expect(received).to.equal(await agg.maxTotalFee(H.MAX_FEE, f, true));
+    expect(received).to.equal(await H.quote(agg, H.MAX_FEE, f, true));
   });
 
   it("the seed mixes the first 2 values to arrive, in index order: same values, same jury, whoever draws and whenever", async () => {
@@ -444,9 +444,20 @@ describe("JuryBeacons (item 9's beacon flag)", function () {
     expect(await keeper.isEligible(b.key, H.MAX_FEE)).to.equal(true);
   });
 
-  it("a jury shortage after the beacon stage refunds only if selection walks the whole class list", async () => {
-    // 7 of 12 arbiters cost more than the request's maxFee: beacons ignore fees, the jury (K = 6) cannot fill
+  it("after the beacon stage a thin jury pool fills with repeats; none eligible fails, refunded only if selection walks the whole list", async () => {
+    // 7 of 12 arbiters cost more than the request's maxFee: beacons ignore fees, and the jury (K = 6)
+    // fills from the 5 that are left, one of them twice
     for (const a of arbs.slice(5)) await keeper.setFee(a.key, H.MAX_FEE + 1n);
+    const thin = await drv.requestOnly();
+    await drv.beaconStage(thin, { answering: 2 });
+    await agg.connect(stranger).drawJury(thin.aggId, { gasLimit: 16_000_000 });
+    expect(await phase(thin)).to.equal(PH.COMMIT);
+    const keys = [];
+    for (let i = 0; i < 6; i++) keys.push((await agg.getSlot(thin.aggId, i)).key);
+    expect(new Set(keys).size).to.equal(5);
+    expect(keys[5]).to.equal(keys[0]);
+    // every arbiter priced out: the jury finds none and the round fails
+    for (const a of arbs.slice(0, 5)) await keeper.setFee(a.key, H.MAX_FEE + 1n);
     const run = async () => {
       const r = await drv.requestOnly();
       await drv.beaconStage(r, { answering: 2 });

@@ -98,13 +98,14 @@ comparing the two ABIs and the code that calls them.
 
 | v1 | v2 |
 |---|---|
-| `requestAIEvaluationWithApproval(cids, addendum, alpha, maxFee, baseCost, scaling, class)` | `(cids, addendum, alpha, maxFee, minFee, baseCost, scaling, class, withBeacons)`: item 8's fee floor after `maxFee` (0 = none), and the beacon flag at the end (the class preset: Jumbo on) |
-| `maxTotalFee(maxFee)` | `maxTotalFee(maxFee, minFee, withBeacons)`: `max(eff, minFee) × (K + B×P [+ 2]) + eff × (2 + 1)` |
+| `requestAIEvaluationWithApproval(cids, addendum, alpha, maxFee, baseCost, scaling, class)` | `(cids, addendum, alpha, maxFee, minFee, baseCost, scaling, class, withBeacons, jury)`: item 8's fee floor after `maxFee` (0 = none), the beacon flag (the class preset: Jumbo on), and the jury `(K, M, N, P, timeout)` (added 2026-11-24: one deployment serves every class) |
+| `maxTotalFee(maxFee)` | `maxTotalFee(maxFee, minFee, withBeacons, K, P)`: `max(eff, minFee) × (K + B×P [+ 2]) + eff × (2 + 1)`, for the jury the request will ask for |
+| `K()`, `M()`, `N()`, `P()`, `setConfig` | none: the jury is the request's. `getJury(aggId)` returns a round's `(K, M, N, P, timeout)`; the owner bounds requests with `setLimits(maxJury, maxTimeout, tPlus)` (`maxJury()`, `maxTimeout()`, `tPlus()`) |
 | (none) | `drawJury(aggId)` from block B+2: a passthrough on the wallet, like `startEvaluation`, so the draw reward reaches the hunter. With beacons, call it twice: once to start the stage, then again once 2 beacon values are in |
 | `finalizeEvaluationTimeout(aggId)` | `settle(aggId)` after the round's deadline. Anyone may call it, and new requests settle due rounds too |
 | `getAggregationStatus(aggId)` → `isComplete, failed, …` | `getRoundInfo(aggId)` → `phase, …`. Settled = phase 7 (settled) or 8 (failed); `isFailed(aggId)`. After the escrow fields it also returns `deadline` (0 until the draw; `settle` is due after it), `windowEnd` (T+ after the draw), `commits` and `requestTime` (added 2026-11-23, for consumers' on-chain views) |
 | `getEvaluation(aggId)` | same; valid from finalization (phase 6), before settlement |
-| `responseTimeoutSeconds()` (uint256) | uint40 (ABI-compatible); runs from the draw, not the request |
+| `responseTimeoutSeconds()` | none: the jury's `timeout`, run from the draw, not the request |
 
 Behaviour BountyEscrow must allow for:
 
@@ -129,8 +130,13 @@ Behaviour BountyEscrow must allow for:
     quorum).
 - **Credit covers only what `msg.value` does not.** Sending exactly `maxTotalFee` leaves the wallet's
   credit untouched, and an overpayment returns to credit.
-- **Fees per class.** The fee per class must stay at or below `maxOracleFee()`. K/M/N come from the
-  class's aggregator, one deployment per class.
+- **Fees per class.** The fee per class must stay at or below `maxOracleFee()`. K/M/N/P and the
+  timeout are the bounty's (its class preset), passed with every request; one aggregator serves every
+  class. The request reverts (`BadJury`, from AggregatorLib) unless K >= M >= N >= P >= 1, N <= 40,
+  P >= 2 unless N = 1, K <= `maxJury()` and the keeper's `shortlistSize()`, and T+ < timeout <=
+  `maxTimeout()`.
+- **A thin pool repeats arbiters.** With fewer than K eligible, the jury fills with repeats (slot k
+  holds pick k mod m); the draw fails (refunded) only when none is eligible.
 - **The fee floor (item 8).** It is the bounty creator's setting: add `minOracleFee` to the bounty's
   oracle parameters and pass it into every request for that bounty, never the hunter's choice. It
   may exceed `maxOracleFee()`. The UI should ask for a target cost per attempt and divide by K,
@@ -139,7 +145,7 @@ Behaviour BountyEscrow must allow for:
 
 ## Scripts in this folder
 
-`deploy/` is ported and tested on the in-process network (`AGG_CLASS=jumbo npx hardhat deploy --tags
+`deploy/` is ported and tested on the in-process network (`npx hardhat deploy --tags
 aggregator,keeper,config`). The Python analysis scripts do not touch the contracts.
 
 **Run against the live v1 contracts from a checkout of the tag, not from this folder.** Scripts that
@@ -151,10 +157,10 @@ use `ethers.getContractAt("ReputationAggregator", …)` now get the v2 ABI.
 | `unregister-oracle*.js` | `deregisterOracle` | `requestExit`, then `completeExit` after the unbonding period (2 days) |
 | `reset-oracle.js`, `reset-reputations-cl.js` | `resetAllReputations` | none (no reset in v2) |
 | `oracle-poller(-cl).js`, `arbiter-noise.js`, `arbiter-stats.js` | `registeredOracles`, `getRegisteredOraclesCount`, `getOracleInfo`, `getOracleClasses` | the `ArbiterRegistered` events, `classSize(cls)`, `getArbiter(key)` |
-| `monitor-contracts(-cl).js`, `agg-history.js` | `getContractConfig`, `oraclesToPoll`, `getAggregationStatus`, v1 events | `K()`/`M()`/`N()`/`P()`, `getRoundInfo`, v2 events |
-| `single-query.js`, `simultaneous-tests.js` | 7-argument request, `maxTotalFee(fee)` | 9-argument request, `maxTotalFee(fee, floor, flag)`, then `drawJury` at B+2 (twice with beacons) and `promote` after the commit phase closes |
+| `monitor-contracts(-cl).js`, `agg-history.js` | `getContractConfig`, `oraclesToPoll`, `getAggregationStatus`, v1 events | `getJury(aggId)` per round, `maxJury()`/`maxTimeout()`/`tPlus()`, `getRoundInfo`, v2 events |
+| `single-query.js`, `simultaneous-tests.js` | 7-argument request, `maxTotalFee(fee)` | 10-argument request (with the jury), `maxTotalFee(fee, floor, flag, K, P)`, then `drawJury` at B+2 (twice with beacons) and `promote` after the commit phase closes |
 | `refund.js` | `finalizeEvaluationTimeout`, `getAggregationStatus` | `settle`, `getRoundInfo` |
-| `configure-contracts.js`, `deploy_just_aggregator.js` | `approveContract`, `setConfig(5 args)`, `setMaxOracleFee` | `setApproved`, `setConfig(6 args)`, `setParams`, `setContracts` (or `deploy/`) |
+| `configure-contracts.js`, `deploy_just_aggregator.js` | `approveContract`, `setConfig(5 args)`, `setMaxOracleFee` | `setApproved`, `setLimits`, `setParams`, `setContracts` (or `deploy/`) |
 | `reveal-forensics.js` | v1 reveal events (`RevealHashMismatch`, …) | v2 ignores bad reveals silently: only `RevealReceived` is emitted |
 | `transfer-ownership.js`, `whoami.js`, `check-*.js`, `approve-link.js`, `withdraw-link-from-oracle.js`, `fork-base-sepolia.js`, `estimate-deploy-cost.js`, `show-gas.js` | none of the changed calls | check before use |
 

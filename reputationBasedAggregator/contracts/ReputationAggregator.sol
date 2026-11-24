@@ -47,10 +47,14 @@ interface IJuryBeacons {
  *     reveals are classified on arrival against the stored median and spread;
  *   - settlement after the deadline: one batched keeper call carrying every slot's outcome code
  *     (Table 1), with failed rounds settled on the same path;
- *   - a settlement queue: every new request settles up to `settlePerRequest` due rounds, so
+ *   - a settlement queue: every new request settles due rounds (up to settlePerRequest x its K slots), so
  *     settlement never depends on an outside keeper bot (anyone may also call settle());
  *   - getOutcomeScores (item 11): every counted reveal's score for one outcome, so a consumer can
  *     apply a Q-of-N rule (item 12).
+ *   - a requester-set jury (item 15): K/M/N/P and the round timeout come with each request, within the
+ *     owner's bounds (maxJury, at most the keeper's shortlist; maxTimeout; above T+), so one deployment
+ *     serves every bounty class; each new request settles due rounds within a budget of
+ *     settlePerRequest x its own K slots;
  *   - a requester-set fee floor (item 8): each juror is paid max(its posted fee, minFee), and its bonus
  *     scales off that, so a requester can make every attempt cost at least K x minFee. Eligibility
  *     still uses the ceiling only;
@@ -112,6 +116,16 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         bytes32 commitHash;   // s3: keccak256(abi.encode(aggId, operator, response, salt)), all 32 bytes
     }
 
+    /// @notice The jury a request asks for (item 15's class presets): K drawn, M promoted, N counted, P
+    ///         clustered, and the round timeout from the draw
+    struct Jury {
+        uint8 K;
+        uint8 M;
+        uint8 N;
+        uint8 P;
+        uint40 timeout;
+    }
+
     struct Round {
         address requester;    // s0
         uint40 start;
@@ -143,6 +157,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         uint96 baseCost;
         uint64 cls;
         uint96 minFee;        // s5: fee floor (item 8): each juror is paid max(posted fee, minFee)
+        uint40 timeout;       // the request's round timeout, from the draw
         bytes32 sealedHash;   // s6
         string payload;
         uint256[] aggregated;
@@ -195,17 +210,14 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
     event SlotSkipped(bytes32 indexed aggRequestId, uint256 pollIndex, uint8 reason);
 
     // ------------------------------------------------------------------ config
-    uint8 public K = 6;
-    uint8 public M = 5;
-    uint8 public N = 4;
-    uint8 public P = 3;
+    uint8 public maxJury = 50;                 // largest K a request may ask for (keeper shortlist, tx gas)
+    uint40 public maxTimeout = 3600;           // longest round timeout a request may ask for
     uint8 public bonusMultiplier = 3;
     uint8 public settlePerRequest = 2;
     uint8 public drawRewardFees = 2;           // drawer reward, in per-arbiter fees
     uint8 public promoteRewardFees = 1;        // promote() caller's reward, so third parties call it
     uint40 public requesterDrawPriority = 30;  // seconds in which only the requester earns the reward
     address public treasury;
-    uint40 public responseTimeoutSeconds = 300;
     uint40 public tPlus = 155;                 // mean + 2 SD of honest commit latency (item 14, Oct-Nov 2026)
     uint40 public revealWindow = 120;          // reveal time guaranteed after promotion (reveal p90 54 s)
     uint40 private constant DRAW_GRACE = 1 days; // no draw after this; the round can then only be cancelled
@@ -243,19 +255,25 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         uint256 estimatedBaseCost,
         uint256 maxFeeBasedScalingFactor,
         uint64 requestedClass,
-        bool withBeacons
+        bool withBeacons,
+        Jury calldata j
     ) external payable nonReentrant whenNotPaused returns (bytes32 aggId) {
         if (address(keeper) == address(0)) revert KeeperNotSet();
         string memory payload =
             AggregatorLib.buildCommitPayload(cids, addendumText, MAX_CID_COUNT, MAX_CID_LENGTH, MAX_ADDENDUM_LENGTH);
 
-        // settle due rounds first: bounded work, so settlement never waits for an outside caller
-        _settleDue(settlePerRequest);
+        // the jury (item 15): K/M/N/P and the timeout are the request's. K must fit the keeper's shortlist,
+        // or the draw would fill the rest of the jury with repeats from a pool that has more arbiters
+        AggregatorLib.checkJury(j.K, j.M, j.N, j.P, j.timeout, tPlus, maxJury, maxTimeout, keeper.shortlistSize());
+
+        // settle due rounds first: bounded work, so settlement never waits for an outside caller. The budget
+        // is in slots, settlePerRequest x this request's K, so a small request never pays to settle a big round
+        _settleDue(uint256(settlePerRequest) * j.K);
 
         uint256 effMaxFee = maxFee < maxOracleFee ? maxFee : maxOracleFee;
         if (estimatedBaseCost >= effMaxFee || alpha > 1000 || maxFeeBasedScalingFactor < 1 || maxFeeBasedScalingFactor > type(uint16).max)
             revert BadInput();
-        uint256 required = maxTotalFee(maxFee, minFee, withBeacons);
+        uint256 required = maxTotalFee(maxFee, minFee, withBeacons, j.K, j.P);
         if (required > type(uint88).max) revert BadInput();   // so every credited total fits its field
         // credit covers only what msg.value does not; any excess value goes back to credit, so the
         // escrow is exactly `required` (a treasury path never takes more than the round's prepay)
@@ -268,10 +286,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         aggId = bytes32(id);
         Round storage r = rounds[id];
         r.requester = msg.sender;
-        r.K = K;
-        r.M = M;
-        r.N = N;
-        r.P = P;
+        (r.K, r.M, r.N, r.P) = (j.K, j.M, j.N, j.P);
         r.phase = PH_DRAW;
         r.ethReceived = uint96(required);
         r.bonusMult = bonusMultiplier;
@@ -285,7 +300,8 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         r.effMaxFee = uint96(effMaxFee);
         r.baseCost = uint96(estimatedBaseCost);
         r.cls = requestedClass;
-        if (minFee != 0) r.minFee = uint96(minFee);
+        r.minFee = uint96(minFee);
+        r.timeout = j.timeout;
         r.payload = payload;
         emit RequestFunded(aggId, msg.sender, fromCredit, msg.value);
         emit RequestAIEvaluation(aggId, cids);
@@ -297,8 +313,8 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
     ///         what a juror or a beacon is paid (item 8). The floor may exceed the ceiling: the ceiling
     ///         limits which arbiters are eligible, not what a requester chooses to pay. The draw and promote
     ///         rewards are paid on eff, so a requester that draws or promotes its own round gets none of
-    ///         the floor back.
-    function maxTotalFee(uint256 maxFee, uint256 minFee, bool withBeacons) public view returns (uint256) {
+    ///         the floor back. K and P are the jury the request will ask for.
+    function maxTotalFee(uint256 maxFee, uint256 minFee, bool withBeacons, uint8 K, uint8 P) public view returns (uint256) {
         uint256 eff = maxFee < maxOracleFee ? maxFee : maxOracleFee;
         uint256 juror = minFee > eff ? minFee : eff;
         uint256 n = uint256(K) + uint256(bonusMultiplier) * P;
@@ -419,7 +435,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         r.start = uint40(block.timestamp);
         r.windowEnd = uint40(block.timestamp) + tPlus;
         r.mPlus = uint8(uint256(r.M) + (uint256(r.K) - r.M + 1) / 2);
-        r.deadline = uint40(block.timestamp) + responseTimeoutSeconds;
+        r.deadline = uint40(block.timestamp) + r.timeout;
         string memory payload = r.payload;
         uint96 base;
         uint256 floor_ = r.minFee;
@@ -688,19 +704,22 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         _settle(r, uint256(aggId));
     }
 
-    function _settleDue(uint256 maxCount) internal {
+    /// @dev Settles due rounds in queue order while their juries fit `budget` slots. A round that does not
+    ///      fit stops the walk (it is not skipped): it waits for a request with a bigger budget, or for
+    ///      anyone's settle(). Only its scores and a failed round's refund wait; a result is readable
+    ///      from finalization.
+    function _settleDue(uint256 budget) internal {
         uint256 h = settleHead;
         uint256 len = settleQueue.length;
         // already-settled entries (settle() called directly) count as steps too, so holes in the queue
         // cannot make a request's walk unbounded
-        uint256 limit = maxCount * 8;
-        uint256 c;
+        uint256 limit = uint256(settlePerRequest) * 8;
         for (uint256 steps = 0; steps < limit && h < len; steps++) {
             Round storage r = rounds[settleQueue[h]];
             if (r.phase < PH_SETTLED) {
-                if (c == maxCount || block.timestamp <= r.deadline) break;
+                if (r.K > budget || block.timestamp <= r.deadline) break;
+                budget -= r.K;
                 _settle(r, settleQueue[h]);
-                c++;
             }
             h++;
         }
@@ -790,6 +809,12 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
                 r.rewardCredited, r.deadline, r.windowEnd, r.commits, r.requestTime);
     }
 
+    /// @notice The jury a round was requested with (zero for an unknown round)
+    function getJury(bytes32 aggId) external view returns (uint8 K, uint8 M, uint8 N, uint8 P, uint40 timeout) {
+        Round storage r = rounds[uint256(aggId)];
+        return (r.K, r.M, r.N, r.P, r.timeout);
+    }
+
     function isFailed(bytes32 aggId) external view returns (bool) {
         return rounds[uint256(aggId)].phase == PH_FAILED;
     }
@@ -814,16 +839,12 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
     }
 
     // ================================================================== owner configuration
-    /// @dev P >= 2 unless N = 1: the cluster always holds at least the closest pair, and the escrow
-    ///      only covers B x P bonuses.
-    /// @notice Jury and timing for new requests. P >= 2 unless N = 1: the cluster always holds at least
-    ///         the closest pair, and the escrow only covers B x P bonuses. T+ (seconds) comes from measured
-    ///         honest commit latency (mean + 2 SD) and must be below the timeout.
-    function setConfig(uint8 _K, uint8 _M, uint8 _N, uint8 _P, uint40 timeout, uint40 tPlus_) external onlyOwner {
-        // N <= 40: the N-th reveal finalizes, and at 20 outcomes clustering 40 reveals is ~8M gas
-        if (!(_K >= _M && _M >= _N && _N >= _P && _N >= 1 && _N <= 40 && (_P >= 2 || _N == 1) && _P >= 1) || tPlus_ == 0 || timeout <= tPlus_)
-            revert InvalidConfig();
-        (K, M, N, P, responseTimeoutSeconds, tPlus) = (_K, _M, _N, _P, timeout, tPlus_);
+    /// @notice Bounds on the jury a request may ask for: the largest K, the longest timeout, and T+ (seconds,
+    ///         from measured honest commit latency: mean + 2 SD), which every timeout must exceed. Each request
+    ///         also checks K against the keeper's shortlist, so a shortlist lowered later still binds.
+    function setLimits(uint8 maxJury_, uint40 maxTimeout_, uint40 tPlus_) external onlyOwner {
+        if (maxJury_ == 0 || tPlus_ == 0 || maxTimeout_ <= tPlus_) revert InvalidConfig();
+        (maxJury, maxTimeout, tPlus) = (maxJury_, maxTimeout_, tPlus_);
     }
 
     /// @notice Bonus multiplier (at most 20), rounds settled per request, the per-call dispatch stipend

@@ -13,6 +13,11 @@ const BASE_COST = 8n * 10n ** 9n;
 const HISTORY = "0x0000F90827F1C53a10cb7A02335B175320002935";   // EIP-2935
 /** a likelihood pair on the arbiters' 0..1,000,000 scale */
 const vec = (accept) => [BigInt(accept), 1_000_000n - BigInt(accept)];
+/** A request's jury (item 15): K drawn, M promoted, N counted, P clustered, timeout from the draw. */
+const jury = (K, M, N, P, timeout = 300) => ({ K, M, N, P, timeout });
+const JURY = jury(6, 5, 4, 3, 300);   // Small, the deploy default
+/** maxTotalFee for `j` (default JURY) */
+const quote = (agg, maxFee, minFee, beacons, j = JURY) => agg.maxTotalFee(maxFee, minFee, beacons, j.K, j.P);
 
 /** Hash chain: chain[0] = seed, chain[i] = keccak(chain[i-1]); head = chain[L]. */
 function makeChain(L = 64) {
@@ -130,6 +135,6 @@ async function fulfil(req, node, response, cid) {
 }
 
 module.exports = {
-  abi, T, Q, COMMITTED, code, STAKE, FEE, MAX_FEE, BASE_COST, HISTORY, vec,
+  abi, T, Q, COMMITTED, code, STAKE, FEE, MAX_FEE, BASE_COST, HISTORY, vec, jury, JURY, quote,
   makeChain, deployCore, registerArbiters, saltHex, commitWord, oracleRequests, fulfil, installHistory, recordHash,
 };

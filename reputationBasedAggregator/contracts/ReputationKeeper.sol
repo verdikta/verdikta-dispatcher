@@ -151,7 +151,6 @@ contract ReputationKeeper is Ownable {
     error Blocked();
     error TransferFailed();
     error FutureBlock();
-    error NotEnoughEligible();
     error StaleBlock();
 
     // ------------------------------------------------------------------ events
@@ -592,8 +591,11 @@ contract ReputationKeeper is Ownable {
      * @notice Select `count` arbiters from the state as of block `atBlock` (timestamp `atTime`), using
      *         only `seed` for randomness, then send health calls to the jurors and `liveRandom` other
      *         shortlisted arbiters.
-     * @dev Reverts with fewer eligible (shortlisted) arbiters than `count`: repeated slots would count one
-     *      arbiter's vote twice and charge it twice. The aggregator then fails the round with a refund.
+     * @dev With fewer eligible (shortlisted) arbiters than `count`, all of them are drawn and the remaining
+     *      slots repeat them in draw order (slot k holds pick k mod m), so a thin pool (testing, start-up, a
+     *      niche class) still gets an answer from what is there. A repeated arbiter answers, is paid and is
+     *      scored once per slot. With hundreds of arbiters per class this never happens; the aggregator caps
+     *      `count` at the shortlist size, so repeats only come from a pool that has fewer eligible.
      */
     function selectArbiters(SelectParams calldata sp, bytes32 seed, uint256 atBlock, uint256 atTime)
         external
@@ -631,12 +633,15 @@ contract ReputationKeeper is Ownable {
             }
         }
         if (m == 0) revert NoEligibleArbiters();
-        if (m < sp.count) revert NotEnoughEligible();
 
         sel = new Selected[](sp.count);
         bool[] memory taken = new bool[](m);
         uint256 remaining = total;
         for (uint256 k = 0; k < sp.count; k++) {
+            if (k >= m) {
+                sel[k] = sel[k % m];                   // a thin pool: repeat in draw order
+                continue;
+            }
             uint256 pick;
             uint256 pivot = uint256(keccak256(abi.encodePacked(seed, k))) % remaining;
             uint256 acc;
