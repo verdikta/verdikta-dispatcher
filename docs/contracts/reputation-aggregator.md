@@ -675,7 +675,8 @@ At settlement each slot gets an outcome code for the keeper:
 | Final (6) | promoted, no reveal | 2 | timeliness −200 |
 | Reveal (5): fewer than N reveals | promoted, revealed | 1 | timeliness +20 |
 | Reveal (5) | promoted, no reveal | 3 | timeliness −500 |
-| Commit (3), fewer than M commits | no commit | 4 | timeliness −400 |
+| Commit (3), 1 to M − 1 commits | no commit | 4 | timeliness −400 |
+| Commit (3) with no commit at all | any | 0 | none: the failure is the request's (one every honest arbiter refuses) or a shared outage's |
 | Commit (3) with M commits, or closing (4) | any | 0 | none: nobody failed to deliver |
 | any | not promoted | 0 | none |
 

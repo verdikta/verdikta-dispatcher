@@ -1609,7 +1609,7 @@ for going silent.
 | … revealed score is **far** (more than 3 spreads) | | **−200** |
 | Promoted, no reveal, round still finished | **−200** | |
 | Promoted, no reveal, **round failed** | **−500** | |
-| Live, no commit, and the **round failed for lack of commits** | **−400** | |
+| Live, no commit, and the **round failed for lack of commits**, with at least one commit | **−400** | |
 | Anything else: committing, speed, not being promoted, not being selected | 0 | 0 |
 
 A **spread** is `max(1.48 × MAD, 3 points)`, where MAD is the median absolute deviation of the
@@ -1638,6 +1638,13 @@ keeper. Scores are clamped to 0–1000.
   ones. A missing commit costs points only when the round then failed for lack of commits, which is
   the attack where a cartel blocks by never committing. A fake commit doesn't avoid that: if it is
   promoted it must be revealed and scored.
+  - **2026-11-26: no charge when nobody committed** (owner decision, commit 2bb4284). The −400
+    used to hit every live non-committer of a round that failed for lack of commits, even when no
+    slot committed at all. That charged the whole jury for a shared outage, and let a requester
+    whose request every honest arbiter refuses (an over-limit archive, a bad dispute statement)
+    push honest jurors toward blocks for one round's base fees. Now a round with zero commits
+    charges nobody; a round with 1 to M − 1 commits still charges each silent, live
+    non-committer −400 (frozen ones are skipped, as before).
 - **Fake commits don't pay.** For a live arbiter that can't do the work in time in a K=6 / M=5
   round, not committing costs about −23 expected (the round fails for lack of commits about 6% of
   the time). A commit it can't reveal is promoted about 83% of the time and costs −200 in a round
@@ -2023,7 +2030,7 @@ The README lists the behaviour; the points below changed or sharpened the design
   to an outstanding call counts, so an arbiter that recovers before settlement isn't charged for an
   outage.
 - **−400 only when commits fell short.** A round with M commits that timed out because nobody closed
-  the commit phase charges nobody.
+  the commit phase charges nobody, and (2026-11-26) so does a round with no commit at all.
 - **A score that reaches 0 while the arbiter is already blocked** restarts at 500 but adds no offense.
   Several in-flight rounds failing together count as one incident, not as a quick path to a ban. The
   simulator runs rounds one at a time, so this case doesn't occur there.
