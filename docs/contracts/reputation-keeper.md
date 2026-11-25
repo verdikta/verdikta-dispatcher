@@ -230,7 +230,7 @@ function poolPayee(bytes32 seed) external view returns (address)
 function registryLength() external view returns (uint256)
 ```
 
-The keeper keeps a registry of every registered arbiter: `registerArbiter` adds the key and `completeExit` removes it. The aggregator calls `poolPayee` at each draw that draws a jury, with a seed derived from that draw's seed, to pay an eighth of its arbiter pool (the forfeits that earlier v2 drafts sent to a treasury; see [ReputationAggregator](reputation-aggregator.md#the-arbiter-pool)). `poolPayee` makes at most two picks and returns the first arbiter that is registered and not paused, banned, exiting or understaked; otherwise address(0), and the pool waits for the next draw. Anyone may call it. The aggregator caps the call at 80,000 gas and catches its failure, so an operator's `owner()` cannot make the draw fail.
+The keeper keeps a registry of every registered arbiter: `registerArbiter` adds the key and `completeExit` removes it. The aggregator calls `poolPayee` at each draw that draws a jury, with a seed derived from that draw's seed, to pay an eighth of its arbiter pool, at most that draw's base fees (the forfeits that earlier v2 drafts sent to a treasury; see [ReputationAggregator](reputation-aggregator.md#the-arbiter-pool)). `poolPayee` makes at most two picks and returns the first arbiter that is registered and not paused, banned, exiting or understaked; otherwise address(0), and the pool waits for the next draw. Anyone may call it. The aggregator caps the call at 80,000 gas and catches its failure, so an operator's `owner()` cannot make the draw fail.
 
 ### Outcomes (approved contracts only)
 

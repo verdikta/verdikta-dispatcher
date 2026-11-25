@@ -109,7 +109,7 @@ event PoolPayment(bytes32 indexed aggRequestId, address indexed payee, uint256 a
 |-----------|------|---------|-------------|
 | `aggRequestId` | `bytes32` | Yes | The round whose draw paid it (not the round the forfeit came from) |
 | `payee` | `address` | Yes | The winning arbiter's operator `owner()` |
-| `amount` | `uint256` | No | An eighth of the arbiter pool, `ethOwed(address(0)) / 8`, credited to `ethOwed[payee]` |
+| `amount` | `uint256` | No | An eighth of the arbiter pool, `ethOwed(address(0)) / 8`, at most the draw's base fees, credited to `ethOwed[payee]` |
 
 **When it fires:** In a `drawJury` that draws a jury, just before `JuryDrawn`, when the pool holds at least 8 wei and the keeper's `poolPayee(seed)` found an available registered arbiter in its two picks. Declared in `AggregatorLib` and emitted in the aggregator's context, so it appears in the aggregator's logs and ABI. No event fires when nobody was picked: the pool waits for the next draw.
 
@@ -529,7 +529,7 @@ drawJury, from block B+2:
    With beacons, second call: BeaconPayment (x used values)
 4. keeper HealthCall (x jurors + 3)
 5. BasePayment (x dispatched slots) and SlotSkipped (x undispatched slots)
-   PoolPayment                           an eighth of the arbiter pool, if someone was picked
+   PoolPayment                           an eighth of the arbiter pool (at most the base fees), if someone was picked
 6. JuryDrawn                             phase 3, deadline = now + timeout
 
 As the arbiters answer:

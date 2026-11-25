@@ -45,7 +45,7 @@ Tests:
 - `aggregator.flow.test.js`:
   - item 9: draw timing; determinism whoever draws and whenever; EIP-2935 reads; reward; no expiry;
     cancel to the arbiter pool; empty pool; the committers' shares of a never-promoted round; the
-    arbiter pool's payouts (an eighth per draw, the keeper's two picks, nobody can withdraw it, the
+    arbiter pool's payouts (an eighth per draw, at most its base fees, the keeper's two picks, nobody can withdraw it, the
     registry after an exit);
   - M+ / T+ promotion, finalize, late reveals and settlement;
   - the 0..1,000,000 score scale, failed rounds, the freeze dodge, the queue;

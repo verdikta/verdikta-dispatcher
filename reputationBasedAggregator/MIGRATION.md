@@ -117,7 +117,7 @@ comparing the two ABIs and the code that calls them.
 | (none; v2 drafts until 2026-11-25 had `treasury()`) | none: `treasury()` is removed and there is no treasury. Prepay that is not refunded goes to the committers of a never-promoted round or to the arbiter pool (changed 2026-11-25) |
 | (none; v2 drafts had `setContracts(keeper, beacons, treasury)`) | `setContracts(keeper, beacons)`: two arguments; reverts `InvalidConfig` only for a zero keeper. The deploy no longer reads `TREASURY_ADDRESS` (changed 2026-11-25) |
 | (none) | new events: `CommitPayment(aggId, payee, amount)`, one per committed slot of a never-promoted round, at settlement; `PoolPayment(aggId, payee, amount)`, an arbiter pool payout at a draw (declared in `AggregatorLib`, emitted in the aggregator's context: include it in the ABI you decode with). `RequesterRefunded(aggId, address(0), amount)` now marks a credit to the pool (added 2026-11-25) |
-| (none) | the arbiter pool: `ethOwed(address(0))`, which nobody can withdraw (`withdrawEthFor(address(0))` reverts `NotAuthorized`). Each `drawJury` that draws a jury pays an eighth of it to one registered arbiter picked by the keeper's new `poolPayee(seed)`; the keeper also has `registryLength()` (added 2026-11-25) |
+| (none) | the arbiter pool: `ethOwed(address(0))`, which nobody can withdraw (`withdrawEthFor(address(0))` reverts `NotAuthorized`). Each `drawJury` that draws a jury pays an eighth of it (at most that draw's base fees) to one registered arbiter picked by the keeper's new `poolPayee(seed)`; the keeper also has `registryLength()` (added 2026-11-25) |
 
 Behaviour BountyEscrow must allow for:
 

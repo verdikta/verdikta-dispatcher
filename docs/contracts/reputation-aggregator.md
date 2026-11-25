@@ -204,7 +204,7 @@ function cancelUnsealed(bytes32 aggId) external
 - If the keeper finds no eligible arbiter, the round fails (phase 8, `EvaluationFailed(aggId, 1)`). The prepay is refunded, since no jury could be drawn and so the refund is no re-roll.
     - After a beacon stage, the refund goes to the requester only if the selection walk covers the whole class list (`keeper.scansAll(cls)`). Otherwise it goes to the arbiter pool, because the failure could depend on the beacon seed.
 - If the beacon stage finds fewer beacon candidates than the quorum, the round fails at the first call and is refunded.
-- **Arbiter pool payout:** a call that draws a jury also pays an eighth of the [arbiter pool](#the-arbiter-pool) to one registered arbiter's payee (`PoolPayment`). The first call of a beacon round and a failed draw pay nothing from the pool.
+- **Arbiter pool payout:** a call that draws a jury also pays an eighth of the [arbiter pool](#the-arbiter-pool), at most that draw's base fees, to one registered arbiter's payee (`PoolPayment`). The first call of a beacon round and a failed draw pay nothing from the pool.
 - **Draw reward:** `eff × drawRewardFees()` (2 fees) is credited to the caller. Within `requesterDrawPriority()` (30 s) of the request, or of the quorum-th beacon value, only the requester earns it; a third party that draws in that time earns nothing. After it, whoever draws earns it. The first call of a beacon round earns no reward.
 - **Second call of a beacon round:**
     - Each used beacon value is paid `max(eff, minFee)` to the beacon's operator owner (`BeaconPayment`).
@@ -696,7 +696,7 @@ The keeper turns the codes into points and consequences: see [ReputationKeeper](
     - a missed beacon quorum;
     - a cancelled round;
     - a draw that fails after a beacon stage when the walk does not cover the class list.
-- **The pool cannot be steered**: each pool payout is picked from the draw's seed, which a block hash fixes after the request and which is the same whoever draws. A forfeiting round never picks its own winner, and paying an eighth per draw makes grinding with many requests cost more than it wins.
+- **The pool cannot be steered**: each pool payout is picked from the draw's seed, which a block hash fixes after the request and which is the same whoever draws. A forfeiting round never picks its own winner, and paying an eighth per draw, at most the draw's own base fees, makes grinding with many requests cost more than it wins.
 
 ### Economic Security
 
@@ -758,7 +758,7 @@ Each credit of the rest emits `RequesterRefunded(aggId, to, amount)` when the am
 
 The pool replaces the treasury of earlier v2 drafts (v1 had neither). It is the ledger entry `ethOwed(address(0))`, and no address can withdraw it. It is paid out at draws:
 
-- every `drawJury` that draws a jury pays `ethOwed(address(0)) / 8` to one registered arbiter (`PoolPayment(aggId, payee, amount)`);
+- every `drawJury` that draws a jury pays `min(ethOwed(address(0)) / 8, the draw's base fees)` to one registered arbiter (`PoolPayment(aggId, payee, amount)`);
 - the keeper's `poolPayee(seed)` picks the arbiter uniformly from the draw's seed and returns its payee, its operator's `owner()`;
 - it makes at most two picks and skips arbiters that are paused, banned, exiting or understaked; if both miss, nobody is paid and the pool waits for the next draw;
 - the keeper call is capped at 80,000 gas and its failure is caught, so it can never make the draw fail.

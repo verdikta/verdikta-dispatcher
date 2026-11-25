@@ -91,7 +91,7 @@ Settlement can lag. A new request settles due rounds in queue order until `settl
 
 A blocked arbiter is not eligible until `blockedUntil`, and it cannot complete an exit while blocked (`Blocked()`). An arbiter whose stake falls below `stakeRequirement` after a burn is not eligible until it tops up (`topUpStake`). Exiting does not help an arbiter escape a block: `requestExit` starts a 2-day unbonding during which blocks and bans still apply.
 
-The arbiter pool's payouts (an eighth of the pool at each jury draw, to one registered arbiter picked from the draw's seed) use the keeper's flags, not the scores: an arbiter that is paused, banned, exiting or understaked is skipped, and one that has completed its exit is no longer in the registry. Blocks and the liveness freeze are not checked, so a blocked or frozen arbiter that is otherwise in good standing can still be paid from the pool.
+The arbiter pool's payouts (an eighth of the pool at each jury draw, at most that draw's base fees, to one registered arbiter picked from the draw's seed) use the keeper's flags, not the scores: an arbiter that is paused, banned, exiting or understaked is skipped, and one that has completed its exit is no longer in the registry. Blocks and the liveness freeze are not checked, so a blocked or frozen arbiter that is otherwise in good standing can still be paid from the pool.
 
 ## The Liveness Freeze
 
