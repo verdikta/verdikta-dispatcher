@@ -294,18 +294,30 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
       expect(seen.size).to.equal(7);
     });
 
-    it("a closed phase that is never promoted fails without penalising anyone, and the requester gets no refund", async () => {
+    it("a closed phase that is never promoted fails without penalising anyone; the committers share the unspent prepay", async () => {
       const r = await drv.request();
       await drv.answerAll(r);
       await commitAll(r, [0, 1, 2, 3, 4, 5, 6]);
       await time.increase(301);
       const before = await agg.ethOwed(requester.address);
+      const [, , , , received, base, bonus, reward0] = await agg.getRoundInfo(r.aggId);
+      const left = received - base - bonus - reward0;
       const rc = await drv.settle(r);
       expect(await agg.isFailed(r.aggId)).to.equal(true);
       for (let s = 0; s < 8; s++) expect(await score(r.slots[s])).to.deep.equal([500, 500]);
       expect(await agg.ethOwed(requester.address)).to.equal(before);     // withholding promote buys no refund
+      // the 7 committed slots (M+ of K = 8) each get an equal share, the 8th (no commit) nothing
+      const paid = eventArgs(rc, "CommitPayment");
+      const share = left / 7n;
+      expect(paid.length).to.equal(7);
+      for (const p of paid) expect(p.amount).to.equal(share);
+      const payees = await Promise.all([0, 1, 2, 3, 4, 5, 6].map(async (s) => (await agg.getSlot(r.aggId, s)).payee));
+      expect(paid.map((p) => p.payee).sort()).to.deep.equal(payees.sort());
+      const dust = eventArgs(rc, "RequesterRefunded");                     // the indivisible rest, to the treasury
       const [deployer] = await ethers.getSigners();
-      expect(eventArgs(rc, "RequesterRefunded")[0].requester).to.equal(deployer.address);   // treasury
+      if (left % 7n) expect([dust[0].requester, dust[0].amount]).to.deep.equal([deployer.address, left % 7n]);
+      else expect(dust.length).to.equal(0);
+      expect((await agg.getRoundInfo(r.aggId))[7]).to.equal(reward0 + share * 7n, "the shares count as rewards");
     });
 
     it("promote() pays its caller 1 x eff, and promoted arbiters get revealWindow however late it is called", async () => {
@@ -423,7 +435,7 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
       expect(refunds[0].amount).to.equal(received - base - reward);
     });
 
-    it("M commits but nobody closed the phase after T+: the round fails, nobody is charged, and the prepay goes to the treasury", async () => {
+    it("M commits but nobody closed the phase after T+: the round fails, nobody is charged, and the 5 committers share the prepay", async () => {
       drv.jury = H.jury(8, 5, 4, 3, 300);
       const r = await drv.request();
       await drv.answerAll(r);
@@ -432,13 +444,17 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
       const [deployer] = await ethers.getSigners();
       const t0 = await agg.ethOwed(deployer.address);
       const q0 = await agg.ethOwed(requester.address);
-      await drv.settle(r);
+      const [, , , , rec0, base0, bonus0, reward0] = await agg.getRoundInfo(r.aggId);
+      const rc = await drv.settle(r);
       expect(await agg.isFailed(r.aggId)).to.equal(true);
       for (const s of [5, 6, 7]) expect(await score(r.slots[s])).to.deep.equal([500, 500]);
+      const paid = eventArgs(rc, "CommitPayment");
+      expect(paid.length).to.equal(5);
+      for (const p of paid) expect(p.amount).to.equal((rec0 - base0 - bonus0 - reward0) / 5n);
       // otherwise a requester that dislikes the jury could withhold closeCommits (with one colluding
       // juror not committing) and get its prepay back: a cheap re-roll
       const [, , , , received, base, , reward] = await agg.getRoundInfo(r.aggId);
-      expect((await agg.ethOwed(deployer.address)) - t0).to.equal(received - base - reward);
+      expect((await agg.ethOwed(deployer.address)) - t0).to.equal(received - base - reward);   // only the dust
       expect(await agg.ethOwed(requester.address)).to.equal(q0);
     });
 

@@ -198,6 +198,8 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
     event JuryDrawn(bytes32 indexed aggRequestId, address indexed drawer, uint256 reward);
     event BeaconStageStarted(bytes32 indexed aggRequestId, uint256 beacons);
     event BeaconPayment(bytes32 indexed aggRequestId, address indexed payee, uint256 amount);
+    /// @notice A never-promoted round's unspent prepay, shared by the slots that committed (one per slot)
+    event CommitPayment(bytes32 indexed aggRequestId, address indexed payee, uint256 amount);
     event RoundCancelled(bytes32 indexed aggRequestId, uint256 toTreasury);
     event RevealReceived(bytes32 indexed aggRequestId, uint256 pollIndex, bool late, uint8 qcode);
     event FulfillAIEvaluation(bytes32 indexed aggRequestId, uint256[] aggregated, string justifications);
@@ -734,11 +736,19 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         uint8 ph = r.phase;
         bool failed = ph != PH_FINAL;
         bytes32 aggId = bytes32(id);
+        uint256 share;
         if (failed) {
             // M commits were in but the round was never promoted (closed and not promoted, or not
-            // closed after T+): the unspent prepay goes to the treasury, so a requester that dislikes
-            // the jury or the promotion draw cannot abort for a refund
-            _refund(r, aggId, ph == PH_CLOSING || (ph == PH_COMMIT && r.commits >= r.M) ? treasury : r.requester);
+            // closed after T+). No refund, so a requester that dislikes the jury or the promotion draw
+            // cannot abort for one: the unspent prepay is shared equally by the slots that committed
+            // (they did the work; anyone could have promoted), and the indivisible rest goes to the treasury
+            if (ph == PH_CLOSING || (ph == PH_COMMIT && r.commits >= r.M)) {
+                share = (uint256(r.ethReceived) - r.baseCredited - r.bonusCredited - r.rewardCredited) / r.commits;
+                r.rewardCredited += uint88(share * r.commits);
+                _refund(r, aggId, treasury);
+            } else {
+                _refund(r, aggId, r.requester);
+            }
             emit EvaluationFailed(aggId, ph);   // phase it failed in: 3 commit, 4 promotion, 5 reveal
         }
         uint256 k = r.K;
@@ -758,6 +768,10 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
                 else code = failed ? T_MISS_FAILED : T_MISS_FINISHED;
             }
             if (code != 0 && f & S_COMMITTED != 0) code |= C_COMMITTED;   // proved up: scored even if frozen
+            if (share != 0 && f & S_COMMITTED != 0) {
+                ethOwed[sl.payee] += share;
+                emit CommitPayment(aggId, sl.payee, share);
+            }
             keys[i] = sl.key;
             codes[i] = code;
         }
