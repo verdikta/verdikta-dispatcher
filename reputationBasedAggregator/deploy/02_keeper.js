@@ -5,11 +5,12 @@
 //   keeper.setApproved(aggregator)   the aggregator selects juries and reports outcomes
 //   keeper.setApproved(beacons)      JuryBeacons picks beacons and relays their answers
 //   beacons.setApproved(aggregator)  the aggregator starts beacon stages
-//   aggregator.setContracts(keeper, beacons, treasury)
+//   aggregator.setContracts(keeper, beacons)
 // -----------------------------------------------------------------------------
 //   • Token: WRAPPED_VERDIKTA_TOKEN_BASE / _BASE_SEPOLIA / WRAPPED_VERDIKTA_TOKEN;
 //     local networks get a TestToken
-//   • Treasury: TREASURY_ADDRESS, else the deployer
+//   • No treasury: forfeits go to the aggregator's arbiter pool (ethOwed[address(0)]), paid out
+//     to random registered arbiters at draws (TREASURY_ADDRESS is no longer read)
 //   • Skips entirely when SKIP_MIGRATIONS is set
 // -----------------------------------------------------------------------------
 
@@ -60,15 +61,12 @@ module.exports = async ({ deployments, getNamedAccounts, ethers, network }) => {
     await execute("JuryBeacons", tx, "setApproved", agg.address, true);
   }
 
-  const treasury = process.env.TREASURY_ADDRESS || (await read("ReputationAggregator", "treasury"));
-  if (!ethers.isAddress(treasury)) throw new Error("TREASURY_ADDRESS invalid");
   const curKeeper = await read("ReputationAggregator", "keeper");
   const curBeacons = await read("ReputationAggregator", "beacons");
-  const curTreasury = await read("ReputationAggregator", "treasury");
-  if (!eq(curKeeper, keeper.address) || !eq(curBeacons, beacons.address) || !eq(curTreasury, treasury)) {
-    await execute("ReputationAggregator", tx, "setContracts", keeper.address, beacons.address, treasury);
+  if (!eq(curKeeper, keeper.address) || !eq(curBeacons, beacons.address)) {
+    await execute("ReputationAggregator", tx, "setContracts", keeper.address, beacons.address);
   }
-  console.log(`Wired: aggregator ${agg.address}, keeper ${keeper.address}, beacons ${beacons.address}, treasury ${treasury}`);
+  console.log(`Wired: aggregator ${agg.address}, keeper ${keeper.address}, beacons ${beacons.address}`);
 };
 
 module.exports.tags = ["keeper"];

@@ -96,7 +96,7 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
       expect(await juryKeys(r2)).to.deep.equal(jury1);
     });
 
-    it("an undrawn round never times out; unsealed past the 8,191-block history it goes to the treasury, never refunded", async () => {
+    it("an undrawn round never times out; unsealed past the 8,191-block history it goes to the arbiter pool, never refunded", async () => {
       const x = await drv.requestOnly();
       const y = await drv.requestOnly();
       await mine(2);
@@ -107,10 +107,10 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
       await expect(agg.cancelUnsealed(x.aggId)).to.be.revertedWithCustomError(agg, "TooEarly");   // still in history
       await mine(8200);
       const [deployer] = await ethers.getSigners();
-      const t0 = await agg.ethOwed(deployer.address);                         // treasury = deployer
+      const t0 = await agg.ethOwed(ethers.ZeroAddress);                         // the arbiter pool
       const [, , , , received] = await agg.getRoundInfo(x.aggId);
       await agg.connect(stranger).cancelUnsealed(x.aggId);
-      expect((await agg.ethOwed(deployer.address)) - t0).to.equal(received);
+      expect((await agg.ethOwed(ethers.ZeroAddress)) - t0).to.equal(received);
       expect(await agg.ethOwed(requester.address)).to.equal(0n);
       await expect(agg.cancelUnsealed(y.aggId)).to.be.revertedWithCustomError(agg, "TooEarly");    // sealed, < 1 day
       await drv.draw(y, { waitBlocks: 0 });                                   // sealed: drawable for a day
@@ -128,7 +128,7 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
       expect(await agg.ethOwed(requester.address)).to.equal(received);
     });
 
-    it("a sealed round undrawn for a day can no longer be drawn, and goes to the treasury", async () => {
+    it("a sealed round undrawn for a day can no longer be drawn, and goes to the arbiter pool", async () => {
       // the draw age limit: no draw reads a request block more than a day old, which the keeper's
       // unbonding (at least 2 days) and slot reuse rely on
       const r = await drv.requestOnly();
@@ -142,10 +142,10 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
       await time.increase(31);
       await expect(agg.drawJury(r.aggId)).to.be.revertedWithCustomError(agg, "DrawExpired");
       const [deployer] = await ethers.getSigners();
-      const t0 = await agg.ethOwed(deployer.address);
+      const t0 = await agg.ethOwed(ethers.ZeroAddress);
       const [, , , , received] = await agg.getRoundInfo(r.aggId);
       await agg.connect(stranger).cancelUnsealed(r.aggId);
-      expect((await agg.ethOwed(deployer.address)) - t0).to.equal(received);
+      expect((await agg.ethOwed(ethers.ZeroAddress)) - t0).to.equal(received);
     });
 
     it("rewards are fixed at request: raising them before the draw cannot break settlement", async () => {
@@ -313,9 +313,9 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
       for (const p of paid) expect(p.amount).to.equal(share);
       const payees = await Promise.all([0, 1, 2, 3, 4, 5, 6].map(async (s) => (await agg.getSlot(r.aggId, s)).payee));
       expect(paid.map((p) => p.payee).sort()).to.deep.equal(payees.sort());
-      const dust = eventArgs(rc, "RequesterRefunded");                     // the indivisible rest, to the treasury
+      const dust = eventArgs(rc, "RequesterRefunded");                     // the indivisible rest, to the arbiter pool
       const [deployer] = await ethers.getSigners();
-      if (left % 7n) expect([dust[0].requester, dust[0].amount]).to.deep.equal([deployer.address, left % 7n]);
+      if (left % 7n) expect([dust[0].requester, dust[0].amount]).to.deep.equal([ethers.ZeroAddress, left % 7n]);
       else expect(dust.length).to.equal(0);
       expect((await agg.getRoundInfo(r.aggId))[7]).to.equal(reward0 + share * 7n, "the shares count as rewards");
     });
@@ -442,7 +442,7 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
       await commitAll(r, [0, 1, 2, 3, 4]);                                    // M commits, before T+; nobody closes
       await time.increase(301);
       const [deployer] = await ethers.getSigners();
-      const t0 = await agg.ethOwed(deployer.address);
+      const t0 = await agg.ethOwed(ethers.ZeroAddress);
       const q0 = await agg.ethOwed(requester.address);
       const [, , , , rec0, base0, bonus0, reward0] = await agg.getRoundInfo(r.aggId);
       const rc = await drv.settle(r);
@@ -454,7 +454,7 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
       // otherwise a requester that dislikes the jury could withhold closeCommits (with one colluding
       // juror not committing) and get its prepay back: a cheap re-roll
       const [, , , , received, base, , reward] = await agg.getRoundInfo(r.aggId);
-      expect((await agg.ethOwed(deployer.address)) - t0).to.equal(received - base - reward);   // only the dust
+      expect((await agg.ethOwed(ethers.ZeroAddress)) - t0).to.equal(received - base - reward);   // only the dust
       expect(await agg.ethOwed(requester.address)).to.equal(q0);
     });
 
@@ -531,7 +531,7 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
     it("keeps the ETH solvency invariant: balance == sum of ethOwed once rounds are settled", async () => {
       for (let i = 0; i < 3; i++) await drv.fullRound();
       const [deployer] = await ethers.getSigners();
-      const payees = new Set([requester.address, deployer.address]);          // deployer calls promote()
+      const payees = new Set([requester.address, deployer.address, ethers.ZeroAddress]);          // deployer calls promote()
       for (const a of arbs) payees.add(await a.op.owner());
       let owed = 0n;
       for (const p of payees) owed += await agg.ethOwed(p);
@@ -782,11 +782,55 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
     it("keeps the ETH solvency invariant with a floor", async () => {
       for (let i = 0; i < 2; i++) await drv.fullRound({ request: { minFee: 7n * H.MAX_FEE } });
       const [deployer] = await ethers.getSigners();
-      const payees = new Set([requester.address, deployer.address]);
+      const payees = new Set([requester.address, deployer.address, ethers.ZeroAddress]);
       for (const a of arbs) payees.add(await a.op.owner());
       let owed = 0n;
       for (const p of payees) owed += await agg.ethOwed(p);
       expect(await ethers.provider.getBalance(agg.target)).to.equal(owed);
+    });
+  });
+
+  describe("the arbiter pool (forfeits paid to random registered arbiters)", () => {
+    const POOL = ethers.ZeroAddress;
+    async function forfeit() {                                                // a round cancelled unsealed
+      const x = await drv.requestOnly();
+      await mine(8200);
+      await agg.connect(stranger).cancelUnsealed(x.aggId);
+      return agg.ethOwed(POOL);
+    }
+
+    it("each draw pays an eighth of the pool to one registered arbiter's payee; nobody can withdraw the pool", async () => {
+      const p0 = await forfeit();
+      expect(p0 > 0n).to.equal(true);
+      const owners = new Set(await Promise.all(arbs.map((a) => a.op.owner())));
+      const r = await drv.request();
+      const paid = eventArgs(r.rcpt, "PoolPayment");
+      expect(paid.length).to.equal(1);
+      expect(paid[0].amount).to.equal(p0 / 8n);
+      expect(owners.has(paid[0].payee)).to.equal(true);
+      expect(await agg.ethOwed(POOL)).to.equal(p0 - p0 / 8n);
+      const r2 = await drv.request();                                          // the next draw: an eighth of the rest
+      expect(eventArgs(r2.rcpt, "PoolPayment")[0].amount).to.equal((p0 - p0 / 8n) / 8n);
+      await expect(agg.withdrawEthFor(POOL)).to.be.revertedWithCustomError(agg, "NotAuthorized");
+    });
+
+    it("the keeper picks only available arbiters, in two tries at most; with none the pool waits", async () => {
+      expect(await keeper.registryLength()).to.equal(12n);
+      const seed = (i) => ethers.id(`seed ${i}`);
+      const owners = new Set(await Promise.all(arbs.map((a) => a.op.owner())));
+      for (let i = 0; i < 4; i++) expect(owners.has(await keeper.poolPayee(seed(i)))).to.equal(true);
+      for (const a of arbs) await keeper.setPaused(a.key, true);
+      for (let i = 0; i < 4; i++) expect(await keeper.poolPayee(seed(i))).to.equal(POOL);
+    });
+
+    it("a completed exit removes the arbiter from the registry", async () => {
+      const a0 = arbs[0];
+      await keeper.requestExit(a0.key);
+      await time.increase(2 * 86400 + 1);
+      await keeper.completeExit(a0.key);
+      expect(await keeper.registryLength()).to.equal(11n);
+      for (const a of arbs.slice(1)) await keeper.setPaused(a.key, true);     // only a0 could win, and it left
+      for (let i = 0; i < 4; i++) expect(await keeper.poolPayee(ethers.id(`s${i}`))).to.equal(POOL);
     });
   });
 

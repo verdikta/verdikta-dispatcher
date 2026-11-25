@@ -178,6 +178,9 @@ contract ReputationKeeper is Ownable {
     mapping(bytes32 => uint64[]) internal classesOf;
     mapping(bytes32 => mapping(uint64 => uint32)) internal slotOf;   // slot index + 1 (0 = not listed)
     mapping(address => bool) public approvedContracts;
+    /// @dev every registered arbiter once, dense (swap-and-pop at completeExit): the arbiter pool's draw
+    bytes32[] internal registry;
+    mapping(bytes32 => uint256) internal registryPos;   // index + 1 (0 = not listed)
 
     Points public points = Points(20, 50, 200, 500, 400, 500, 1000);
     uint256 public stakeRequirement = 100e18;
@@ -301,6 +304,8 @@ contract ReputationKeeper is Ownable {
         // head 0: the node sets its chain with its first answer (a re-sync); frozen until then
         if (chainHead == bytes32(0)) _resyncFreeze(c);
         _write(key, c);
+        registry.push(key);
+        registryPos[key] = registry.length;
         // a freed slot first (see the contract notes), else append. A returning arbiter's slots were
         // freed at its exit, so it takes its classes from this registration like a new one
         for (uint256 i = 0; i < classes.length; i++) {
@@ -397,6 +402,12 @@ contract ReputationKeeper is Ownable {
             delete slotOf[key][cl];
         }
         delete classesOf[key];
+        uint256 rp = registryPos[key];
+        bytes32 last = registry[registry.length - 1];
+        registry[rp - 1] = last;
+        registryPos[last] = rp;
+        registry.pop();
+        delete registryPos[key];
         if (refund > 0 && !verdiktaToken.transfer(to, refund)) revert TransferFailed();
         emit ArbiterRemoved(key, refund);
     }
@@ -939,6 +950,25 @@ contract ReputationKeeper is Ownable {
     ///         so this holds as of B too)
     function scansAll(uint64 cls) external view returns (bool) {
         return classList[cls].length <= maxScan;
+    }
+
+    /// @notice The arbiter pool's draw (the aggregator's forfeits, paid out a share per draw): a registered
+    ///         arbiter picked uniformly from `seed`, returned as its payee (its operator's owner). At most
+    ///         two picks, to keep the draw cheap: if neither is available (paused, banned, exiting or
+    ///         understaked), it returns address(0) and the pool waits for the next draw.
+    function poolPayee(bytes32 seed) external view returns (address) {
+        uint256 n = registry.length;
+        for (uint256 t = 0; t < 2 && n != 0; t++) {
+            bytes32 key = registry[uint256(keccak256(abi.encodePacked(seed, t))) % n];
+            if (_cur(key).flags & (F_REGISTERED | F_PAUSED | F_BANNED | F_EXITING | F_UNDERSTAKED) == F_REGISTERED)
+                return IOracleOwner(metas[key].oracle).owner();
+        }
+        return address(0);
+    }
+
+    /// @notice Registered arbiters (exited ones are removed; banned ones stay until they complete their exit)
+    function registryLength() external view returns (uint256) {
+        return registry.length;
     }
 
     // ================================================================== owner configuration

@@ -50,7 +50,7 @@ describe("JuryBeacons (item 9's beacon flag)", function () {
     expect(on - off).to.equal(2n * H.MAX_FEE);
     await expect(agg.connect(requester).requestAIEvaluationWithApproval(["Qm"], "", 500, H.MAX_FEE, 0, H.BASE_COST, 5, 1, true, H.JURY, { value: off }))
       .to.be.revertedWithCustomError(agg, "InsufficientPayment");
-    await agg.setContracts(keeper.target, ethers.ZeroAddress, deployer.address);
+    await agg.setContracts(keeper.target, ethers.ZeroAddress);
     await expect(H.quote(agg, H.MAX_FEE, 0, true)).to.be.reverted;
     await expect(agg.connect(requester).requestAIEvaluationWithApproval(["Qm"], "", 500, H.MAX_FEE, 0, H.BASE_COST, 5, 1, true, H.JURY, { value: on }))
       .to.be.reverted;
@@ -178,12 +178,12 @@ describe("JuryBeacons (item 9's beacon flag)", function () {
     expect(await juryAfter([3, 0])).to.not.deep.equal(j01);
   });
 
-  it("missed quorum: the round ends with no result, the answering beacon is paid, the rest goes to the treasury", async () => {
+  it("missed quorum: the round ends with no result, the answering beacon is paid, the rest goes to the arbiter pool", async () => {
     const r = await drv.requestOnly();
     await drv.beaconStage(r, { answering: 1 });
     await time.increase(121);
     await drv.answerBeacon(r, 1);                                              // too late: answers its call, value not counted
-    const t0 = await agg.ethOwed(deployer.address);
+    const t0 = await agg.ethOwed(ethers.ZeroAddress);
     const rc = await (await agg.connect(stranger).drawJury(r.aggId)).wait();
     expect(await agg.isFailed(r.aggId)).to.equal(true);
     expect(ev(agg, rc, "EvaluationFailed")[0].phase).to.equal(PH.BEACON);
@@ -191,7 +191,7 @@ describe("JuryBeacons (item 9's beacon flag)", function () {
     expect(H.oracleRequests(rc).length).to.equal(0);
     const [, , , , received, , , rewards] = await agg.getRoundInfo(r.aggId);
     expect(rewards).to.equal(H.MAX_FEE);
-    expect((await agg.ethOwed(deployer.address)) - t0).to.equal(received - H.MAX_FEE);
+    expect((await agg.ethOwed(ethers.ZeroAddress)) - t0).to.equal(received - H.MAX_FEE);
     expect(await agg.ethOwed(requester.address)).to.equal(0n);
     for (const b of r.beacons.slice(2)) expect(await keeper.isFrozen(b.key)).to.equal(true);   // silent beacons freeze
     for (const b of r.beacons.slice(0, 2)) expect(await keeper.isFrozen(b.key)).to.equal(false);
@@ -461,12 +461,12 @@ describe("JuryBeacons (item 9's beacon flag)", function () {
     const run = async () => {
       const r = await drv.requestOnly();
       await drv.beaconStage(r, { answering: 2 });
-      const [owedReq, owedTreasury] = [await agg.ethOwed(requester.address), await agg.ethOwed(deployer.address)];
+      const [owedReq, owedTreasury] = [await agg.ethOwed(requester.address), await agg.ethOwed(ethers.ZeroAddress)];
       await agg.connect(stranger).drawJury(r.aggId, { gasLimit: 16_000_000 });
       expect(await phase(r)).to.equal(PH.FAILED);
       const [, , , , received] = await agg.getRoundInfo(r.aggId);
       return { received, req: (await agg.ethOwed(requester.address)) - owedReq,
-               treasury: (await agg.ethOwed(deployer.address)) - owedTreasury };
+               treasury: (await agg.ethOwed(ethers.ZeroAddress)) - owedTreasury };
     };
     let o = await run();                                                       // maxScan 400 >= 12: seed-independent
     expect(o.req).to.equal(o.received - 2n * H.MAX_FEE);                      // refund less the 2 beacons
@@ -491,7 +491,7 @@ describe("JuryBeacons (item 9's beacon flag)", function () {
     const r = await drv.requestOnly();
     await drv.beaconStage(r);
     const nb = await (await ethers.getContractFactory("JuryBeacons")).deploy(keeper.target);
-    await agg.setContracts(keeper.target, nb.target, deployer.address);
+    await agg.setContracts(keeper.target, nb.target);
     await expect(agg.drawJury(r.aggId)).to.be.revertedWithCustomError(agg, "TooEarly");
     await time.increase(24 * 3600 + 1);
     await agg.cancelUnsealed(r.aggId);
@@ -515,16 +515,16 @@ describe("JuryBeacons (item 9's beacon flag)", function () {
     expect(ev(agg, r.rcpt, "JuryDrawn")[0].reward).to.equal(2n * H.MAX_FEE);
   });
 
-  it("a beacon stage nobody concluded for a day goes to the treasury, unpaid, and can no longer be drawn", async () => {
+  it("a beacon stage nobody concluded for a day goes to the arbiter pool, unpaid, and can no longer be drawn", async () => {
     const r = await drv.requestOnly();
     await drv.beaconStage(r);
     await expect(agg.cancelUnsealed(r.aggId)).to.be.revertedWithCustomError(agg, "TooEarly");
     await time.increase(24 * 3600 + 1);
     await expect(agg.drawJury(r.aggId)).to.be.revertedWithCustomError(agg, "DrawExpired");
-    const t0 = await agg.ethOwed(deployer.address);
+    const t0 = await agg.ethOwed(ethers.ZeroAddress);
     const [, , , , received] = await agg.getRoundInfo(r.aggId);
     await agg.connect(stranger).cancelUnsealed(r.aggId);
-    expect((await agg.ethOwed(deployer.address)) - t0).to.equal(received);
+    expect((await agg.ethOwed(ethers.ZeroAddress)) - t0).to.equal(received);
     expect(await phase(r)).to.equal(PH.CANCELLED);
   });
 
@@ -536,8 +536,8 @@ describe("JuryBeacons (item 9's beacon flag)", function () {
     expect(await phase(r)).to.equal(PH.SETTLED);
     await drv.beaconStage(x, { answering: 1 });
     await time.increase(121);
-    await agg.drawJury(x.aggId);                                              // x: quorum missed, to the treasury
-    const payees = [requester.address, deployer.address, ...(await Promise.all(arbs.map((a) => a.op.owner())))];
+    await agg.drawJury(x.aggId);                                              // x: quorum missed, to the arbiter pool
+    const payees = [requester.address, deployer.address, ethers.ZeroAddress, ...(await Promise.all(arbs.map((a) => a.op.owner())))];
     let owed = 0n;
     for (const p of payees) owed += await agg.ethOwed(p);
     expect(await ethers.provider.getBalance(agg.target)).to.equal(owed);

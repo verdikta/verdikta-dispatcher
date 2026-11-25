@@ -12,7 +12,34 @@ pragma solidity ^0.8.23;
  *         (`uint256[][]`) instead of the aggregator's `Response[]`, so the
  *         library has no dependency on the contract's storage types.
  */
+interface IPoolKeeper { function poolPayee(bytes32 seed) external view returns (address); }
+
 library AggregatorLib {
+    /// @notice A share of the arbiter pool, paid at a draw to a random registered arbiter's payee
+    event PoolPayment(bytes32 indexed aggRequestId, address indexed payee, uint256 amount);
+
+    uint256 internal constant POOL_SHARE = 8;       // each draw pays 1/8 of the pool
+    uint256 internal constant POOL_GAS = 80_000;    // keeper.poolPayee: two picks and one owner() call
+
+    /// @notice The arbiter pool's payout at a draw (called by the aggregator, in its storage): an eighth of
+    ///         ethOwed[address(0)] to a registered arbiter the keeper picks uniformly from the draw's seed.
+    ///         That seed is fixed by a block hash after the request and is the same whoever draws, and a
+    ///         forfeiting round never picks its own winner, so a forfeit cannot be steered back to its
+    ///         requester; paying an eighth per draw makes grinding with many requests cost more than it
+    ///         wins. The keeper call has capped gas, so an operator's owner() cannot make the draw fail;
+    ///         with no winner the pool waits for the next draw.
+    function payPool(mapping(address => uint256) storage owed, address keeper, bytes32 seed, bytes32 aggId) public {
+        uint256 share = owed[address(0)] / POOL_SHARE;
+        if (share == 0) return;
+        try IPoolKeeper(keeper).poolPayee{gas: POOL_GAS}(keccak256(abi.encodePacked(seed, "pool"))) returns (address w) {
+            if (w != address(0)) {
+                owed[address(0)] -= share;
+                owed[w] += share;
+                emit PoolPayment(aggId, w, share);
+            }
+        } catch {}
+    }
+
     error ArrayLengthMismatch();
     error NeedMoreResponses();
 

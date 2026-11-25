@@ -79,6 +79,10 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
     uint8 private constant PH_FINAL = 6;          // aggregated, awaiting settlement
     uint8 private constant PH_SETTLED = 7;
     uint8 private constant PH_FAILED = 8;         // failed and settled
+    /// @dev The arbiter pool (where v1-style "treasury" forfeits go): the ledger entry ethOwed[address(0)],
+    ///      which nobody can withdraw (msg.sender is never address(0), and withdrawEthFor refuses it). Each
+    ///      draw pays an eighth of it to one registered arbiter (AggregatorLib.payPool).
+    address private constant POOL = address(0);
     uint8 private constant PH_CANCELLED = 9;      // never drawable: prepay sent to the treasury
 
     uint8 private constant S_DISPATCHED = 1;
@@ -198,6 +202,9 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
     event JuryDrawn(bytes32 indexed aggRequestId, address indexed drawer, uint256 reward);
     event BeaconStageStarted(bytes32 indexed aggRequestId, uint256 beacons);
     event BeaconPayment(bytes32 indexed aggRequestId, address indexed payee, uint256 amount);
+    /// @notice A share of the arbiter pool, paid at a draw to a random registered arbiter's payee
+    ///         (emitted by AggregatorLib.payPool, in this contract's context)
+    event PoolPayment(bytes32 indexed aggRequestId, address indexed payee, uint256 amount);
     /// @notice A never-promoted round's unspent prepay, shared by the slots that committed (one per slot)
     event CommitPayment(bytes32 indexed aggRequestId, address indexed payee, uint256 amount);
     event RoundCancelled(bytes32 indexed aggRequestId, uint256 toTreasury);
@@ -220,7 +227,6 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
     uint8 public drawRewardFees = 2;           // drawer reward, in per-arbiter fees
     uint8 public promoteRewardFees = 1;        // promote() caller's reward, so third parties call it
     uint40 public requesterDrawPriority = 30;  // seconds in which only the requester earns the reward
-    address public treasury;
     uint40 public tPlus = 155;                 // mean + 2 SD of honest commit latency (item 14, Oct-Nov 2026)
     uint40 public revealWindow = 120;          // reveal time guaranteed after promotion (reveal p90 54 s)
     uint40 private constant DRAW_GRACE = 1 days; // no draw after this; the round can then only be cancelled
@@ -245,7 +251,6 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
     constructor(address link, address _keeper) Ownable(msg.sender) {
         _setChainlinkToken(link);
         keeper = ReputationKeeper(_keeper);
-        treasury = msg.sender;
     }
 
     // ================================================================== request
@@ -411,7 +416,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
             r.rewardCredited += uint88(pay * payees.length);
             if (st == 3) {
                 r.phase = PH_FAILED;              // quorum missed: no result, and no refund (a free re-roll)
-                _refund(r, aggId, treasury);
+                _refund(r, aggId, POOL);
                 emit EvaluationFailed(aggId, PH_BEACON);
                 return;
             }
@@ -429,7 +434,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
             r.phase = PH_FAILED;
             // After a beacon stage, a failure that could depend on the seed (the walk covers only part
             // of the class list) is a re-roll the beacons' timing could choose, so no refund then
-            _refund(r, aggId, r.beaconFees != 0 && !keeper.scansAll(r.cls) ? treasury : r.requester);
+            _refund(r, aggId, r.beaconFees != 0 && !keeper.scansAll(r.cls) ? POOL : r.requester);
             emit EvaluationFailed(aggId, PH_DRAW);
             return;
         }
@@ -453,6 +458,11 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
             ethOwed[msg.sender] += reward;
             r.rewardCredited += uint88(reward);
         }
+        // the arbiter pool: 1/POOL_SHARE of it to a random registered arbiter, from this draw's seed (fixed by
+        // a block hash after the request, the same whoever draws). A forfeiting round never picks its own
+        // winner, so a forfeit cannot be steered back to its requester. Capped gas: an operator's owner()
+        // cannot make the draw fail; no winner, and the pool waits for the next draw
+        AggregatorLib.payPool(ethOwed, address(keeper), seed, aggId);
         settleQueue.push(id);
         emit JuryDrawn(aggId, msg.sender, reward);
     }
@@ -468,7 +478,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         if (r.sealedHash == bytes32(0) ? block.number <= uint256(r.requestBlock) + 1 + HISTORY_WINDOW
                                        : block.timestamp <= uint256(r.requestTime) + DRAW_GRACE) revert TooEarly();
         r.phase = PH_CANCELLED;
-        ethOwed[treasury] += r.ethReceived;
+        ethOwed[POOL] += r.ethReceived;
         emit RoundCancelled(aggId, r.ethReceived);
     }
 
@@ -745,7 +755,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
             if (ph == PH_CLOSING || (ph == PH_COMMIT && r.commits >= r.M)) {
                 share = (uint256(r.ethReceived) - r.baseCredited - r.bonusCredited - r.rewardCredited) / r.commits;
                 r.rewardCredited += uint88(share * r.commits);
-                _refund(r, aggId, treasury);
+                _refund(r, aggId, POOL);
             } else {
                 _refund(r, aggId, r.requester);
             }
@@ -853,7 +863,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
     }
 
     function withdrawEthFor(address payee) external nonReentrant {
-        if (msg.sender != payee && msg.sender != owner()) revert NotAuthorized();
+        if ((msg.sender != payee && msg.sender != owner()) || payee == POOL) revert NotAuthorized();
         _withdrawTo(payee);
     }
 
@@ -888,12 +898,12 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         (drawRewardFees, requesterDrawPriority, promoteRewardFees, revealWindow) = (drawFees_, priority, promoteFees_, revealWindow_);
     }
 
-    /// @notice Keeper, beacon contract (0 = beacons off) and treasury. Rounds in flight keep calling the
-    ///         new ones: change the keeper only when no round awaits settlement, and the beacon contract
-    ///         only when no round is in its beacon stage.
-    function setContracts(address keeper_, address beacons_, address treasury_) external onlyOwner {
-        if (keeper_ == address(0) || treasury_ == address(0)) revert InvalidConfig();
-        (keeper, beacons, treasury) = (ReputationKeeper(keeper_), IJuryBeacons(beacons_), treasury_);
+    /// @notice Keeper and beacon contract (0 = beacons off). Rounds in flight keep calling the new ones:
+    ///         change the keeper only when no round awaits settlement, and the beacon contract only when no
+    ///         round is in its beacon stage.
+    function setContracts(address keeper_, address beacons_) external onlyOwner {
+        if (keeper_ == address(0)) revert InvalidConfig();
+        (keeper, beacons) = (ReputationKeeper(keeper_), IJuryBeacons(beacons_));
     }
 
     function pause() external onlyOwner {
