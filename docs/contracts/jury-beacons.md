@@ -38,7 +38,7 @@ If the keeper finds fewer candidates than the quorum, `start` returns the count 
 A cartel holding beacon seats can still choose among a few seeds by when it reveals, and it can force a no-result round by withholding (item 9, "What it buys and costs"). Two limits apply:
 
 - Beacons are picked with the jurors' eligibility, including the round's fee ceiling. Keys posted above the ceiling never sit on a jury, so they cost a Sybil no juror risk; before this rule they took beacon seats in proportion to their share of the class, and a priced-out swarm holding 3 of the 4 seats could void a round and win much of the forfeit back from the arbiter pool.
-- Withholding costs score. After the deadline anyone may call `chargeSilent`, and each beacon with no value counted by the deadline loses 400 timeliness through the keeper (as a juror that did not commit in a failed round), whether the stage met its quorum or not, and even if it is frozen by then. A second hit within the decay period blocks the key.
+- Withholding costs score. After the deadline, until a day after the stage started, anyone may call `chargeSilent`, and each beacon with no value counted by the deadline loses 400 timeliness through the keeper (as a juror that did not commit in a failed round), whether the stage met its quorum or not, and even if it is frozen by then. A second hit within the decay period blocks the key.
 
 ## Contract Interface
 
@@ -65,7 +65,7 @@ function chargeSilent(address aggregator, bytes32 aggId) external
 | `quorum_` | The values the aggregator escrowed for, fixed at the request |
 | `maxFee` | The round's fee ceiling, `min(maxFee, maxOracleFee)`: only arbiters whose posted fee is at most this are picked, as for the jury |
 
-`chargeSilent` reverts with the keeper's `BadParams()` before the deadline, for a request with no stage, for a second call, and when `timeout` was below the keeper's `callDeadline` (60 s) at the start.
+`chargeSilent` reverts with the keeper's `BadParams()` before the deadline, for a request with no stage, for a second call, more than a day (`MAX_DRAW_AGE`) after the stage started, and when `timeout` was below the keeper's `callDeadline` (60 s) at the start.
 
 `start` reverts with `NotApproved()` for a caller that `setApproved` has not approved, and with `AlreadyStarted()` for a second start of the same `aggId` by the same aggregator. The keeper's `pickBeacons` reverts with `NotApproved()` if the keeper has not approved this contract, with `FutureBlock()` and with `StaleBlock()`. These errors revert the aggregator's `drawJury`.
 

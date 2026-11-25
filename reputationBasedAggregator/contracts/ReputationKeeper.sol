@@ -784,14 +784,18 @@ contract ReputationKeeper is Ownable {
      *         Unlike a juror's miss it is charged even if the beacon is frozen by then: a beacon was live
      *         at B, and withholding means not answering, which freezes. Once per pick; `deadline` must
      *         have passed and give at least the call deadline D, so a caller cannot charge an honest
-     *         beacon for an impossibly short stage.
+     *         beacon for an impossibly short stage. And at most MAX_DRAW_AGE after the pick: a picked key
+     *         was not exiting at B and the pick is at most MAX_DRAW_AGE after B, so the key cannot complete
+     *         an exit (unbonding is at least 2 days) and register again as a fresh arbiter before then: an
+     *         old stage is never charged to a later registration.
      */
     function missedBeacons(bytes32[] calldata keys, uint256 atBlock, uint256 pickedAt, uint256 deadline)
         external
         onlyRole(ROLE_SELECT)
     {
         bytes32 h = keccak256(abi.encode(msg.sender, keys, atBlock, pickedAt));
-        if (beaconPicks[h] == 0 || deadline < pickedAt + callDeadline || deadline >= block.timestamp) revert BadParams();
+        if (beaconPicks[h] == 0 || deadline < pickedAt + callDeadline || deadline >= block.timestamp
+            || block.timestamp > pickedAt + MAX_DRAW_AGE) revert BadParams();
         beaconPicks[h]--;
         uint256 burnTotal;
         for (uint256 i = 0; i < keys.length; i++) {

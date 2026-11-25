@@ -782,8 +782,13 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
             uint8 f = sl.flags;
             uint8 code;
             if (ph == PH_COMMIT) {
-                // -400 only if the round failed for lack of commits (not for want of a closeCommits call)
-                if (f & S_COMMITTED == 0 && r.commits < r.M) code = T_NOCOMMIT_FAILED;
+                // -400 only if the round failed for lack of commits (not for want of a closeCommits call),
+                // and only if someone committed: with no commit at all the failure is the request's (one
+                // every honest arbiter refuses) or the network's (a shared outage), not the jurors'.
+                // commits - 1 < M - 1 is commits < M for commits >= 1, and false for 0 (it wraps; M >= 1)
+                unchecked {
+                    if (f & S_COMMITTED == 0 && uint256(r.commits) - 1 < uint256(r.M) - 1) code = T_NOCOMMIT_FAILED;
+                }
             } else if (ph == PH_CLOSING) {
                 code = 0;   // enough commits arrived; nobody promoted, so nobody failed to deliver
             } else if (f & S_PROMOTED != 0) {

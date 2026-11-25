@@ -106,7 +106,7 @@ These are declared in the libraries. The aggregator's inputs never trigger the g
 | Error | Trigger | Meaning |
 |-------|---------|---------|
 | `NotApproved()` | `selectArbiters`, `pickBeacons` or `applyOutcomes` from a contract that `setApproved` has not approved | |
-| `BadParams()` | `selectArbiters` with `alpha > 1000`, `count == 0`, `estimatedBaseCost >= maxFee` or a scaling factor below 1; `applyOutcomes` with arrays of different lengths; `missedBeacons` (`JuryBeacons.chargeSilent`) for a pick the caller did not make or already charged, before the deadline, or with a stage shorter than `callDeadline` | |
+| `BadParams()` | `selectArbiters` with `alpha > 1000`, `count == 0`, `estimatedBaseCost >= maxFee` or a scaling factor below 1; `applyOutcomes` with arrays of different lengths; `missedBeacons` (`JuryBeacons.chargeSilent`) for a pick the caller did not make or already charged, before the deadline or more than a day (`MAX_DRAW_AGE`) after the pick, or with a stage shorter than `callDeadline` | |
 | `FutureBlock()` | `selectArbiters` or `pickBeacons` with `atBlock >= block.number` | Selection reads only past state |
 | `StaleBlock()` | `selectArbiters` or `pickBeacons` with `atTime` more than `MAX_DRAW_AGE` (1 day) ago | |
 | `NoEligibleArbiters()` | `selectArbiters` when the class list is empty as of `atBlock`, or the walk finds no eligible arbiter | Only at zero: with fewer than K, the jury repeats arbiters. The aggregator catches it and fails the round with a refund |

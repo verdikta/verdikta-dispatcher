@@ -3,8 +3,9 @@
 // Deploys ReputationKeeper and JuryBeacons, then wires them to the aggregator from
 // 01_aggregator.js:
 //   keeper.setApproved(aggregator)   the aggregator selects juries and reports outcomes
-//   keeper.setRoles(beacons, 2)      JuryBeacons picks beacons (ROLE_SELECT only: it never scores
-//                                    and never sends operator requests)
+//   keeper.setRoles(beacons, 2)      JuryBeacons picks beacons (ROLE_SELECT only: it never sends
+//                                    operator requests, and scores only its own picks' silent
+//                                    beacons, once each, through keeper.missedBeacons)
 //   beacons.setApproved(aggregator)  the aggregator starts beacon stages
 //   aggregator.setContracts(keeper, beacons)
 // -----------------------------------------------------------------------------

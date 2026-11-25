@@ -435,6 +435,18 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
       expect(refunds[0].amount).to.equal(received - base - reward);
     });
 
+    it("failed with no commit at all: nobody is charged (a request every arbiter refuses, or a shared outage)", async () => {
+      const r = await drv.request();
+      await drv.answerAll(r);
+      await time.increase(301);
+      await drv.settle(r);
+      expect(await agg.isFailed(r.aggId)).to.equal(true);
+      for (let s = 0; s < 6; s++) {
+        expect(await score(r.slots[s])).to.deep.equal([500, 500]);
+        expect((await keeper.getArbiter(r.slots[s].arb.key)).offenses).to.equal(0n);
+      }
+    });
+
     it("M commits but nobody closed the phase after T+: the round fails, nobody is charged, and the 5 committers share the prepay", async () => {
       drv.jury = H.jury(8, 5, 4, 3, 300);
       const r = await drv.request();
