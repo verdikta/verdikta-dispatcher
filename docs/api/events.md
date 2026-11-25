@@ -1,59 +1,36 @@
 # Events Reference
 
-Complete reference for all events emitted by Verdikta Dispatcher contracts. Events are grouped by contract and listed in the order they typically fire during a request lifecycle.
+Complete reference for all events emitted by Verdikta Dispatcher contracts. Events are grouped by contract and listed in the order they typically fire during a round.
 
 !!! note "Checked against the code"
-    The ReputationAggregator section was revised on 2026-11-22 against the event declarations in [`ReputationAggregator.sol`](https://github.com/verdikta/verdikta-dispatcher/blob/master/reputationBasedAggregator/contracts/ReputationAggregator.sol) and the places where the contract emits them. The aggregator is paid in ETH: every amount in its events is in wei of ETH, and payments are credits in the contract's `ethOwed` ledger that the payee collects with `withdrawEth()`.
+    Regenerated on 2026-11-25 for **v2** from the event declarations and `emit` sites in [`ReputationAggregator.sol`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/contracts/ReputationAggregator.sol), [`ReputationKeeper.sol`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/contracts/ReputationKeeper.sol) and [`JuryBeacons.sol`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/contracts/JuryBeacons.sol) on the `beacon` branch. v2 is not deployed yet. Every amount in the aggregator's events is in wei of ETH, and payments are credits in the contract's `ethOwed` ledger that the payee collects with `withdrawEth()`. In every aggregator event, `aggRequestId` is the round's `aggId`, `bytes32(roundId)`, and `pollIndex` is the jury slot, 0 to K − 1.
+
+!!! warning "v1 events"
+    The v1 aggregator and keeper (tag `aggregator-v0.1.0`, deployed today) emit different events. These v1 events do not exist in v2:
+
+    - aggregator: `OracleSelected`, `RevealRequestDispatched`, `NewOracleResponseRecorded`, `EvaluationTimedOut`, the reveal diagnostics (`RevealHashMismatch`, `InvalidRevealFormat`, `RevealTooManyScores`, `RevealWrongScoreCount`, `RevealTooFewScores`, `RevealCidTooLong`), `ReputationKeeperChanged`, `ScoreDeltasUpdated` and `OracleScoreUpdateSkipped`;
+    - keeper: `OracleRegistered`, `OracleDeregistered`, `ScoreUpdated`, `OracleSlashed`, `ContractApproved`/`ContractRemoved`, `OracleActiveStatusUpdated` and `EntropyPushed`.
+
+    In v2, `CommitReceived` carries a `bytes32` hash and no operator, `CommitPhaseComplete` carries the number promoted, `BonusPayment` is indexed by round, and `EvaluationFailed` carries a phase number instead of a string.
 
 ## ReputationAggregator Events
 
 ### RequestFunded
 
-Emitted when a request is accepted, showing where the ETH for the round came from.
-
 ```solidity
-event RequestFunded(
-    bytes32 indexed aggRequestId,
-    address indexed requester,
-    uint256 fromCredit,
-    uint256 fromValue
-);
+event RequestFunded(bytes32 indexed aggRequestId, address indexed requester, uint256 fromCredit, uint256 fromValue);
 ```
 
 | Parameter | Type | Indexed | Description |
 |-----------|------|---------|-------------|
-| `aggRequestId` | `bytes32` | Yes | Aggregator request identifier |
-| `requester` | `address` | Yes | The caller of `requestAIEvaluationWithApproval()`, who funds the round |
-| `fromCredit` | `uint256` | No | ETH (wei) taken from the requester's existing `ethOwed` credit: the smaller of the credit and the required prepayment |
-| `fromValue` | `uint256` | No | ETH (wei) sent with the call (`msg.value`) |
+| `aggRequestId` | `bytes32` | Yes | The round |
+| `requester` | `address` | Yes | The caller of `requestAIEvaluationWithApproval()` |
+| `fromCredit` | `uint256` | No | ETH taken from the requester's `ethOwed` credit: what `msg.value` did not cover |
+| `fromValue` | `uint256` | No | `msg.value`. Anything above the prepay was added to the requester's credit |
 
-**When it fires:** Once per call to `requestAIEvaluationWithApproval()`, before the oracles are selected. `fromCredit + fromValue` is the ETH held for the round (`ethReceived` in `getEthAccounting()`).
-
-### BasePayment
-
-Emitted when the base fee is credited to the owner of a polled oracle.
-
-```solidity
-event BasePayment(
-    bytes32 indexed aggRequestId,
-    uint256 pollIndex,
-    address indexed payee,
-    uint256 amount
-);
-```
-
-| Parameter | Type | Indexed | Description |
-|-----------|------|---------|-------------|
-| `aggRequestId` | `bytes32` | Yes | Aggregator request identifier |
-| `pollIndex` | `uint256` | No | Oracle's slot index in the polling array |
-| `payee` | `address` | Yes | The credited address: the `owner()` of the oracle's operator contract, read when the request is made |
-| `amount` | `uint256` | No | The oracle's registered fee (wei of ETH), added to `ethOwed[payee]` |
-
-**When it fires:** During `requestAIEvaluationWithApproval()`, once for each of the K oracles whose request was dispatched (default 6), just before that oracle's `OracleSelected`. An oracle whose request could not be dispatched is not credited and gets an `OracleScoreUpdateSkipped` event instead.
+**When it fires:** Once per request, just before `RequestAIEvaluation`. The prepay held for the round is `fromCredit + fromValue` less any excess, which is `received` in `getRoundInfo`.
 
 ### RequestAIEvaluation
-
-Emitted when a new commit-reveal evaluation request is created.
 
 ```solidity
 event RequestAIEvaluation(bytes32 indexed aggRequestId, string[] cids);
@@ -61,430 +38,317 @@ event RequestAIEvaluation(bytes32 indexed aggRequestId, string[] cids);
 
 | Parameter | Type | Indexed | Description |
 |-----------|------|---------|-------------|
-| `aggRequestId` | `bytes32` | Yes | Unique aggregator request identifier, derived from `keccak256(timestamp, sender, cidPayload, requestCounter)` |
-| `cids` | `string[]` | No | Array of IPFS CIDs containing evidence to evaluate |
+| `aggRequestId` | `bytes32` | Yes | The round: `bytes32(roundId)`, sequential from 1 |
+| `cids` | `string[]` | No | The request's CIDs |
 
-**When it fires:** Once per call to `requestAIEvaluationWithApproval()`, after all K oracles have been dispatched.
+**When it fires:** Once per request, last in the request transaction. No arbiter is chosen yet: the jury is drawn later by `drawJury`.
 
-### OracleSelected
-
-Emitted for every oracle chosen for a poll slot during request creation.
+### SeedSealed
 
 ```solidity
-event OracleSelected(
-    bytes32 indexed aggRequestId,
-    uint256 indexed pollIndex,
-    address oracle,
-    bytes32 jobId
-);
+event SeedSealed(bytes32 indexed aggRequestId, bytes32 blockHash);
+```
+
+**When it fires:** When blockhash(B+1) is stored: by `sealSeed`, or by the first `drawJury` if the seed was not sealed yet. `blockHash` is that hash.
+
+### BeaconStageStarted
+
+```solidity
+event BeaconStageStarted(bytes32 indexed aggRequestId, uint256 beacons);
+```
+
+**When it fires:** At the first `drawJury` of a round requested with beacons, when the keeper found at least the quorum of beacon candidates. `beacons` is the number picked. The round is then in phase 2. JuryBeacons emits a `BeaconCalled` per beacon in the same transaction.
+
+### BeaconPayment
+
+```solidity
+event BeaconPayment(bytes32 indexed aggRequestId, address indexed payee, uint256 amount);
 ```
 
 | Parameter | Type | Indexed | Description |
 |-----------|------|---------|-------------|
-| `aggRequestId` | `bytes32` | Yes | Aggregator request identifier |
-| `pollIndex` | `uint256` | Yes | Zero-based slot number (0 to K−1) |
-| `oracle` | `address` | No | Oracle operator address |
-| `jobId` | `bytes32` | No | Job ID used for this request |
+| `payee` | `address` | Yes | The beacon's operator `owner()` |
+| `amount` | `uint256` | No | `max(eff, minFee)`, credited to `ethOwed[payee]` |
 
-**When it fires:** K times per request (default 6), once per oracle whose request was dispatched, right after that oracle's `BasePayment`. Fires before `RequestAIEvaluation`.
+**When it fires:** At the second `drawJury` of a beacon round, once per used beacon value, whether the stage was ready or expired. Up to the quorum (2).
+
+### BasePayment
+
+```solidity
+event BasePayment(bytes32 indexed aggRequestId, uint256 pollIndex, address indexed payee, uint256 amount);
+```
+
+| Parameter | Type | Indexed | Description |
+|-----------|------|---------|-------------|
+| `pollIndex` | `uint256` | No | The jury slot |
+| `payee` | `address` | Yes | The operator's `owner()`, read at the draw |
+| `amount` | `uint256` | No | The slot's fee: `max(posted fee as of B, minFee)` |
+
+**When it fires:** In the draw transaction, once per slot whose commit request was dispatched. A slot that could not be dispatched gets `SlotSkipped` instead and is not paid. A repeated arbiter is paid once per slot.
+
+### JuryDrawn
+
+```solidity
+event JuryDrawn(bytes32 indexed aggRequestId, address indexed drawer, uint256 reward);
+```
+
+| Parameter | Type | Indexed | Description |
+|-----------|------|---------|-------------|
+| `drawer` | `address` | Yes | The caller of `drawJury` |
+| `reward` | `uint256` | No | `eff × drawRewardFees()` credited to the drawer, or 0: a third party that draws within `requesterDrawPriority()` (30 s) earns nothing |
+
+**When it fires:** Last in the transaction that draws the jury, after the `BasePayment`s. The round is then in phase 3, and its deadline is the draw time plus the jury's timeout.
 
 ### CommitReceived
 
-Emitted when an oracle submits a commit hash during the commit phase.
-
 ```solidity
-event CommitReceived(
-    bytes32 indexed aggRequestId,
-    uint256 pollIndex,
-    address operator,
-    bytes16 commitHash
-);
+event CommitReceived(bytes32 indexed aggRequestId, uint256 pollIndex, bytes32 commitHash);
 ```
 
-| Parameter | Type | Indexed | Description |
-|-----------|------|---------|-------------|
-| `aggRequestId` | `bytes32` | Yes | Aggregator request identifier |
-| `pollIndex` | `uint256` | No | Oracle's slot index in the polling array |
-| `operator` | `address` | No | Address of the oracle operator (`msg.sender` of the fulfillment) |
-| `commitHash` | `bytes16` | No | 128-bit hash of the oracle's commitment: `bytes16(bytes32(response[0] << 128))` |
+**When it fires:** For each accepted commit: in phase 3, before the deadline, a non-zero hash, the slot's first. `commitHash` is `keccak256(abi.encode(aggId, operator, response, salt))`. A rejected commit emits nothing.
 
-**When it fires:** Each time an oracle calls back with a Mode 1 (commit) response. Also fires for late commits that arrive after the commit phase has completed (these are logged but otherwise ignored).
+### CommitWindowClosed
+
+```solidity
+event CommitWindowClosed(bytes32 indexed aggRequestId, uint256 closeBlock);
+```
+
+**When it fires:** When the commit phase closes: at the M+-th commit, at a commit after T+ with at least M in, or through `closeCommits`. `closeBlock` is C. `promote` is possible from block C+2. The round is then in phase 4.
 
 ### CommitPhaseComplete
 
-Emitted when the required number of commits (M) have been received, transitioning the evaluation to the reveal phase.
+```solidity
+event CommitPhaseComplete(bytes32 indexed aggRequestId, uint256 promoted);
+```
+
+**When it fires:** In `promote`, after the reveal requests have been sent to the M promoted slots. `promoted` is M. The round is then in phase 5. A reveal request that could not be sent gets `SlotSkipped` with reason 3. The promote reward is not in any event.
+
+### RevealReceived
 
 ```solidity
-event CommitPhaseComplete(bytes32 indexed aggRequestId);
+event RevealReceived(bytes32 indexed aggRequestId, uint256 pollIndex, bool late, uint8 qcode);
 ```
 
 | Parameter | Type | Indexed | Description |
 |-----------|------|---------|-------------|
-| `aggRequestId` | `bytes32` | Yes | Aggregator request identifier |
+| `pollIndex` | `uint256` | No | The slot |
+| `late` | `bool` | No | `false`: a counted reveal (phase 5). `true`: a late reveal after finalization (phase 6), which is scored but does not change the result |
+| `qcode` | `uint8` | No | For a late reveal, its quality class (1 close, 2 off, 3 far). 0 for a counted reveal: its class is set at finalization |
 
-**When it fires:** Once, in the `fulfill()` call that delivers the M-th commit (`commitReceived == revealExpected`, where `revealExpected` is the value of `oraclesToPoll` when the request was made). `finalizeEvaluationTimeout()` does not emit it.
-
-### RevealRequestDispatched
-
-Emitted when a Mode 2 (reveal) request is sent to an oracle that successfully committed.
-
-```solidity
-event RevealRequestDispatched(
-    bytes32 indexed aggRequestId,
-    uint256 pollIndex,
-    bytes16 commitHash
-);
-```
-
-| Parameter | Type | Indexed | Description |
-|-----------|------|---------|-------------|
-| `aggRequestId` | `bytes32` | Yes | Aggregator request identifier |
-| `pollIndex` | `uint256` | No | Oracle's slot index |
-| `commitHash` | `bytes16` | No | The commit hash the oracle is being asked to reveal |
-
-**When it fires:** Once per oracle that committed (skipping slots with no commit), immediately after `CommitPhaseComplete`. The reveal request payload is `"2:<commitHashHex>"`. If the reveal request to an oracle cannot be dispatched, `OracleScoreUpdateSkipped` is emitted for it instead.
-
-### NewOracleResponseRecorded
-
-Emitted when an oracle provides a valid reveal response that passes all validation (hash match, format check, array length limits).
-
-```solidity
-event NewOracleResponseRecorded(
-    bytes32 requestId,
-    uint256 pollIndex,
-    bytes32 indexed aggRequestId,
-    address operator
-);
-```
-
-| Parameter | Type | Indexed | Description |
-|-----------|------|---------|-------------|
-| `requestId` | `bytes32` | No | Chainlink request identifier (the reveal-phase request ID) |
-| `pollIndex` | `uint256` | No | Oracle's slot index |
-| `aggRequestId` | `bytes32` | Yes | Aggregator request identifier |
-| `operator` | `address` | No | Address of the oracle operator |
-
-**When it fires:** Each time a valid reveal is accepted and stored. Does not fire for rejected reveals (hash mismatch, format error, etc.).
-
-`aggRequestId` is the third argument and the only indexed one, so a filter for one request is `filters.NewOracleResponseRecorded(null, null, aggRequestId)`.
-
-### FulfillAIEvaluation
-
-Emitted when the aggregation is complete and final results are available.
-
-```solidity
-event FulfillAIEvaluation(
-    bytes32 indexed aggRequestId,
-    uint256[] aggregated,
-    string justifications
-);
-```
-
-| Parameter | Type | Indexed | Description |
-|-----------|------|---------|-------------|
-| `aggRequestId` | `bytes32` | Yes | Aggregator request identifier |
-| `aggregated` | `uint256[]` | No | Final aggregated likelihood scores — the arithmetic mean of clustered oracles' scores per dimension |
-| `justifications` | `string` | No | Comma-separated IPFS CIDs of justifications from clustered oracles only |
-
-**When it fires:** Once, when N reveals have been received and `_finalizeAggregation()` completes successfully. It is the last event of a completed round, after `BonusPayment` and `RequesterRefunded`.
+**When it fires:** For each valid reveal before the deadline. A bad reveal is ignored and emits nothing.
 
 ### BonusPayment
 
-Emitted when the bonus is credited for a clustered oracle.
-
 ```solidity
-event BonusPayment(address indexed operator, uint256 bonusFee);
+event BonusPayment(bytes32 indexed aggRequestId, uint256 pollIndex, address indexed payee, uint256 amount);
 ```
 
-| Parameter | Type | Indexed | Description |
-|-----------|------|---------|-------------|
-| `operator` | `address` | Yes | Address of the clustered oracle's operator contract. The ETH is credited to that operator's owner as recorded when the request was made (the `payee` of the oracle's `BasePayment`), not to this address |
-| `bonusFee` | `uint256` | No | Bonus in wei of ETH: the oracle's registered fee × the bonus multiplier in force when the request was made (`bonusMultiplierSnap` in `getEthAccounting()`) |
-
-**When it fires:** Once per clustered oracle (up to P times, default 2) during `_finalizeAggregation()`. No ETH leaves the contract at this point: the amount is added to `ethOwed` and the payee withdraws it later.
+**When it fires:** At finalization (the N-th counted reveal), once per clustered slot (P of them) with a non-zero bonus. `amount` is `bonusMultiplier × the slot's fee`.
 
 ### RequesterRefunded
 
-Emitted when the part of the prepayment that the round did not spend is credited back to the requester.
-
 ```solidity
-event RequesterRefunded(
-    bytes32 indexed aggRequestId,
-    address indexed requester,
-    uint256 amount
-);
+event RequesterRefunded(bytes32 indexed aggRequestId, address indexed requester, uint256 amount);
 ```
 
 | Parameter | Type | Indexed | Description |
 |-----------|------|---------|-------------|
-| `aggRequestId` | `bytes32` | Yes | Aggregator request identifier |
-| `requester` | `address` | Yes | The address that made the request |
-| `amount` | `uint256` | No | Refund in wei of ETH: `ethReceived − baseCredited − bonusCredited`, added to `ethOwed[requester]` |
+| `requester` | `address` | Yes | Who was credited: the requester, **or the treasury** for a round whose refund would be a free re-roll |
+| `amount` | `uint256` | No | The unspent prepay: received minus base fees, bonuses and rewards |
 
-**When it fires:** Once when the round is settled, if the amount is greater than 0: in `_finalizeAggregation()` for a completed round, or in `finalizeEvaluationTimeout()` for a round that failed. The refund is a credit. It pays for the requester's next request before new ETH is asked for, or is collected with `withdrawEth()`.
+**When it fires:** Only when `amount > 0`, at:
+
+- finalization (to the requester);
+- a failed draw: no eligible arbiter or a beacon pool shortage (to the requester), or a failure after a beacon stage when the walk does not cover the class list (to the treasury);
+- a missed beacon quorum (to the treasury);
+- the settlement of a failed round: to the treasury if M commits were in but the round was never promoted, otherwise to the requester.
+
+A cancelled round emits `RoundCancelled` instead.
+
+### FulfillAIEvaluation
+
+```solidity
+event FulfillAIEvaluation(bytes32 indexed aggRequestId, uint256[] aggregated, string justifications);
+```
+
+**When it fires:** At finalization, last in the transaction of the N-th counted reveal, after the `BonusPayment`s and the `RequesterRefunded`. `aggregated` is the cluster's mean on the 0..1,000,000 scale; `justifications` is the clustered reveals' CIDs, comma-separated. The round is then in phase 6.
+
+### EvaluationFailed
+
+```solidity
+event EvaluationFailed(bytes32 indexed aggRequestId, uint8 phase);
+```
+
+`phase` is where the round failed:
+
+| `phase` | Cause | Emitted by |
+|---------|-------|------------|
+| 1 | No eligible arbiter at the draw, or fewer beacon candidates than the quorum | `drawJury` |
+| 2 | Beacon quorum missed by the beacon deadline | the second `drawJury` |
+| 3 | Commit phase never closed by the deadline | settlement |
+| 4 | Closed but never promoted | settlement |
+| 5 | Fewer than N counted reveals by the deadline | settlement |
+
+**When it fires:** As above. The round is then in phase 8, and `isFailed(aggId)` is true. A failure at 1 or 2 is not settled with the keeper (there is no jury to score) and emits no `RoundSettled`.
+
+### RoundSettled
+
+```solidity
+event RoundSettled(bytes32 indexed aggRequestId, bool failed);
+```
+
+**When it fires:** When a drawn round is settled after its deadline, by `settle` or by a later request's settlement queue. Every slot's outcome has then been reported to the keeper. `failed` is false for a finalized round (phase 7) and true for a failed one (phase 8, after its `EvaluationFailed`).
+
+### RoundCancelled
+
+```solidity
+event RoundCancelled(bytes32 indexed aggRequestId, uint256 toTreasury);
+```
+
+**When it fires:** On `cancelUnsealed` of a round that was never drawn: unsealed once blockhash(B+1) left the 8,191-block history, or sealed but undrawn 1 day after the request. `toTreasury` is the whole prepay. The round is then in phase 9, and `isFailed` stays false.
+
+### SlotSkipped
+
+```solidity
+event SlotSkipped(bytes32 indexed aggRequestId, uint256 pollIndex, uint8 reason);
+```
+
+| `reason` | When | Effect |
+|----------|------|--------|
+| 1 | At the draw: the operator's `owner()` reverted, returned short data, a zero address, or dirty high bits, within the 30,000-gas stipend | The slot gets no commit request and no base fee |
+| 2 | At the draw: the commit request reverted or used up `dispatchGas()`, for example because the operator does not list the v2 keeper | The same |
+| 3 | At `promote`: the reveal request reverted | The promoted slot cannot reveal |
+| 4 | At settlement: the keeper's `applyOutcomes` reverted. `pollIndex` is `type(uint256).max` | The round is settled without scores |
 
 ### EthWithdrawn
-
-Emitted when ETH is paid out of the `ethOwed` ledger.
 
 ```solidity
 event EthWithdrawn(address indexed payee, uint256 amount);
 ```
 
-| Parameter | Type | Indexed | Description |
-|-----------|------|---------|-------------|
-| `payee` | `address` | Yes | The credited address, which is also the address that received the ETH |
-| `amount` | `uint256` | No | ETH sent, in wei: the payee's whole `ethOwed` balance |
+**When it fires:** On `withdrawEth()` or `withdrawEthFor(payee)`: `amount` is the whole credit sent to `payee`.
 
-**When it fires:** On a successful `withdrawEth()` or `withdrawEthFor(payee)`. This is the only point where the contract sends ETH.
+### Inherited Events
 
-### EvaluationTimedOut
-
-Emitted when an evaluation exceeds the response timeout.
-
-```solidity
-event EvaluationTimedOut(bytes32 indexed aggRequestId);
-```
-
-| Parameter | Type | Indexed | Description |
-|-----------|------|---------|-------------|
-| `aggRequestId` | `bytes32` | Yes | Aggregator request identifier |
-
-**When it fires:** When `finalizeEvaluationTimeout()` is called after the timeout window expires and the evaluation cannot be completed normally. Nothing calls that function automatically: a round that has passed its timeout stays open, with the unspent prepayment reserved, until someone calls it.
-
-### EvaluationFailed
-
-Emitted when an evaluation fails during a specific phase.
-
-```solidity
-event EvaluationFailed(bytes32 indexed aggRequestId, string phase);
-```
-
-| Parameter | Type | Indexed | Description |
-|-----------|------|---------|-------------|
-| `aggRequestId` | `bytes32` | Yes | Aggregator request identifier |
-| `phase` | `string` | No | Phase where failure occurred: `"commit"` (fewer than M commits) or `"reveal"` (fewer than N reveals) |
-
-**When it fires:** Immediately after `EvaluationTimedOut` when insufficient responses prevent completion. `RequesterRefunded` is emitted just before the two.
-
-### Reveal Validation Events
-
-These events fire when an oracle's reveal is rejected for a specific reason. The transaction does **not** revert — the oracle is treated as a non-responder, allowing the round to continue with other oracles.
-
-#### RevealHashMismatch
-
-```solidity
-event RevealHashMismatch(
-    bytes32 indexed aggRequestId,
-    uint256 indexed pollIndex,
-    address operator,
-    bytes16 expectedHash,
-    bytes16 gotHash
-);
-```
-
-**When it fires:** The `sha256(abi.encode(msg.sender, response, saltUint))` recomputed from the reveal does not match the stored commit hash. Possible causes: oracle changed its response between commit and reveal, or salt was corrupted.
-
-#### InvalidRevealFormat
-
-```solidity
-event InvalidRevealFormat(
-    bytes32 indexed aggRequestId,
-    uint256 indexed pollIndex,
-    address operator,
-    string badCid
-);
-```
-
-**When it fires:** The CID string does not match the expected `"justificationCID:20hexSalt"` format. The validator checks: minimum length > 21, last colon separates exactly 20 hex characters.
-
-#### RevealTooManyScores
-
-```solidity
-event RevealTooManyScores(
-    bytes32 indexed aggRequestId,
-    uint256 indexed pollIndex,
-    address operator,
-    uint256 responseLength,
-    uint256 maxAllowed
-);
-```
-
-**When it fires:** `response.length > maxLikelihoodLength` (default 20). Prevents gas exhaustion from oversized payloads.
-
-#### RevealWrongScoreCount
-
-```solidity
-event RevealWrongScoreCount(
-    bytes32 indexed aggRequestId,
-    uint256 indexed pollIndex,
-    address operator,
-    uint256 responseLength,
-    uint256 expectedLength
-);
-```
-
-**When it fires:** Never, in the current contract. The event is still declared, but no code emits it. Reveals of any length from 2 to `maxLikelihoodLength` are accepted; when the round is finalized every reveal is brought to the most common length (longer ones are cut, shorter ones filled with zeros, `AggregatorLib.normalizeToModal`), so a reveal of an unusual length is left out of the cluster by its distance instead of being rejected here.
-
-#### RevealTooFewScores
-
-```solidity
-event RevealTooFewScores(
-    bytes32 indexed aggRequestId,
-    uint256 indexed pollIndex,
-    address operator,
-    uint256 responseLength
-);
-```
-
-**When it fires:** Declared for `response.length < 2`. A valid evaluation requires at least 2 likelihood scores. A response with a single score and a non-empty CID is rejected earlier with the `MalformedPayload()` error, so this event is not reached in the current contract.
-
-#### RevealCidTooLong
-
-```solidity
-event RevealCidTooLong(
-    bytes32 indexed aggRequestId,
-    uint256 indexed pollIndex,
-    address operator,
-    uint256 cidLength,
-    uint256 maxAllowed
-);
-```
-
-**When it fires:** The oracle's `"justificationCID:salt"` string is longer than `MAX_REVEAL_CID_LENGTH` (121 bytes: `MAX_CID_LENGTH` of 100 plus 21 for the colon and the salt). Only the length is logged.
-
-### Administrative Events
-
-#### ReputationKeeperChanged
-
-```solidity
-event ReputationKeeperChanged(address indexed oldKeeper, address indexed newKeeper);
-```
-
-**When it fires:** When the owner calls `setReputationKeeper(newAddress)`.
-
-#### Paused / Unpaused
-
-```solidity
-event Paused(address account);
-event Unpaused(address account);
-```
-
-**When they fire:** When the owner calls `pause()` or `unpause()`. Inherited from OpenZeppelin `Pausable`. While the contract is paused, new requests revert with `EnforcedPause()`.
-
-#### ScoreDeltasUpdated
-
-```solidity
-event ScoreDeltasUpdated(
-    int8 clusteredTimeliness, int8 clusteredQuality,
-    int8 selectedTimeliness,  int8 selectedQuality,
-    int8 revealedTimeliness,  int8 revealedQuality,
-    int8 committedTimeliness, int8 committedQuality
-);
-```
-
-**When it fires:** When the owner calls `setScoreDeltas(...)` to update the reputation scoring parameters.
-
-#### OracleScoreUpdateSkipped
-
-```solidity
-event OracleScoreUpdateSkipped(address oracle, bytes32 jobId, string reason);
-```
-
-**When it fires:** When the contract skips an oracle instead of reverting the whole transaction. The `reason` string indicates the context:
-
-At request time (the oracle is not credited a base fee and takes no part in the round):
-- `"getOracleInfo reverted at request"` — the keeper's record of the oracle could not be read
-- `"owner() reverted at base payment"` — the operator contract's `owner()` could not be read
-- `"dispatch reverted at request"` — the request to the operator contract reverted
-
-When the reveal phase starts:
-- `"dispatch reverted at reveal"` — the reveal request to the operator contract reverted
-
-At finalization or timeout:
-- `"getOracleInfo reverted at finalization"` — the keeper's record of the oracle could not be read
-- `"Inactive at finalization"` — oracle became inactive between dispatch and finalization
-- `"updateScores failed for clustered selected response"` — score update reverted for a clustered oracle
-- `"updateScores failed for non-clustered selected response"` — score update reverted for a selected-but-not-clustered oracle
-- `"updateScores failed for responded but not selected"` — score update reverted for a revealed-but-not-selected oracle
-- `"updateScores failed for no response"` — score update reverted for a non-responding oracle
-- `"timeout penalty"` — score update reverted during timeout penalty application
+`OwnershipTransferred(address indexed previousOwner, address indexed newOwner)` from OpenZeppelin `Ownable`, `Paused(address account)` / `Unpaused(address account)` from `Pausable`, and Chainlink's `ChainlinkRequested(bytes32 indexed id)` (for each commit and reveal request sent) and `ChainlinkFulfilled(bytes32 indexed id)` (for each answer, accepted or not) from `ChainlinkClient`. The owner's setters (`setLimits`, `setParams`, `setRewards`, `setContracts`) emit no event.
 
 ## ReputationKeeper Events
 
-### OracleRegistered
+### ArbiterRegistered
 
 ```solidity
-event OracleRegistered(address indexed oracle, bytes32 jobId, uint256 fee);
+event ArbiterRegistered(bytes32 indexed key, address indexed oracle, bytes32 jobId, uint256 fee);
 ```
 
-**When it fires:** When `registerOracle()` successfully stakes VDKA and records the oracle.
+**When it fires:** On `registerArbiter`. `key` is `keyOf(oracle, jobId)`, and `fee` is the posted fee in wei of ETH. The keeper keeps no enumerable list: this event is how to find all arbiters.
 
-### OracleDeregistered
+### ExitRequested
 
 ```solidity
-event OracleDeregistered(address indexed oracle, bytes32 jobId);
+event ExitRequested(bytes32 indexed key, uint256 exitAt);
 ```
 
-**When it fires:** When `deregisterOracle()` removes the oracle record and refunds the stake.
+**When it fires:** On `requestExit`. `exitAt` is when `completeExit` becomes possible: now plus `unbondingPeriod()`.
 
-### ScoreUpdated
+### ArbiterRemoved
 
 ```solidity
-event ScoreUpdated(address indexed oracle, int256 newQualityScore, int256 newTimelinessScore);
+event ArbiterRemoved(bytes32 indexed key, uint256 refunded);
 ```
 
-**When it fires:** After every `updateScores()` call, reflecting the oracle's new cumulative scores. This fires even when slashing or blocking also occurs — it always shows the latest state.
+**When it fires:** On `completeExit`. `refunded` is the stake left after burns, sent in VDKA to the operator's `owner()`.
 
-### OracleSlashed
+### HealthCall
 
 ```solidity
-event OracleSlashed(
-    address indexed oracle,
-    bytes32 jobId,
-    uint256 slashAmount,
-    uint256 lockedUntil,
-    bool blocked
-);
+event HealthCall(bytes32 indexed key, uint256 sentAt);
 ```
 
-| Parameter | Type | Indexed | Description |
-|-----------|------|---------|-------------|
-| `oracle` | `address` | Yes | Slashed oracle's operator address |
-| `jobId` | `bytes32` | No | Job identifier |
-| `slashAmount` | `uint256` | No | VDKA tokens slashed (0 for mild threshold, `slashAmountConfig` for severe or consistent degradation) |
-| `lockedUntil` | `uint256` | No | Timestamp until which the oracle is locked |
-| `blocked` | `bool` | No | `true` for severe threshold or consistent degradation; `false` for mild threshold |
+**When it fires:** When a health call is sent to an arbiter. It is sent to:
 
-**When it fires:** When `updateScores()` triggers a penalty. Three scenarios:
-1. **Severe threshold** — quality or timeliness score drops below `severeThreshold` (default −900)
-2. **Mild threshold** — quality or timeliness score drops below `mildThreshold` (default −300) but above severe
-3. **Consistent degradation** — score history buffer is full (25 entries) and every entry is worse than the previous on at least one dimension
+- every juror at selection, and `liveRandom()` other shortlisted arbiters;
+- every beacon candidate;
+- the keys passed to `sendHealthCalls`;
+- the key passed to `requestHealthCall`;
+- an arbiter's own first valid answer after a re-sync.
 
-### ContractApproved / ContractRemoved
+The node must answer within `callDeadline()` (60 s) or the arbiter is frozen. A second call while one is pending emits nothing (the earlier deadline stands), except the one call a re-sync waits for.
+
+### HealthAnswered
 
 ```solidity
-event ContractApproved(address indexed contractAddress);
-event ContractRemoved(address indexed contractAddress);
+event HealthAnswered(bytes32 indexed key, uint256 answeredAt);
 ```
 
-**When they fire:** When the owner calls `approveContract()` or `removeContract()` to manage the aggregator allowlist.
+**When it fires:** On every valid `answerHealthCall` or `rotateChain`: one whose value hashes to the head. It fires also when no call was pending; the value is then revealed early.
 
-### OracleActiveStatusUpdated
+### ChainResynced
 
 ```solidity
-event OracleActiveStatusUpdated(address indexed oracle, bytes32 jobId, bool isActive);
+event ChainResynced(bytes32 indexed key);
 ```
 
-**When it fires:** When the owner calls `setOracleActive()` to pause (`false`) or unpause (`true`) an oracle.
+**When it fires:** When an answer's value does not hash to the head (`answerHealthCall(key, v)` or `rotateChain(key, v, v)`). `v` becomes the head, and the arbiter is frozen until it answers a call sent after the re-sync.
 
-### EntropyPushed
+### ScoresUpdated
 
 ```solidity
-event EntropyPushed(bytes16 entropy, uint256 blockNumber);
+event ScoresUpdated(bytes32 indexed key, uint256 quality, uint256 timeliness);
 ```
 
-**When it fires:** When an approved aggregator calls `pushEntropy()` and `block.number > entropyBlock` (at most once per block). The entropy is mixed into the selection randomness for future oracle selections.
+**When it fires:** In `applyOutcomes`, once per slot with a non-zero code that was scored. The values are the new scores, after the cap and any restart at `start`. A repeated arbiter gets one event per slot.
+
+### OutcomeSkippedFrozen
+
+```solidity
+event OutcomeSkippedFrozen(bytes32 indexed key);
+```
+
+**When it fires:** In `applyOutcomes`, for a slot whose arbiter was frozen at the round's end and did not commit in the round. It is not scored.
+
+### ArbiterBlocked
+
+```solidity
+event ArbiterBlocked(bytes32 indexed key, uint256 until, uint256 offenses, uint256 burned);
+```
+
+**When it fires:** In `applyOutcomes`, when a score reaches 0 and the arbiter is not already blocked. `until` is the end of the block, `offenses` the count after this one (after decay), and `burned` the VDKA burned from the stake.
+
+### ArbiterBanned
+
+```solidity
+event ArbiterBanned(bytes32 indexed key, uint256 burned);
+```
+
+**When it fires:** Right after the `ArbiterBlocked` of the `maxOffenses()`-th block (3). `burned` is the same amount: the whole stake if `burnOnBan()` is set.
+
+### ContractApproval
+
+```solidity
+event ContractApproval(address indexed aggregator, bool approved);
+```
+
+**When it fires:** On `setApproved`. Approved contracts can select arbiters, pick beacons and report outcomes, and ArbiterOperators that list this keeper accept their requests.
+
+The keeper's `setPaused`, `setFee`, `topUpStake` and owner setters emit no event. Ownership changes emit OpenZeppelin's `OwnershipTransferred`.
+
+## JuryBeacons Events
+
+### BeaconCalled
+
+```solidity
+event BeaconCalled(address indexed aggregator, bytes32 indexed aggId, uint256 index, bytes32 indexed key, uint256 deadline);
+```
+
+**When it fires:** In `start`, once per picked beacon, when the stage starts with at least the quorum. `index` orders the beacons for mixing, `key` is the beacon's keeper key, and `deadline` is when the stage expires. It is for information: the node answers the keeper's `HealthCall`, emitted in the same transaction.
+
+### Approval
+
+```solidity
+event Approval(address indexed aggregator, bool ok);
+```
+
+**When it fires:** On `setApproved`.
 
 ## ArbiterOperator Events
 
@@ -535,11 +399,15 @@ event OracleResponse(bytes32 indexed requestId);
 
 **When they fire:** Standard Chainlink operator events inherited from `OperatorMod`. `OracleRequest` fires when the operator accepts a new request (after `_beforeOracleRequest` access control passes). `OracleResponse` fires during `fulfillOracleRequestV()` after payment processing.
 
-## SimpleContract Events
+## Legacy and v1 contracts
 
-SimpleContract is a legacy contract that is paid in LINK.
+These contracts are in the repository but are not part of the v2 flow.
 
-### RequestAIEvaluation
+### SimpleContract Events
+
+SimpleContract is a legacy contract that is paid in LINK. It is unchanged in v2.
+
+#### RequestAIEvaluation
 
 ```solidity
 event RequestAIEvaluation(bytes32 indexed requestId, string[] cids);
@@ -547,7 +415,7 @@ event RequestAIEvaluation(bytes32 indexed requestId, string[] cids);
 
 **When it fires:** Once per call to `requestAIEvaluationWithApproval()`.
 
-### FulfillmentReceived
+#### FulfillmentReceived
 
 ```solidity
 event FulfillmentReceived(bytes32 indexed requestId, address caller, uint256 len, string justificationCID);
@@ -555,7 +423,7 @@ event FulfillmentReceived(bytes32 indexed requestId, address caller, uint256 len
 
 **When it fires:** At the beginning of `fulfill()`, before validation. A debugging event that shows the raw callback data including the caller address and array length.
 
-### FulfillAIEvaluation
+#### FulfillAIEvaluation
 
 ```solidity
 event FulfillAIEvaluation(bytes32 indexed requestId, uint256[] likelihoods, string justificationCID);
@@ -563,7 +431,7 @@ event FulfillAIEvaluation(bytes32 indexed requestId, uint256[] likelihoods, stri
 
 **When it fires:** After successful fulfillment and bonus payment.
 
-### BonusPaid
+#### BonusPaid
 
 ```solidity
 event BonusPaid(bytes32 indexed requestId, address oracle, uint256 amount);
@@ -571,7 +439,7 @@ event BonusPaid(bytes32 indexed requestId, address oracle, uint256 amount);
 
 **When it fires:** When the bonus LINK is successfully transferred from the requester to the oracle during `fulfill()`. Amount equals the contract's configured `fee`.
 
-### EvaluationFailed
+#### EvaluationFailed
 
 ```solidity
 event EvaluationFailed(bytes32 indexed requestId);
@@ -579,11 +447,11 @@ event EvaluationFailed(bytes32 indexed requestId);
 
 **When it fires:** When `finalizeEvaluationTimeout()` marks a request as timed out.
 
-## ReputationSingleton Events
+### ReputationSingleton Events (v1 only)
 
-ReputationSingleton is a legacy contract that is paid in LINK.
+ReputationSingleton is a legacy contract that is paid in LINK. It works only with the v1 keeper.
 
-### RequestAIEvaluation
+#### RequestAIEvaluation
 
 ```solidity
 event RequestAIEvaluation(bytes32 indexed requestId, string[] cids);
@@ -591,7 +459,7 @@ event RequestAIEvaluation(bytes32 indexed requestId, string[] cids);
 
 **When it fires:** Once per call to `requestAIEvaluationWithApproval()`.
 
-### EvaluationFulfilled
+#### EvaluationFulfilled
 
 ```solidity
 event EvaluationFulfilled(bytes32 indexed requestId, uint256[] likelihoods, string justificationCID);
@@ -599,7 +467,7 @@ event EvaluationFulfilled(bytes32 indexed requestId, uint256[] likelihoods, stri
 
 **When it fires:** After successful fulfillment and bonus payment. Note the event name: `EvaluationFulfilled` (not `FulfillAIEvaluation`).
 
-### BonusPaid
+#### BonusPaid
 
 ```solidity
 event BonusPaid(bytes32 indexed requestId, address oracle, uint256 amount);
@@ -607,7 +475,7 @@ event BonusPaid(bytes32 indexed requestId, address oracle, uint256 amount);
 
 **When it fires:** When the bonus LINK (equal to `feeUsed`) is transferred from the contract's balance to the oracle during `fulfill()`.
 
-### EvaluationFailed
+#### EvaluationFailed
 
 ```solidity
 event EvaluationFailed(bytes32 indexed requestId);
@@ -617,39 +485,52 @@ event EvaluationFailed(bytes32 indexed requestId);
 
 ## Event Lifecycle: Complete Request Flow
 
-### ReputationAggregator (commit-reveal)
+### ReputationAggregator (v2)
 
 ```
-In the request transaction:
-1. RequestFunded                    — ETH for the round: from credit and from msg.value
-2. BasePayment + OracleSelected (× K) — per oracle: base fee credited, oracle polled
-3. RequestAIEvaluation              — request created
+Request transaction (block B):
+1. RequestFunded                         ETH from credit and from msg.value
+2. RequestAIEvaluation                   round created; no jury yet
+   (plus RoundSettled etc. for any due rounds the request settles first)
 
-As the oracles respond:
-4. CommitReceived (× up to K)       — oracles submit hashes
-5. CommitPhaseComplete              — M commits received, transition to reveal
-6. RevealRequestDispatched (× M)    — reveal requests sent to committed oracles
-7. NewOracleResponseRecorded (× N)  — valid reveals accepted
+drawJury, from block B+2:
+3. SeedSealed                            unless sealSeed ran earlier
+   With beacons, first call:  BeaconStageStarted + JuryBeacons.BeaconCalled (x beacons)
+                              + keeper HealthCall (x beacons)
+   With beacons, second call: BeaconPayment (x used values)
+4. keeper HealthCall (x jurors + 3)
+5. BasePayment (x dispatched slots) and SlotSkipped (x undispatched slots)
+6. JuryDrawn                             phase 3, deadline = now + timeout
 
-In the transaction that delivers the N-th reveal:
-8. BonusPayment (× P)               — bonus credited for the clustered oracles
-9. RequesterRefunded                — unspent prepayment credited to the requester
-10. FulfillAIEvaluation             — final aggregated result
+As the arbiters answer:
+7. CommitReceived (x commits)
+8. CommitWindowClosed                    at the M+-th commit, after T+ with M, or closeCommits
+9. CommitPhaseComplete                   promote, from block C+2; reveal requests sent
+10. RevealReceived(late = false) (x N)
 
-On timeout, when someone calls finalizeEvaluationTimeout():
-   RequesterRefunded + EvaluationTimedOut + EvaluationFailed("commit" | "reveal")
+In the transaction of the N-th counted reveal:
+11. BonusPayment (x P)
+12. RequesterRefunded
+13. FulfillAIEvaluation                  phase 6
 
-On invalid reveal:
-   RevealHashMismatch | InvalidRevealFormat | RevealTooManyScores |
-   RevealCidTooLong
+Until the deadline:
+    RevealReceived(late = true, qcode)   late reveals, scored only
 
-Later, whenever a payee collects:
-   EthWithdrawn
+After the deadline, settle() or a later request:
+14. (failed rounds: RequesterRefunded, EvaluationFailed(3 | 4 | 5))
+15. keeper ScoresUpdated / OutcomeSkippedFrozen / ArbiterBlocked / ArbiterBanned
+16. RoundSettled
+
+Other endings:
+    EvaluationFailed(1) (+ RequesterRefunded) at the draw: no eligible arbiter or too few beacons
+    BeaconPayment + RequesterRefunded(treasury) + EvaluationFailed(2): beacon quorum missed
+    RoundCancelled: never drawn
+
+Whenever a payee collects:
+    EthWithdrawn
 ```
 
-With the default settings K = 6, M = 4, N = 3, P = 2 (`commitOraclesToPoll()`, `oraclesToPoll()`, `requiredResponses()`, `clusterSize()`).
-
-### ReputationSingleton
+### ReputationSingleton (v1 only)
 
 ```
 1. RequestAIEvaluation              — request created
@@ -678,40 +559,43 @@ On timeout:
 // ethers.js v6 example
 const contract = new ethers.Contract(address, abi, provider);
 
-// Listen for new evaluation results (ReputationAggregator).
-// Subscribed by event name, the listener receives the event's values
+// New results (ReputationAggregator). Subscribed by event name, the listener gets the values
 contract.on("FulfillAIEvaluation", (aggRequestId, aggregated, justifications) => {
     console.log("Evaluation complete:", {
         aggRequestId,
-        scores: aggregated.map(s => s.toString()),
+        scores: aggregated.map(s => s.toString()),   // 0..1,000,000 scale
         justifications
     });
 });
 
-// Filter by specific request. Subscribed with a filter object, the listener
-// receives one argument, the event, and the values are in its `args`
-const filter = contract.filters.CommitReceived(myAggRequestId);
-contract.on(filter, (event) => {
-    const [aggRequestId, pollIndex, operator, commitHash] = event.args;
-    console.log(`Commit ${pollIndex} received from ${operator}`);
+// One round. Subscribed with a filter object, the listener gets one argument,
+// the event, and the values are in its `args`
+contract.on(contract.filters.JuryDrawn(myAggId), (event) => {
+    const [, drawer, reward] = event.args;
+    console.log(`Jury drawn by ${drawer}, reward ${ethers.formatEther(reward)} ETH`);
+});
+contract.on(contract.filters.CommitReceived(myAggId), (event) => {
+    const [, pollIndex] = event.args;
+    console.log(`Commit from slot ${pollIndex}`);
+});
+contract.once(contract.filters.FulfillAIEvaluation(myAggId), (event) => {
+    const [, aggregated] = event.args;
+    console.log("Got result:", aggregated.map(s => s.toString()));
+});
+contract.once(contract.filters.EvaluationFailed(myAggId), (event) => {
+    const [, phase] = event.args;
+    console.log(`Round failed in phase ${phase}`);
 });
 
-// One-shot listener for a specific fulfillment
-const fulfillFilter = contract.filters.FulfillAIEvaluation(myAggRequestId);
-contract.once(fulfillFilter, (event) => {
-    const [aggRequestId, likelihoods, justifications] = event.args;
-    console.log("Got result:", likelihoods.map(l => l.toString()));
+// What a round paid and gave back (wei of ETH)
+contract.on(contract.filters.BasePayment(myAggId), (event) => {
+    const [, pollIndex, payee, amount] = event.args;
+    console.log(`Base fee ${ethers.formatEther(amount)} ETH to ${payee} (slot ${pollIndex})`);
 });
-
-// What a round paid and gave back (amounts in wei of ETH)
-contract.on(contract.filters.BasePayment(myAggRequestId), (event) => {
-    const [aggRequestId, pollIndex, payee, amount] = event.args;
-    console.log(`Base fee ${ethers.formatEther(amount)} ETH credited to ${payee}`);
-});
-contract.on(contract.filters.RequesterRefunded(myAggRequestId), (event) => {
-    const [aggRequestId, requester, amount] = event.args;
-    console.log(`Refund ${ethers.formatEther(amount)} ETH credited to ${requester}`);
+contract.on(contract.filters.RequesterRefunded(myAggId), (event) => {
+    const [, to, amount] = event.args;   // the requester, or the treasury
+    console.log(`Unspent ${ethers.formatEther(amount)} ETH credited to ${to}`);
 });
 ```
 
-For understanding what triggers each error condition, see the [Error Reference](errors.md). For the full fee flow associated with the `BasePayment`, `BonusPayment` and `RequesterRefunded` events, see [Fee Mechanisms](../advanced/fees.md).
+For what triggers each error, see the [Error Reference](errors.md). For the fee flow behind `BasePayment`, `BonusPayment`, `BeaconPayment` and `RequesterRefunded`, see [Fee Mechanisms](../advanced/fees.md) and the [ReputationAggregator fee structure](../contracts/reputation-aggregator.md#fee-structure).

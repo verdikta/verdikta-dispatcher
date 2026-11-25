@@ -2,6 +2,14 @@
 
 The SimpleContract provides a basic, single-oracle interface for development, testing, and simple production use cases. It offers direct oracle interaction without the complexity of reputation management or multi-oracle aggregation.
 
+!!! note "v2"
+    Checked on 2026-11-25 against [`SimpleContract.sol`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/simpleContract/contracts/SimpleContract.sol) and [`MIGRATION.md`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/MIGRATION.md) on the `beacon` branch. SimpleContract is a legacy, LINK-funded contract and is unchanged in v2. It talks to one fixed operator and job, and it does not use the aggregator, the keeper's selection or reputation. So v2's per-request jury, two-argument fee quote and commit/reveal format do not apply to it, and its `requestAIEvaluationWithApproval` and `maxTotalFee(uint256)` keep their own signatures, shown below.
+
+    - Its request has no `1:` or `2:` prefix, so the arbiter's node evaluates it directly (mode 0) and answers with its scores and a justification CID. The v2 arbiter node still supports that mode.
+    - If the operator gates requests with a v2 keeper, that keeper's owner must approve the SimpleContract (`setApproved(simpleContract, true)`). The approval also lets the contract select arbiters and report outcomes in that keeper. The SimpleContract code never does, but approve only a deployment whose code you have checked.
+    - `setResponseTimeout` and `withdrawLink` have no access control in this test contract: anyone can call them, and `withdrawLink` can send the contract's LINK anywhere.
+    - For the production flow, use the [ReputationAggregator](reputation-aggregator.md).
+
 ## Overview
 
 The SimpleContract is designed for:
@@ -74,10 +82,10 @@ function responseTimeoutSeconds() external view returns (uint256)
 ### Configuration Functions
 
 ```solidity
-// Set response timeout (basic access control)
+// Set the response timeout, 30 s to 1 day. No access control: anyone can call it
 function setResponseTimeout(uint256 secs) external
 
-// Owner-only functions (simplified in current implementation)
+// Send LINK held by the contract. No access control: anyone can call it
 function withdrawLink(address payable to, uint256 amount) external
 ```
 
@@ -171,7 +179,15 @@ contract SimpleContractDeployer {
 ### Integration Example
 
 ```solidity
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.21;
+
+import "./SimpleContract.sol";
+
+interface IERC20 {
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function approve(address spender, uint256 amount) external returns (bool);
+}
 
 contract ContentModerator {
     SimpleContract public evaluator;
@@ -468,14 +484,15 @@ The SimpleContract uses a straightforward fee structure:
 
 ## Comparison with Other Contracts
 
-| Feature | SimpleContract | ReputationSingleton | ReputationAggregator |
+| Feature | SimpleContract | ReputationSingleton (v1 only) | ReputationAggregator (v2) |
 |---------|---------------|-------------------|---------------------|
 | **Setup Complexity** | Minimal | Medium | High |
-| **Oracle Selection** | Fixed | Dynamic (reputation-based) | Dynamic (multi-oracle) |
-| **Cost** | 2× fee | 2× fee | Up to 15× fee |
-| **Response Time** | ~30-60 seconds | ~30-60 seconds | ~5-15 minutes |
-| **Security** | Basic | Reputation-based | Multi-oracle consensus |
-| **Use Cases** | Testing, simple apps | Quick disputes | High-stakes disputes |
+| **Oracle Selection** | Fixed | Dynamic (reputation-based) | Jury of K drawn per request, reputation- and fee-weighted |
+| **Payment** | LINK | LINK | ETH |
+| **Cost** | 2× fee | 2× fee | Prepay `max(eff, minFee) × (K + 3P [+ 2 beacons]) + 3 × eff`, partly refunded (`maxTotalFee`) |
+| **Response Time** | ~30-60 seconds | ~30-60 seconds | Set by the jury's timeout, counted from the draw (presets: 300 s, 600 s for Jumbo) |
+| **Security** | Basic | Reputation-based | Multi-arbiter commit-reveal consensus with an unpredictable jury |
+| **Use Cases** | Testing, simple apps | Quick disputes | Any size, from a 1-arbiter jury to Jumbo |
 
 ## Best Practices
 

@@ -17,11 +17,13 @@ This section provides comprehensive API documentation for the Verdikta Dispatche
 
 ## Quick Links
 
-- [ReputationAggregator API](../contracts/reputation-aggregator.md#api-reference)
-- [ReputationSingleton API](../contracts/reputation-singleton.md#api-reference)  
-- [ReputationKeeper API](../contracts/reputation-keeper.md#api-reference)
-- [ArbiterOperator API](../contracts/arbiter-operator.md#api-reference)
-- [SimpleContract API](../contracts/simple-contract.md#api-reference)
+- [ReputationAggregator API](../contracts/reputation-aggregator.md#contract-interface)
+- [ReputationKeeper API](../contracts/reputation-keeper.md#contract-interface)
+- [JuryBeacons API](../contracts/jury-beacons.md#contract-interface)
+- [ArbiterOperator API](../contracts/arbiter-operator.md#contract-interface)
+- [SimpleContract API](../contracts/simple-contract.md#contract-interface) (legacy, LINK-funded)
+- [ReputationSingleton API](../contracts/reputation-singleton.md#contract-interface) (v1 only)
+- [Error Reference](errors.md) and [Events Reference](events.md)
 
 ## Integration Examples
 

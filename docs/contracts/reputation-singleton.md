@@ -1,5 +1,8 @@
 # ReputationSingleton Contract
 
+!!! warning "v1 only"
+    The ReputationSingleton works only with the **v1** ReputationKeeper (tag `aggregator-v0.1.0`). It calls the v1 keeper's `selectOracles`, `recordUsedOracles` and `updateScores` (see `reputationBasedSingleton/contracts/IReputationKeeper.sol`), which the v2 keeper does not have, so it cannot be pointed at a v2 keeper. v2 has no single-arbiter contract. For a quick, cheap evaluation on v2, use the [ReputationAggregator](reputation-aggregator.md) with a small jury: for example K = M = N = P = 1 (the jury check allows P = 1 when N = 1), or the Small preset 6/5/4/3. The singleton's deployed addresses in the repository README are v1's. This page is kept as the reference for that v1 contract and has not been revised for v2.
+
 The ReputationSingleton provides a simplified, single-oracle interface for quick AI evaluations. It offers the same frontend compatibility as the multi-oracle ReputationAggregator but with faster response times and lower costs for simpler use cases.
 
 ## Overview

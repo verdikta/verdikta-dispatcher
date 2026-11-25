@@ -1,133 +1,313 @@
 # ReputationAggregator Contract
 
-The ReputationAggregator is the most sophisticated contract in the Verdikta ecosystem, implementing a secure commit-reveal mechanism for multi-oracle AI evaluations. It provides maximum security and decentralization for high-stakes dispute resolution.
+The ReputationAggregator runs Verdikta's multi-arbiter evaluations: it escrows the requester's ETH, draws a jury from the ReputationKeeper, collects commits and reveals from the arbiters, clusters the answers, pays the arbiters and reports every arbiter's outcome back to the keeper. This page describes **v2**, a breaking redeploy of v1.
 
 !!! note "Checked against the code"
-    Revised on 2026-11-22 against [`ReputationAggregator.sol`](https://github.com/verdikta/verdikta-dispatcher/blob/master/reputationBasedAggregator/contracts/ReputationAggregator.sol) and against the aggregator deployed on Base mainnet at [`0xd8F38bCBEE43bE3bd31655a563f20c9B3e67142a`](https://basescan.org/address/0xd8F38bCBEE43bE3bd31655a563f20c9B3e67142a). Evaluation fees are paid in ETH: the requester needs no LINK and approves no token. The numbers on this page are settings that the contract's owner can change, so each one is given with the function that returns the current value.
+    Revised on 2026-11-25 against v2's [`ReputationAggregator.sol`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/contracts/ReputationAggregator.sol), [`AggregatorLib.sol`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/contracts/AggregatorLib.sol), [`ScoringLib.sol`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/contracts/ScoringLib.sol) and [`MIGRATION.md`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/MIGRATION.md) on the `beacon` branch. v2 is not deployed yet, so no v2 address is given: the addresses are set at the v2 deployment. Fees are paid in ETH: the requester needs no LINK and approves no token. Every number below is a default that the owner can change, and each is given with the function that returns the current value. "Item n" refers to the numbered design notes in [`TODO.md`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/TODO.md).
+
+!!! warning "v1"
+    The v1 aggregator (tag `aggregator-v0.1.0`) is the one deployed today, on Base mainnet at `0xd8F38bCBEE43bE3bd31655a563f20c9B3e67142a` and on Base Sepolia at `0xe8a385E473EA710c5a88Cc72681a16a26fe380e4`. Its 7-argument request, `maxTotalFee(maxFee)`, `K()`/`M()`/`N()`/`P()`, `setConfig`, `responseTimeoutSeconds()`, `getAggregationStatus` and `finalizeEvaluationTimeout` do not exist in v2. [`MIGRATION.md`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/MIGRATION.md) maps each v1 call to its v2 replacement.
 
 ## Overview
 
-The ReputationAggregator uses a two-phase polling system:
+One v2 aggregator serves every size of question, because **each request carries its own jury**:
 
-1. **Commit Phase**: K oracles are polled and each returns a hash that commits it to its answer
-2. **Reveal Phase**: The first M oracles that committed are asked to reveal their actual responses
-3. **Aggregation**: The first N valid reveals are compared, the P closest are clustered, and the clustered answers are averaged
-4. **Payment**: Every polled oracle is credited its base fee when the request is made; the P clustered oracles are credited a bonus on top; what the requester prepaid and the round did not spend is credited back
+```solidity
+struct Jury {
+    uint8 K;        // arbiters drawn, each sent a commit request
+    uint8 M;        // commits promoted to reveal
+    uint8 N;        // reveals counted: the N-th counted reveal finalizes the round
+    uint8 P;        // cluster size: the P clustered reveals are averaged and paid a bonus
+    uint40 timeout; // seconds, counted from the draw (not from the request)
+}
+```
 
-### Configuration
+A round goes through these steps, each started by a transaction that anyone may send:
 
-The constructor sets these values and `deploy/03_config.js` sets them again after deployment. The aggregator on Base mainnet returned the same values on 2026-11-22.
+1. **Request** (block B). `requestAIEvaluationWithApproval` checks the jury, escrows the ETH and records the query. No arbiter is chosen yet.
+2. **Draw** (from block B+2). `drawJury(aggId)` draws K arbiters with the seed `keccak256(aggId, blockhash(B+1))` and the keeper's state as of block B, so nobody can predict or re-roll the jury when the request is signed (item 9). It sends each arbiter a commit request and credits its base fee. With beacons, the first `drawJury` starts the beacon stage and a second one draws the jury once the beacon values are in (see [JuryBeacons](jury-beacons.md)).
+3. **Commit.** Each arbiter returns a commit hash. The commit phase closes at the M+-th commit, where M+ = M + ceil((K − M) / 2), or at the first commit after T+ (`tPlus()`, 155 s after the draw) once at least M commits are in. If no commit arrives after T+, `closeCommits(aggId)` closes it (item 14).
+4. **Promote** (from block C+2, where C is the block that closed the commit phase). `promote(aggId)` picks M of all commits at random with `keccak256(aggId, "promote", blockhash(C+1))` and sends those arbiters reveal requests. Answering early earns nothing, and the arbiter that closes the phase cannot predict the draw.
+5. **Reveal.** The N-th counted reveal finalizes the round: the counted reveals are clustered, the P clustered reveals are averaged into the result, the clustered arbiters are paid a bonus, and the unspent prepay is credited back to the requester.
+6. **Settle** (after the round's deadline). `settle(aggId)`, or any later request, reports every slot's outcome to the keeper in one call. Promoted arbiters may still reveal until the deadline, also after finalization; such late reveals are scored but do not change the result.
 
-| Setting | Value | Read it with |
-|---------|-------|--------------|
-| **K**, oracles polled in the commit phase | 6 | `commitOraclesToPoll()` |
-| **M**, commits promoted to reveal | 4 | `oraclesToPoll()` |
-| **N**, reveals aggregated | 3 | `requiredResponses()` |
-| **P**, cluster size for the bonus | 2 | `clusterSize()` |
-| **B**, bonus multiplier | 3 | `bonusMultiplier()` |
-| Timeout for the whole round | 300 seconds | `responseTimeoutSeconds()` |
-| Highest fee one oracle may charge | 0.0004 ETH | `maxOracleFee()` |
-| Longest score array an oracle may return | 20 | `maxLikelihoodLength()` |
+### Round phases
 
-The aggregator on Base Sepolia (`0xe8a385E473EA710c5a88Cc72681a16a26fe380e4`) returned the same values on that date except for the timeout, which is 900 seconds there.
+`getRoundInfo(aggId)` returns the phase as a number:
+
+| Phase | Name | Meaning | Next step |
+|-------|------|---------|-----------|
+| 0 | none | No such round | |
+| 1 | draw | Escrowed, awaiting the jury draw | `drawJury` from block B+2 |
+| 2 | beacons | Beacon stage started, awaiting the beacon values | `drawJury` again once the quorum is in or the beacon deadline has passed |
+| 3 | commit | Jury drawn, commit requests sent | commits; `closeCommits` after T+ |
+| 4 | closing | Commit phase closed, awaiting the promotion draw | `promote` from block C+2 |
+| 5 | reveal | Reveal requests sent | reveals; the N-th finalizes |
+| 6 | final | Result available, awaiting settlement | `settle` after the deadline |
+| 7 | settled | Finished and settled | |
+| 8 | failed | Failed, and settled where there was a jury to score | |
+| 9 | cancelled | Never drawable: the whole prepay went to the treasury | |
+
+### Defaults
+
+The constructor sets these values, and [`deploy/03_config.js`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/deploy/03_config.js) sets the same ones again.
+
+| Setting | Default | Read it with | Set it with |
+|---------|---------|--------------|-------------|
+| Largest K a request may ask for | 50 | `maxJury()` | `setLimits` |
+| Longest round timeout a request may ask for | 3,600 s | `maxTimeout()` | `setLimits` |
+| T+, the commit window after the draw; every timeout must exceed it | 155 s | `tPlus()` | `setLimits` |
+| Bonus multiplier B (bonus = B × the juror's fee) | 3 | `bonusMultiplier()` | `setParams` |
+| Highest per-arbiter fee a request can offer (the fee ceiling) | 0.0004 ETH | `maxOracleFee()` | `setParams` |
+| Spread floor for the quality classes, on the 0..1,000,000 score scale | 30,000 | `spreadFloor()` | `setParams` |
+| Gas stipend per arbiter request | 250,000 | `dispatchGas()` | `setParams` |
+| Rounds settled per request, as a multiple of its K | 2 | `settlePerRequest()` | `setParams` |
+| Draw reward, in fees | 2 | `drawRewardFees()` | `setRewards` |
+| Promote reward, in fees | 1 | `promoteRewardFees()` | `setRewards` |
+| Time in which only the requester earns the draw reward | 30 s | `requesterDrawPriority()` | `setRewards` |
+| Reveal time guaranteed after `promote` | 120 s | `revealWindow()` | `setRewards` |
+| Where unrefundable prepay goes | the deployer | `treasury()` | `setContracts` |
+
+The keeper's shortlist (`shortlistSize()` on the keeper, 60) also bounds K. Fixed in the code: at most 10 CIDs of at most 100 bytes each, an addendum of at most 1,000 bytes, reveals of 1 to 20 values, each value capped at 1e34, no draw more than 1 day after the request, and a promote grace of 30 s after a late close.
+
+### The jury is the requester's
+
+K, M, N, P and the timeout are not protocol constants. The class presets that Verdikta's applications use (the bounty site and API in `example-bounty-program/shared/classPresets.js`, and the stake-attestation listings) are:
+
+| Preset | K | M | N | P | Timeout | Beacons |
+|--------|---|---|---|---|---------|---------|
+| Small | 6 | 5 | 4 | 3 | 300 s | no |
+| Medium | 8 | 5 | 4 | 3 | 300 s | no |
+| Large | 21 | 16 | 13 | 10 | 300 s | no |
+| Jumbo | 50 | 38 | 27 | 17 | 600 s | yes |
+
+They are application settings, and any jury that passes the check below is accepted.
 
 ## Key Features
 
-- **Commit-Reveal Security**: Prevents oracle manipulation and front-running
-- **Reputation-Based Selection**: Oracles chosen based on quality and timeliness scores
-- **Clustering Algorithm**: Groups similar responses to identify consensus
-- **Bonus System**: Rewards oracles that provide consensus responses
-- **ETH Payment with Refund**: The requester prepays a worst-case budget in ETH and is credited what the round does not spend
-- **Timeout Handling**: A round that has not finished within the timeout can be closed by anyone with `finalizeEvaluationTimeout()`. It is not closed automatically
+- **Per-request jury**: one deployment serves every class of question
+- **Unpredictable jury**: drawn from a block hash that did not exist when the request was signed, against the keeper's state at the request block (item 9)
+- **Optional jury beacons**: for the largest rounds, the seed also mixes in hash-chain values revealed by beacon arbiters ([JuryBeacons](jury-beacons.md))
+- **M+ / T+ promotion**: the reveal set is a random draw from all commits, so a fast arbiter gains nothing (item 14)
+- **Commits bound to the round**: `keccak256(abi.encode(aggId, operator, response, salt))`, all 32 bytes, with a 128-bit salt (items 4 and 5)
+- **Exact one-number clustering**: a question that asks for one number is clustered exactly; vectors use the nearest-neighbour rule (item 10)
+- **Fee floor**: a requester can make every juror cost at least `minFee`, so a re-run cannot be bought cheaply (item 8)
+- **ETH escrow with refunds**: the requester prepays the worst case and gets back what the round did not spend, except where a refund would be a free re-roll
+- **Settlement without a bot**: new requests settle due rounds within a budget (see [the settlement queue](#driving-a-round)), and anyone may call `settle`
+- **Per-arbiter scores**: `getOutcomeScores` returns every counted reveal's score for one outcome, so a consumer can apply its own Q-of-N rule (items 11 and 12)
 
 ## Contract Interface
 
-### Primary Function
+### Request
 
 ```solidity
 function requestAIEvaluationWithApproval(
     string[] memory cids,
     string memory addendumText,
-    uint256 _alpha,
-    uint256 _maxOracleFee,
-    uint256 _estimatedBaseCost,
-    uint256 _maxFeeBasedScalingFactor,
-    uint64 _requestedClass
-) public payable nonReentrant whenNotPaused returns (bytes32)
+    uint256 alpha,
+    uint256 maxFee,
+    uint256 minFee,
+    uint256 estimatedBaseCost,
+    uint256 maxFeeBasedScalingFactor,
+    uint64 requestedClass,
+    bool withBeacons,
+    Jury calldata j
+) external payable nonReentrant whenNotPaused returns (bytes32 aggId)
 ```
 
-The function keeps its historical name. It is `payable`: the ETH that funds the round travels with the call, and there is no token approval.
+The function keeps its historical name. It is `payable`: the ETH travels with the call and there is no token approval.
 
 #### Parameters
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `cids` | `string[]` | IPFS content hashes containing evidence: 1 to 10 entries (`MAX_CID_COUNT`), each at most 100 bytes (`MAX_CID_LENGTH`) |
-| `addendumText` | `string` | Additional context, at most 1000 bytes (`MAX_ADDENDUM_LENGTH`) |
-| `_alpha` | `uint256` | Reputation weight (0-1000), higher values favor timeliness |
-| `_maxOracleFee` | `uint256` | Highest fee you accept from one oracle, in ETH wei. A value above the contract's `maxOracleFee()` is lowered to it |
-| `_estimatedBaseCost` | `uint256` | Estimated base cost for fee weighting, in ETH wei. Must be lower than the fee ceiling in effect |
-| `_maxFeeBasedScalingFactor` | `uint256` | Maximum scaling factor for fee weighting (at least 1) |
-| `_requestedClass` | `uint64` | Oracle class/type identifier. Only oracles registered for this class are eligible. On 2026-11-22 all 40 oracles on Base mainnet listed class 128 (the ReputationKeeper's `getOracleClasses(i)`) |
+| `cids` | `string[]` | IPFS CIDs of the query package(s): 1 to 10 entries, each at most 100 bytes |
+| `addendumText` | `string` | Extra text appended to the query, at most 1,000 bytes. Empty for none |
+| `alpha` | `uint256` | Reputation weight, 0 to 1,000: 0 weighs only the quality score, 1,000 only the timeliness score |
+| `maxFee` | `uint256` | Fee ceiling, in wei of ETH: the highest per-arbiter fee you accept. Arbiters whose posted fee is above it are not eligible. A value above `maxOracleFee()` is lowered to it; the result is called `eff` below |
+| `minFee` | `uint256` | Fee floor, in wei of ETH (item 8). Every juror and every used beacon is paid at least this. 0 for none. It may exceed the ceiling: the ceiling decides who is eligible, the floor what you pay |
+| `estimatedBaseCost` | `uint256` | Base cost for the fee weighting, in wei of ETH. Must be below `eff` |
+| `maxFeeBasedScalingFactor` | `uint256` | Largest weight boost a cheap arbiter can get from its fee, 1 to 65,535 |
+| `requestedClass` | `uint64` | Arbiter class. Only arbiters registered in this class are drawn |
+| `withBeacons` | `bool` | Mix jury beacons into the draw seed (the Jumbo preset uses them). Requires a beacon contract (`beacons()` not zero) |
+| `j` | `Jury` | The jury: `(K, M, N, P, timeout)`, see below |
+
+#### The jury check
+
+The request reverts with `BadJury()` (from `AggregatorLib.checkJury`) unless all of these hold:
+
+- K ≥ M ≥ N ≥ P ≥ 1;
+- N ≤ 40 (the N-th reveal pays for clustering; at 20 outcomes, 40 reveals cost about 8M gas);
+- P ≥ 2, unless N = 1 (a cluster holds at least the closest pair);
+- K ≤ `maxJury()` (50) and K ≤ the keeper's `shortlistSize()` (60);
+- `tPlus()` < timeout ≤ `maxTimeout()` (155 s < timeout ≤ 3,600 s).
+
+The other checks: `KeeperNotSet()` if no keeper is set; `BadInput()` for no CIDs, more than 10, a CID over 100 bytes, an addendum over 1,000 bytes, `estimatedBaseCost >= eff`, `alpha > 1000`, a scaling factor outside 1..65,535, or a prepay above 2^88 − 1 wei; `InsufficientPayment()` if `msg.value` plus your credit is below the prepay; `EnforcedPause()` while paused. A request with `withBeacons` while `beacons()` is zero reverts without an error message.
 
 #### ETH to send
 
-The call must be funded with `maxTotalFee(_maxOracleFee)`. The contract first uses any credit the caller already has in `ethOwed(caller)` and requires the rest as `msg.value`; if the two together are too little it reverts with `InsufficientPayment()`. ETH sent above the required amount is not lost: it is part of the round's escrow and is credited back when the round ends. See [Fee Structure](#fee-structure).
+The call must be funded with `maxTotalFee(maxFee, minFee, withBeacons, j.K, j.P)` (see [Fee Structure](#fee-structure)). Credit in `ethOwed(caller)` covers only what `msg.value` does not: sending exactly the prepay leaves your credit untouched, and any ETH above it is added to your credit. The escrow is always exactly the prepay. `RequestFunded` records how much came from credit and how much from `msg.value`.
+
+Before it escrows, the request settles due rounds from the settlement queue, within a budget of `settlePerRequest() × K` slots, so its gas use depends a little on other rounds.
 
 #### Returns
-- `aggRequestId`: Unique identifier for tracking the aggregation request. The same value is the indexed argument of the `RequestAIEvaluation` event
+
+`aggId`: the round's identifier, `bytes32(roundId)`. Round ids are sequential from 1 (`roundCount()` is the latest). The same value is the indexed first argument of `RequestAIEvaluation` and `RequestFunded`, and it is sent to each arbiter as the `aggId` request parameter (`0x` and 64 lowercase hex digits).
+
+### Driving a round
+
+All of these may be called by anyone.
+
+```solidity
+// Draw the jury and send the commit requests (from block B+2, at most 1 day after the request).
+// With beacons: the first call starts the beacon stage, a second call draws.
+function drawJury(bytes32 aggId) external
+
+// Store blockhash(B+1) while it is still readable (about 30k gas). drawJury seals it too,
+// so this is needed only if the draw will come more than 8,191 blocks (about 27 min) after B+1
+function sealSeed(bytes32 aggId) external
+
+// Close the commit phase once T+ has passed with at least M commits, before the deadline
+function closeCommits(bytes32 aggId) external
+
+// Draw the M promoted commits and send the reveal requests (from block C+2, before the deadline)
+function promote(bytes32 aggId) external
+
+// Settle a round in phase 3 to 6 once its deadline has passed
+function settle(bytes32 aggId) external
+
+// Send a round that can never be drawn to the treasury: unsealed once blockhash(B+1) has left
+// the 8,191-block history, or sealed but undrawn 1 day after the request
+function cancelUnsealed(bytes32 aggId) external
+```
+
+**`drawJury`.**
+
+- Reverts with:
+    - `WrongPhase()` outside phases 1 and 2;
+    - `DrawExpired()` more than 1 day after the request;
+    - `TooEarly()` before block B+2, or in the beacon stage while the beacons are still pending;
+    - `SeedExpired()` if the seed was never sealed and blockhash(B+1) is no longer readable;
+    - `OutOfGas()` if the caller sent too little gas for the keeper call.
+- It reads block hashes with `BLOCKHASH` for 256 blocks and then from the EIP-2935 history contract for up to 8,191 blocks.
+- On success the phase becomes 3 (commit). The deadline is set to `now + timeout` and the commit window to `now + tPlus()`. The keeper sends a health call to every juror and to 3 other shortlisted arbiters.
+- **Repeats.** When the keeper's shortlist ends up with m < K arbiters, the jury fills with repeats: slot k holds pick k mod m. This happens:
+    - when fewer than K arbiters are eligible;
+    - when `shortlistSize()` was lowered below K after the request (selection reads the current value);
+    - when the walk stops at `maxScan()` (400) entries before it has found K eligible ones, though the class holds more.
+
+    One operator can then hold several slots, or every slot. Each slot is paid, committed, revealed and scored separately, and a Q-of-N rule over `getOutcomeScores` counts slots, not distinct arbiters. Selection fails (`NoEligibleArbiters`) only when it finds none.
+- If the keeper finds no eligible arbiter, the round fails (phase 8, `EvaluationFailed(aggId, 1)`). The prepay is refunded, since no jury could be drawn and so the refund is no re-roll.
+    - After a beacon stage, the refund goes to the requester only if the selection walk covers the whole class list (`keeper.scansAll(cls)`). Otherwise it goes to the treasury, because the failure could depend on the beacon seed.
+- If the beacon stage finds fewer beacon candidates than the quorum, the round fails at the first call and is refunded.
+- **Draw reward:** `eff × drawRewardFees()` (2 fees) is credited to the caller. Within `requesterDrawPriority()` (30 s) of the request, or of the quorum-th beacon value, only the requester earns it; a third party that draws in that time earns nothing. After it, whoever draws earns it. The first call of a beacon round earns no reward.
+- **Second call of a beacon round:**
+    - Each used beacon value is paid `max(eff, minFee)` to the beacon's operator owner (`BeaconPayment`).
+    - If the quorum was missed by the beacon deadline, the round ends with no result (phase 8, `EvaluationFailed(aggId, 2)`), and the unspent prepay goes to the treasury.
+
+**Commits** arrive through `fulfill` (below). A commit closes the phase when it is the M+-th, or when it arrives after T+ with at least M commits in. Closing records block C and makes sure the deadline is at least 30 s away, so `promote` still fits.
+
+**`promote`.**
+
+- Reverts with:
+    - `WrongPhase()` outside phase 4, or after the deadline;
+    - `TooEarly()` before block C+2;
+    - `SeedExpired()` if blockhash(C+1) is unreadable.
+- It sends each promoted arbiter a reveal request `2:<commit hash as 64 lowercase hex>`.
+- It extends the deadline to at least `now + revealWindow()` (120 s).
+- It credits the caller `eff × promoteRewardFees()` (1 fee). No event records this reward; it is counted in `rewards` of `getRoundInfo`.
+
+**`settle`** reverts with `WrongPhase()` outside phases 3 to 6 and `NotDue()` until the deadline has passed. A round that never finalized is failed here, with `EvaluationFailed(aggId, phase)` for phase 3, 4 or 5. Then one call to the keeper's `applyOutcomes` carries every slot's outcome code (see [Settlement](#settlement)).
+
+**The settlement queue.** Every drawn round joins a queue. Each new request walks the queue in order, settling rounds within a budget of `settlePerRequest() × K` slots, where K is the new request's. The walk stops at the first unsettled round whose K exceeds the remaining budget, or whose deadline has not passed. Rounds behind it wait as well, even if they are due, until a larger request comes or anyone calls `settle`. The walk takes at most `settlePerRequest() × 8` queue entries per request. `setParams` accepts `settlePerRequest = 0`, which turns settlement by requests off: then only `settle` settles. Only scores (and a failed round's refund) wait; a result is readable from finalization.
+
+**`cancelUnsealed`** reverts with `WrongPhase()` outside phases 1 and 2 and `TooEarly()` before its time. It credits the whole prepay to the treasury (phase 9, `RoundCancelled`). An undrawn round never times out on its own: only this call ends it.
+
+### Arbiter callback
+
+```solidity
+// Called by the arbiter's operator contract, for commits and reveals alike
+function fulfill(bytes32 requestId, uint256[] memory response, string memory cid) public
+```
+
+| Request | Payload sent (`cid` parameter) | Answer expected |
+|---------|-------------------------------|-----------------|
+| Commit | `1:<cid>,<cid>,...[:<addendum>]` | `response = [commit hash]`, `cid = ""` |
+| Reveal | `2:<64 lowercase hex>`, the slot's commit hash | `response` = the committed scores (1 to 20 values), `cid = "<justification cid>:<32 hex salt>"` |
+
+- The commit hash is `keccak256(abi.encode(bytes32 aggId, address operator, uint256[] response, uint256 salt))`, where `operator` is the operator contract that calls `fulfill`. The salt is 128 bits, sent as 32 hex digits in either case. The reveal's `cid` is at most 133 bytes.
+- Anything that does not fit is ignored without a revert, and the request is used up: there is no retry. This covers:
+    - a commit outside phase 3, a zero hash, or a second commit;
+    - a reveal from a slot that was not promoted or already revealed;
+    - a reveal with the wrong length or a malformed salt;
+    - a reveal that does not match the commit.
+- After the deadline every answer is ignored.
+- Reveal values above 1e34 are cut to 1e34. Arbiters answer on a 0..1,000,000 scale.
+- The N-th counted reveal pays for clustering. At Jumbo that is 1.3M gas with one-number answers, 2.6M with two outcomes and 6.9M at 20 outcomes. The arbiter's job gas limit must cover it.
 
 ### View Functions
 
 ```solidity
-// Get aggregation result. hasValidData is true only for a round that completed with a result
-function getEvaluation(bytes32 reqId)
-    public view returns (
-        uint256[] memory likelihoods,
-        string memory justifications,   // comma-separated CIDs of the clustered oracles
-        bool hasValidData
+// Result. valid is true from finalization (phase 6) on, also after settlement (phase 7)
+function getEvaluation(bytes32 aggId)
+    external view returns (uint256[] memory aggregated, string memory justifications, bool valid)
+// justifications: the clustered arbiters' justification CIDs, comma-separated
+
+// Every counted reveal's raw score for one outcome, in reveal order (0 where a reveal was short).
+// valid is false until finalization, for a failed round, and for an outcome past the result's length
+function getOutcomeScores(bytes32 aggId, uint256 outcome)
+    external view returns (uint256[] memory scores, bool valid)
+
+// Phase, draw blocks, the escrow and the round's timing
+function getRoundInfo(bytes32 aggId)
+    external view returns (
+        uint8 phase,          // 1 draw ... 9 cancelled (table above)
+        uint256 requestBlock, // B
+        bytes32 sealedHash,   // blockhash(B+1), 0 until sealed
+        uint256 closeBlock,   // C, 0 until the commit phase closes
+        uint256 received,     // the prepay held for the round (wei)
+        uint256 baseFees,     // base fees credited at the draw
+        uint256 bonuses,      // bonuses credited at finalization
+        uint256 rewards,      // draw and promote rewards, beacon payments
+        uint256 deadline,     // 0 until the draw; settle is due after it
+        uint256 windowEnd,    // the draw time + T+
+        uint256 commits,      // commits received
+        uint256 requestTime   // drawJury's 1-day limit and cancelUnsealed run from it
     )
 
-// True once a round has been closed as failed by finalizeEvaluationTimeout()
+// The jury the round was requested with (zeros for an unknown round)
+function getJury(bytes32 aggId)
+    external view returns (uint8 K, uint8 M, uint8 N, uint8 P, uint40 timeout)
+
+// True only in phase 8. A cancelled round (phase 9) is not "failed": read the phase
 function isFailed(bytes32 aggId) external view returns (bool)
 
-// Worst-case ETH (wei) for one round: min(requestedMaxOracleFee, maxOracleFee) * (K + B * P)
-function maxTotalFee(uint256 requestedMaxOracleFee)
+// One slot of the jury
+function getSlot(bytes32 aggId, uint256 i) external view returns (Slot memory)
+// Slot: oracle, fee (paid: max(posted fee at B, minFee)), key (keeper key), payee (operator owner),
+//       committedAt, flags (1 dispatched, 2 committed, 4 promoted, 8 revealed, 16 counted),
+//       qcode (quality class: 1 close, 2 off, 3 far), commitHash
+
+// The prepay for a request, in wei (see Fee Structure)
+function maxTotalFee(uint256 maxFee, uint256 minFee, bool withBeacons, uint8 K, uint8 P)
     public view returns (uint256)
 
-// ETH (wei) the contract holds for an address: oracle earnings or requester refunds
+// ETH (wei) held for an address: arbiter earnings, rewards, refunds, overpayments
 function ethOwed(address payee) external view returns (uint256)
 
-// Phase and progress of a round
-function getAggregationStatus(bytes32 aggId)
-    external view returns (
-        bool isComplete,
-        bool failed,
-        bool commitPhaseComplete,
-        uint256 commitExpected,
-        uint256 commitReceived,
-        uint256 responseCount,
-        uint256 requiredN,
-        uint256 clusterP,
-        address requester,
-        uint256 startTimestamp
-    )
+// Chainlink request id => roundId << 8 | slot
+function requestRef(bytes32 requestId) external view returns (uint256)
 
-// ETH accounting of a round
-function getEthAccounting(bytes32 aggId)
-    external view returns (
-        uint256 ethReceived,
-        uint256 baseCredited,
-        uint256 bonusCredited,
-        uint256 bonusMultiplierSnap,
-        uint256 reserved
-    )
-
-// Get timeout duration
-function responseTimeoutSeconds() external view returns (uint256)
+function roundCount() external view returns (uint256)
+function settleQueue(uint256 i) external view returns (uint256)   // round ids, in draw order
+function settleHead() external view returns (uint256)             // next queue entry to settle
+function keeper() external view returns (address)
+function beacons() external view returns (address)                // 0 = beacons off
 ```
 
-### Withdrawals and Timeouts
+The settings in the [Defaults](#defaults) table have getters of the same name.
+
+### Withdrawals
 
 ```solidity
 // Send the caller's whole ethOwed balance to the caller
@@ -135,116 +315,104 @@ function withdrawEth() external
 
 // Send payee's whole ethOwed balance to payee. Callable by payee or by the contract owner
 function withdrawEthFor(address payee) external
-
-// Close a round that has passed its timeout. Callable by anyone
-function finalizeEvaluationTimeout(bytes32 aggId) external
 ```
+
+The owner has no function that takes ETH out of the contract. The only code that sends ETH is the internal `_withdrawTo(payee)`, reached through these two functions, and it always pays the address the ETH is credited to. The treasury collects its credit the same way.
 
 ### Configuration Functions (Owner Only)
 
 ```solidity
-// Set phase parameters and the timeout. Requires K >= M >= N >= P and P >= 2
-function setConfig(uint256 _k, uint256 _m, uint256 _n, uint256 _p, uint256 _timeoutSecs) external onlyOwner
+// Bounds on a request's jury: largest K, longest timeout, and T+ (seconds).
+// Reverts InvalidConfig() if maxJury_ == 0, tPlus_ == 0 or maxTimeout_ <= tPlus_.
+// There is no upper bound on maxTimeout_
+function setLimits(uint8 maxJury_, uint40 maxTimeout_, uint40 tPlus_) external onlyOwner
 
-// Set response timeout
-function setResponseTimeout(uint256 _seconds) external onlyOwner
+// Bonus multiplier (at most 20), rounds settled per request (any value; 0 turns settlement by
+// requests off), the dispatch stipend (100,000 to 2,000,000 gas), the spread floor (at most 1e34)
+// and the fee ceiling (wei). Else InvalidConfig()
+function setParams(uint8 bonusMult, uint8 settlePerReq, uint32 dispatchGas_,
+                   uint256 spreadFloor_, uint256 maxOracleFee_) external onlyOwner
 
-// Set the highest fee (ETH wei) one oracle may charge
-function setMaxOracleFee(uint256 _newMax) external onlyOwner
+// Draw reward (fees), the requester's draw priority (s), promote reward (fees) and the reveal
+// window (s, not 0, else InvalidConfig())
+function setRewards(uint8 drawFees_, uint40 priority, uint8 promoteFees_, uint40 revealWindow_) external onlyOwner
 
-// Set the bonus multiplier (0 to 20)
-function setBonusMultiplier(uint256 _m) external onlyOwner
+// Keeper, beacon contract (0 = beacons off) and treasury. Keeper and treasury must not be 0.
+// Rounds in flight call the new contracts: change the keeper only when no round awaits settlement,
+// and the beacon contract only when no round is in its beacon stage
+function setContracts(address keeper_, address beacons_, address treasury_) external onlyOwner
 
-// Set the longest score array an oracle may return (at least 2)
-function setMaxLikelihoodLength(uint256 _len) external onlyOwner
-
-// Set the reputation changes applied after a round
-function setScoreDeltas(int8, int8, int8, int8, int8, int8, int8, int8) external onlyOwner
-
-// Point the aggregator at another ReputationKeeper
-function setReputationKeeper(address newKeeper) external onlyOwner
-
-// Stop and resume new requests. Rounds in progress, timeouts and withdrawals keep working while paused
+// Stop and resume new requests. Draws, commits, reveals, settlement, cancellation and
+// withdrawals keep working while paused
 function pause() external onlyOwner
 function unpause() external onlyOwner
-
-// Recover LINK sent to the contract by mistake (the contract holds no LINK in normal operation)
-function withdrawLink(address payable _to, uint256 _amount) external onlyOwner
 ```
 
-The owner has no function that takes ETH out of the contract. The only code that sends ETH is the internal `_withdrawTo(payee)`, reached through `withdrawEth()` and `withdrawEthFor(payee)`, and it always pays the address the ETH is credited to.
+The bonus multiplier, the draw and promote rewards and the beacon quorum are fixed in each round at its request, since its escrow was sized on them. The spread floor, the dispatch stipend, the draw priority and the reveal window apply to rounds in flight. T+ is read twice: `checkJury` checks the timeout against the T+ in force at the request, while the round's commit window (`windowEnd`) uses the T+ in force at the draw. A T+ changed in between applies to that round's commit window even if its timeout no longer exceeds it. The shortlist that bounds K is read at the request, and again by the keeper at the draw. Ownership uses OpenZeppelin `Ownable` (`owner()`, `transferOwnership`, `renounceOwnership`).
+
+`dispatchOracleRequest(...)` is external only so that the contract can call itself with a gas stipend. It reverts with `OnlySelf()` for any other caller.
 
 ## Events
 
+Amounts are in wei of ETH. A payment is a credit in `ethOwed`, collected with `withdrawEth()`.
+
 ```solidity
-// Request initiated
-event RequestAIEvaluation(bytes32 indexed aggRequestId, string[] cids);
-
-// How the round was funded: from the requester's existing credit and from msg.value
 event RequestFunded(bytes32 indexed aggRequestId, address indexed requester, uint256 fromCredit, uint256 fromValue);
-
-// An oracle was picked for a poll slot
-event OracleSelected(bytes32 indexed aggRequestId, uint256 indexed pollIndex, address oracle, bytes32 jobId);
-
-// Base fee credited to a polled oracle's owner at request time
+event RequestAIEvaluation(bytes32 indexed aggRequestId, string[] cids);
+event SeedSealed(bytes32 indexed aggRequestId, bytes32 blockHash);
+event BeaconStageStarted(bytes32 indexed aggRequestId, uint256 beacons);
+event BeaconPayment(bytes32 indexed aggRequestId, address indexed payee, uint256 amount);
 event BasePayment(bytes32 indexed aggRequestId, uint256 pollIndex, address indexed payee, uint256 amount);
-
-// Commit received from oracle
-event CommitReceived(bytes32 indexed aggRequestId, uint256 pollIndex, address operator, bytes16 commitHash);
-
-// Commit phase completed, moving to reveal
-event CommitPhaseComplete(bytes32 indexed aggRequestId);
-
-// Reveal request sent to oracle
-event RevealRequestDispatched(bytes32 indexed aggRequestId, uint256 pollIndex, bytes16 commitHash);
-
-// Oracle response recorded
-event NewOracleResponseRecorded(bytes32 requestId, uint256 pollIndex, bytes32 indexed aggRequestId, address operator);
-
-// Final aggregated result
-event FulfillAIEvaluation(bytes32 indexed aggRequestId, uint256[] aggregated, string justifications);
-
-// Bonus credited to a clustered oracle's owner (amount in ETH wei)
-event BonusPayment(address indexed operator, uint256 bonusFee);
-
-// Unspent prepayment credited back to the requester
+event JuryDrawn(bytes32 indexed aggRequestId, address indexed drawer, uint256 reward);
+event CommitReceived(bytes32 indexed aggRequestId, uint256 pollIndex, bytes32 commitHash);
+event CommitWindowClosed(bytes32 indexed aggRequestId, uint256 closeBlock);
+event CommitPhaseComplete(bytes32 indexed aggRequestId, uint256 promoted);
+event RevealReceived(bytes32 indexed aggRequestId, uint256 pollIndex, bool late, uint8 qcode);
+event BonusPayment(bytes32 indexed aggRequestId, uint256 pollIndex, address indexed payee, uint256 amount);
 event RequesterRefunded(bytes32 indexed aggRequestId, address indexed requester, uint256 amount);
-
-// ETH paid out of the ledger
+event FulfillAIEvaluation(bytes32 indexed aggRequestId, uint256[] aggregated, string justifications);
+event EvaluationFailed(bytes32 indexed aggRequestId, uint8 phase);
+event RoundSettled(bytes32 indexed aggRequestId, bool failed);
+event RoundCancelled(bytes32 indexed aggRequestId, uint256 toTreasury);
+event SlotSkipped(bytes32 indexed aggRequestId, uint256 pollIndex, uint8 reason);
 event EthWithdrawn(address indexed payee, uint256 amount);
-
-// Evaluation failed or timed out
-event EvaluationFailed(bytes32 indexed aggRequestId, string phase);
-event EvaluationTimedOut(bytes32 indexed aggRequestId);
 ```
 
-The contract also emits diagnostic events for rejected reveals (`RevealHashMismatch`, `InvalidRevealFormat`, `RevealTooManyScores`, `RevealTooFewScores`, `RevealWrongScoreCount`, `RevealCidTooLong`) and `OracleScoreUpdateSkipped`. See the [Events Reference](../api/events.md).
+v2 has no diagnostic events for rejected reveals: a bad reveal is ignored, and only `RevealReceived` is emitted for good ones. The [Events Reference](../api/events.md) gives each event's fields and when it fires.
 
 ## Usage Examples
 
 ### Basic Integration
 
-This contract passes on the ETH it is called with, so it does not have to be funded in advance. It follows [`demoClient/contracts/DemoClient.sol`](https://github.com/verdikta/verdikta-dispatcher/blob/master/demoClient/contracts/DemoClient.sol) in this repository.
+This contract passes on the ETH it is called with, so it does not have to be funded in advance. Because it is the requester, it should also pass `drawJury` through: within 30 s of the request only the requester earns the draw reward.
 
 ```solidity
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.21;
+pragma solidity ^0.8.23;
 
 interface IReputationAggregator {
+    struct Jury { uint8 K; uint8 M; uint8 N; uint8 P; uint40 timeout; }
+
     function requestAIEvaluationWithApproval(
         string[] calldata cids,
         string calldata addendumText,
         uint256 alpha,
-        uint256 maxOracleFee,
+        uint256 maxFee,
+        uint256 minFee,
         uint256 estimatedBaseCost,
         uint256 maxFeeBasedScalingFactor,
-        uint64 requestedClass
+        uint64 requestedClass,
+        bool withBeacons,
+        Jury calldata j
     ) external payable returns (bytes32);
 
-    function maxTotalFee(uint256 requestedMaxOracleFee) external view returns (uint256);
-    function getEvaluation(bytes32 aggId)
-        external view returns (uint256[] memory, string memory, bool);
-    function isFailed(bytes32 aggId) external view returns (bool);
+    function maxTotalFee(uint256 maxFee, uint256 minFee, bool withBeacons, uint8 K, uint8 P)
+        external view returns (uint256);
+    function drawJury(bytes32 aggId) external;
+    function getEvaluation(bytes32 aggId) external view returns (uint256[] memory, string memory, bool);
+    // getRoundInfo returns 12 values; only the first, the phase, is declared here.
+    // The decoder ignores the rest, and the full tuple would not fit on the stack
+    function getRoundInfo(bytes32 aggId) external view returns (uint8 phase);
     function withdrawEth() external;
 }
 
@@ -252,65 +420,81 @@ contract EvaluationClient {
     IReputationAggregator public immutable aggregator;
     address public immutable owner;
 
-    uint256 public constant MAX_ORACLE_FEE = 15e13;   // 0.00015 ETH per oracle at most
-    uint256 public constant BASE_COST      = 8e9;     // estimated base cost, below MAX_ORACLE_FEE
+    uint256 public constant MAX_FEE   = 15e13;   // fee ceiling: 0.00015 ETH per arbiter
+    uint256 public constant MIN_FEE   = 0;       // no fee floor
+    uint256 public constant BASE_COST = 8e9;     // below MAX_FEE
+    uint64  public constant CLASS     = 128;
+
+    // The Small preset: 6 drawn, 5 promoted, 4 counted, 3 clustered, 300 s from the draw
+    uint8  public constant K = 6;
+    uint8  public constant M = 5;
+    uint8  public constant N = 4;
+    uint8  public constant P = 3;
+    uint40 public constant TIMEOUT = 300;
 
     mapping(bytes32 => address) public requesterOf;
 
     event Requested(bytes32 indexed aggId, address indexed requester);
-    event Resolved(bytes32 indexed aggId, uint256[] likelihoods, string justifications);
-    event Failed(bytes32 indexed aggId);
+    event Resolved(bytes32 indexed aggId, uint256[] scores, string justifications);
+    event Failed(bytes32 indexed aggId, uint8 phase);
 
     constructor(address _aggregator) {
         aggregator = IReputationAggregator(_aggregator);
         owner = msg.sender;
     }
 
-    // Worst-case ETH to send with requestEvaluation()
-    function quote() external view returns (uint256) {
-        return aggregator.maxTotalFee(MAX_ORACLE_FEE);
+    // ETH to send with requestEvaluation()
+    function quote() public view returns (uint256) {
+        return aggregator.maxTotalFee(MAX_FEE, MIN_FEE, false, K, P);
     }
 
-    function requestEvaluation(
-        string[] calldata evidenceCIDs,
-        string calldata description
-    ) external payable returns (bytes32 aggId) {
-        // The ETH sent with this call funds the round. The aggregator reverts
-        // with InsufficientPayment() if it is less than quote(), minus any
-        // credit this contract already holds in the aggregator.
+    // memory, not calldata, parameters: with calldata ones the 10-argument call is
+    // "stack too deep" unless the contract is compiled with viaIR
+    function requestEvaluation(string[] memory evidenceCIDs, string memory description)
+        external payable returns (bytes32 aggId)
+    {
+        // Send quote(): the aggregator takes any shortfall from this contract's credit
+        // there, or reverts with InsufficientPayment()
         aggId = aggregator.requestAIEvaluationWithApproval{value: msg.value}(
             evidenceCIDs,
             description,
             500,              // equal weight on timeliness and quality
-            MAX_ORACLE_FEE,
+            MAX_FEE,
+            MIN_FEE,
             BASE_COST,
-            5,                // max 5x fee scaling
-            128               // oracle class
+            5,                // up to 5x weight for a cheap arbiter
+            CLASS,
+            false,            // no beacons
+            IReputationAggregator.Jury(K, M, N, P, TIMEOUT)
         );
         requesterOf[aggId] = msg.sender;
         emit Requested(aggId, msg.sender);
     }
 
-    function resolve(bytes32 aggId) external {
+    // Call from block B+2 on. As the requester, this contract earns the draw reward
+    // (2 x MAX_FEE, credited to it in the aggregator) if it draws within 30 s
+    function draw(bytes32 aggId) external {
         require(requesterOf[aggId] != address(0), "Unknown request");
-
-        (uint256[] memory likelihoods, string memory justifications, bool hasValidData) =
-            aggregator.getEvaluation(aggId);
-
-        if (hasValidData) {
-            delete requesterOf[aggId];
-            emit Resolved(aggId, likelihoods, justifications);
-        } else if (aggregator.isFailed(aggId)) {
-            // Someone called finalizeEvaluationTimeout() on the aggregator
-            delete requesterOf[aggId];
-            emit Failed(aggId);
-        } else {
-            revert("Evaluation not complete");
-        }
+        aggregator.drawJury(aggId);
     }
 
-    // The aggregator sees this contract as the requester, so the unspent part
-    // of every prepayment is credited to this contract. Collect it here.
+    function resolve(bytes32 aggId) external {
+        require(requesterOf[aggId] != address(0), "Unknown request");
+        (uint256[] memory scores, string memory justifications, bool valid) = aggregator.getEvaluation(aggId);
+        if (valid) {
+            delete requesterOf[aggId];
+            emit Resolved(aggId, scores, justifications);
+            return;
+        }
+        uint8 phase = aggregator.getRoundInfo(aggId);
+        // 8 = failed, 9 = cancelled. A round that is still running is not settled
+        // automatically: anyone may call settle(aggId) on the aggregator after its deadline
+        require(phase == 8 || phase == 9, "Evaluation not complete");
+        delete requesterOf[aggId];
+        emit Failed(aggId, phase);
+    }
+
+    // Refunds and draw rewards are credited to this contract in the aggregator
     function reclaim() external {
         require(msg.sender == owner, "Not owner");
         aggregator.withdrawEth();
@@ -318,7 +502,6 @@ contract EvaluationClient {
         require(ok, "Transfer failed");
     }
 
-    // The aggregator sends the reclaimed ETH here
     receive() external payable {}
 }
 ```
@@ -328,267 +511,294 @@ contract EvaluationClient {
 ```javascript
 import { ethers } from 'ethers';
 
+const JURY = '(uint8 K, uint8 M, uint8 N, uint8 P, uint40 timeout)';
 const REPUTATION_AGGREGATOR_ABI = [
-    'function requestAIEvaluationWithApproval(string[] cids, string addendumText, uint256 alpha, uint256 maxOracleFee, uint256 estimatedBaseCost, uint256 maxFeeBasedScalingFactor, uint64 requestedClass) payable returns (bytes32)',
-    'function maxTotalFee(uint256 requestedMaxOracleFee) view returns (uint256)',
+    `function requestAIEvaluationWithApproval(string[] cids, string addendumText, uint256 alpha, uint256 maxFee, uint256 minFee, uint256 estimatedBaseCost, uint256 maxFeeBasedScalingFactor, uint64 requestedClass, bool withBeacons, ${JURY} j) payable returns (bytes32)`,
+    'function maxTotalFee(uint256 maxFee, uint256 minFee, bool withBeacons, uint8 K, uint8 P) view returns (uint256)',
     'function ethOwed(address payee) view returns (uint256)',
-    'function responseTimeoutSeconds() view returns (uint256)',
-    'function getEvaluation(bytes32 aggId) view returns (uint256[] likelihoods, string justifications, bool hasValidData)',
-    'function getAggregationStatus(bytes32 aggId) view returns (bool isComplete, bool failed, bool commitPhaseComplete, uint256 commitExpected, uint256 commitReceived, uint256 responseCount, uint256 requiredN, uint256 clusterP, address requester, uint256 startTimestamp)',
-    'function isFailed(bytes32 aggId) view returns (bool)',
-    'function finalizeEvaluationTimeout(bytes32 aggId)',
+    'function drawJury(bytes32 aggId)',
+    'function closeCommits(bytes32 aggId)',
+    'function promote(bytes32 aggId)',
+    'function settle(bytes32 aggId)',
+    'function getEvaluation(bytes32 aggId) view returns (uint256[] aggregated, string justifications, bool valid)',
+    'function getRoundInfo(bytes32 aggId) view returns (uint8 phase, uint256 requestBlock, bytes32 sealedHash, uint256 closeBlock, uint256 received, uint256 baseFees, uint256 bonuses, uint256 rewards, uint256 deadline, uint256 windowEnd, uint256 commits, uint256 requestTime)',
+    'function getJury(bytes32 aggId) view returns (uint8 K, uint8 M, uint8 N, uint8 P, uint40 timeout)',
     'function withdrawEth()',
     'event RequestAIEvaluation(bytes32 indexed aggRequestId, string[] cids)',
-    'event CommitReceived(bytes32 indexed aggRequestId, uint256 pollIndex, address operator, bytes16 commitHash)',
-    'event CommitPhaseComplete(bytes32 indexed aggRequestId)',
-    'event NewOracleResponseRecorded(bytes32 requestId, uint256 pollIndex, bytes32 indexed aggRequestId, address operator)',
+    'event JuryDrawn(bytes32 indexed aggRequestId, address indexed drawer, uint256 reward)',
+    'event CommitReceived(bytes32 indexed aggRequestId, uint256 pollIndex, bytes32 commitHash)',
+    'event CommitWindowClosed(bytes32 indexed aggRequestId, uint256 closeBlock)',
+    'event CommitPhaseComplete(bytes32 indexed aggRequestId, uint256 promoted)',
+    'event RevealReceived(bytes32 indexed aggRequestId, uint256 pollIndex, bool late, uint8 qcode)',
     'event FulfillAIEvaluation(bytes32 indexed aggRequestId, uint256[] aggregated, string justifications)',
-    'event EvaluationFailed(bytes32 indexed aggRequestId, string phase)'
+    'event EvaluationFailed(bytes32 indexed aggRequestId, uint8 phase)'
 ];
+
+const SMALL = { K: 6, M: 5, N: 4, P: 3, timeout: 300 };
+const PHASE = ['none', 'draw', 'beacons', 'commit', 'closing', 'reveal', 'final', 'settled', 'failed', 'cancelled'];
 
 class VerdiktaDispatcher {
     constructor(contractAddress, signer) {
         this.signer = signer;
-        this.contract = new ethers.Contract(
-            contractAddress,
-            REPUTATION_AGGREGATOR_ABI,
-            signer
-        );
+        this.contract = new ethers.Contract(contractAddress, REPUTATION_AGGREGATOR_ABI, signer);
     }
 
     // cids: IPFS CIDs of the query package(s) to evaluate
     async submitRequest(cids, description, options = {}) {
-        // Highest fee accepted from one oracle, and the base cost for fee weighting (ETH wei)
-        const maxFee = options.maxFee ?? ethers.parseEther("0.00015");
+        const maxFee = options.maxFee ?? ethers.parseEther('0.00015');   // fee ceiling
+        const minFee = options.minFee ?? 0n;                              // fee floor
         const baseCost = options.baseCost ?? 8_000_000_000n;
+        const withBeacons = options.withBeacons ?? false;
+        const jury = options.jury ?? SMALL;
 
-        // Worst-case ETH for the round, less any credit already held in the aggregator
-        const required = await this.contract.maxTotalFee(maxFee);
+        // The prepay. Credit in the aggregator covers only what msg.value does not
+        const required = await this.contract.maxTotalFee(maxFee, minFee, withBeacons, jury.K, jury.P);
         const credit = await this.contract.ethOwed(await this.signer.getAddress());
         const value = required > credit ? required - credit : 0n;
 
-        const args = [
-            cids,
-            description,
-            options.alpha ?? 500,
-            maxFee,
-            baseCost,
-            options.scalingFactor ?? 5,
-            options.oracleClass ?? 128
-        ];
+        const args = [cids, description, options.alpha ?? 500, maxFee, minFee, baseCost,
+                      options.scalingFactor ?? 5, options.oracleClass ?? 128, withBeacons, jury];
 
-        // Oracle selection is random, so the gas used differs from the estimate:
-        // add headroom, or the transaction can run out of gas
+        // The request settles due rounds first, so its gas varies: add headroom
         const estimate = await this.contract.requestAIEvaluationWithApproval.estimateGas(...args, { value });
-        const gasLimit = (estimate * 150n) / 100n;
-
-        // Submit request: the ETH travels with the call, there is nothing to approve
-        const tx = await this.contract.requestAIEvaluationWithApproval(...args, { value, gasLimit });
-
-        console.log("Transaction submitted:", tx.hash);
+        const tx = await this.contract.requestAIEvaluationWithApproval(...args, { value, gasLimit: estimate * 150n / 100n });
         const receipt = await tx.wait();
 
-        // Extract aggregator ID from events
-        const topic = this.contract.interface.getEvent("RequestAIEvaluation").topicHash;
-        const event = receipt.logs.find(
-            log => log.address.toLowerCase() === this.contract.target.toLowerCase()
-                && log.topics[0] === topic
-        );
-        const aggId = event.topics[1];
+        const topic = this.contract.interface.getEvent('RequestAIEvaluation').topicHash;
+        const log = receipt.logs.find(l => l.address.toLowerCase() === this.contract.target.toLowerCase()
+                                        && l.topics[0] === topic);
+        return { aggregatorId: log.topics[1], blockNumber: receipt.blockNumber, valueSent: value };
+    }
 
-        return {
-            aggregatorId: aggId,
-            transactionHash: tx.hash,
-            blockNumber: receipt.blockNumber,
-            valueSent: value
-        };
+    // From block B+2. Twice for a beacon round: once to start the stage,
+    // again once the beacon values are in (drawJury reverts TooEarly() while they are pending)
+    async draw(aggregatorId) {
+        const info = await this.contract.getRoundInfo(aggregatorId);
+        const provider = this.signer.provider;
+        while (BigInt(await provider.getBlockNumber()) < info.requestBlock + 2n) {
+            await new Promise(r => setTimeout(r, 1000));
+        }
+        const estimate = await this.contract.drawJury.estimateGas(aggregatorId);
+        return (await this.contract.drawJury(aggregatorId, { gasLimit: estimate * 150n / 100n })).wait();
+    }
+
+    // Moves a round on when nobody else does: close the commit phase after T+,
+    // promote from block C+2, settle after the deadline. Anyone may call these
+    async nudge(aggregatorId) {
+        const info = await this.contract.getRoundInfo(aggregatorId);
+        const now = BigInt(Math.floor(Date.now() / 1000));
+        const phase = Number(info.phase);
+        if (phase === 3 && now > info.windowEnd && now <= info.deadline) {
+            const { M } = await this.contract.getJury(aggregatorId);
+            if (info.commits >= M) return (await this.contract.closeCommits(aggregatorId)).wait();
+        }
+        if (phase === 4) return (await this.contract.promote(aggregatorId)).wait();
+        if (phase >= 3 && phase <= 6 && info.deadline > 0n && now > info.deadline) {
+            return (await this.contract.settle(aggregatorId)).wait();
+        }
     }
 
     async getResult(aggregatorId) {
-        const [likelihoods, justifications, hasValidData] =
-            await this.contract.getEvaluation(aggregatorId);
-
-        if (hasValidData) {
+        const [aggregated, justifications, valid] = await this.contract.getEvaluation(aggregatorId);
+        if (valid) {
             return {
                 status: 'complete',
-                likelihoods: likelihoods.map(l => Number(l)),
-                // one CID per clustered oracle
-                justificationCIDs: justifications.split(',')
+                scores: aggregated.map(s => Number(s)),            // 0..1,000,000 scale
+                justificationCIDs: justifications.split(',')        // one per clustered arbiter
             };
         }
-
-        if (await this.contract.isFailed(aggregatorId)) {
-            return { status: 'failed' };
-        }
-
-        // A round does not fail by itself: once the timeout has passed,
-        // someone has to close it before isFailed() turns true
-        const status = await this.contract.getAggregationStatus(aggregatorId);
-        const timeout = await this.contract.responseTimeoutSeconds();
-        const now = BigInt(Math.floor(Date.now() / 1000));
-        if (now >= status.startTimestamp + timeout) {
-            return { status: 'timed-out' };
-        }
-
-        return { status: 'pending' };
+        const info = await this.contract.getRoundInfo(aggregatorId);
+        return { status: PHASE[Number(info.phase)], deadline: Number(info.deadline) };
     }
 
-    // Close a round that has passed its timeout. Anyone may call this.
-    // The unspent part of the prepayment is credited back to the requester
-    async finalizeTimeout(aggregatorId) {
-        const tx = await this.contract.finalizeEvaluationTimeout(aggregatorId);
-        return tx.wait();
-    }
-
-    // Take the caller's credit (refunds) out of the aggregator
+    // Take the caller's credit (refunds, rewards) out of the aggregator
     async withdrawCredit() {
-        const tx = await this.contract.withdrawEth();
-        return tx.wait();
+        return (await this.contract.withdrawEth()).wait();
     }
 
-    // Each callback is called with one argument, the event: with a filter
-    // object ethers v6 does not spread the values, they are in event.args
+    // With a filter object, ethers v6 passes one argument, the event; the values are in event.args
     watchProgress(aggregatorId, callbacks = {}) {
         const filters = {
+            drawn: this.contract.filters.JuryDrawn(aggregatorId),
             commitReceived: this.contract.filters.CommitReceived(aggregatorId),
-            commitComplete: this.contract.filters.CommitPhaseComplete(aggregatorId),
-            // aggRequestId is the third argument of this event
-            responseRecorded: this.contract.filters.NewOracleResponseRecorded(null, null, aggregatorId),
+            commitClosed: this.contract.filters.CommitWindowClosed(aggregatorId),
+            promoted: this.contract.filters.CommitPhaseComplete(aggregatorId),
+            revealReceived: this.contract.filters.RevealReceived(aggregatorId),
             fulfilled: this.contract.filters.FulfillAIEvaluation(aggregatorId),
             failed: this.contract.filters.EvaluationFailed(aggregatorId)
         };
-
-        Object.entries(filters).forEach(([event, filter]) => {
-            if (callbacks[event]) {
-                this.contract.on(filter, callbacks[event]);
-            }
+        Object.entries(filters).forEach(([name, filter]) => {
+            if (callbacks[name]) this.contract.on(filter, callbacks[name]);
         });
-
-        return () => {
-            Object.values(filters).forEach(filter => {
-                this.contract.off(filter);
-            });
-        };
+        return () => Object.values(filters).forEach(filter => this.contract.off(filter));
     }
 }
 ```
 
-The repository's own script for a single request is [`reputationBasedAggregator/scripts/single-query.js`](https://github.com/verdikta/verdikta-dispatcher/blob/master/reputationBasedAggregator/scripts/single-query.js), and [`scripts/refund.js`](https://github.com/verdikta/verdikta-dispatcher/blob/master/reputationBasedAggregator/scripts/refund.js) closes a timed-out round and withdraws the caller's credit.
+The repository's scripts that drive a v2 round, such as `single-query.js` and `refund.js`, are still being ported: [`MIGRATION.md`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/MIGRATION.md#scripts-in-this-folder) lists each one and its v2 calls. The tests in `reputationBasedAggregator/test/` (`round.js` and `aggregator.flow.test.js`) drive full rounds.
+
+## Scoring and Aggregation
+
+- **Normalization.** The counted reveals are resized to their most common length, truncating or zero-filling. On a tie the longer length wins.
+- **One-number answers.** When single values are the most common length, the cluster is exact: the P consecutive values, in sorted order, with the smallest sum of pairwise squared differences. Longer reveals are cut to their first value.
+- **Vectors.** For each counted reveal, its group is the reveal and its P − 1 nearest by squared Euclidean distance. The cluster is the group with the smallest sum of pairwise distances (item 10).
+- **Ties** go by `keccak256(sealed hash, slot)`, not by reveal order.
+- **Result.** The result is the cluster's coordinate-wise mean. `justifications` lists the clustered reveals' CIDs.
+- **Quality classes.** Each counted reveal's distance is d = max over outcomes of |score − median|, against the coordinate-wise median of the counted reveals. The spread is max(1.4826 × the median of d, `spreadFloor()`). A reveal is:
+    - close if d ≤ 1.5 × spread;
+    - off if d ≤ 3 × spread;
+    - far otherwise.
+
+    A late reveal is classified on arrival against the stored median and spread.
+
+## Settlement
+
+At settlement each slot gets an outcome code for the keeper:
+
+- the low nibble is the timeliness event;
+- bits 4 and 5 are the quality class;
+- bit 7 (`0x80`) means the arbiter committed in this round, so it is scored even if it was frozen at the round's end.
+
+| Round ended in | Slot | Code | Keeper points (defaults) |
+|----------------|------|------|--------------------------|
+| Final (6) | promoted, revealed (counted or late) | 1 + quality class | timeliness +20; quality +20 close, −50 off, −200 far |
+| Final (6) | promoted, no reveal | 2 | timeliness −200 |
+| Reveal (5): fewer than N reveals | promoted, revealed | 1 | timeliness +20 |
+| Reveal (5) | promoted, no reveal | 3 | timeliness −500 |
+| Commit (3), fewer than M commits | no commit | 4 | timeliness −400 |
+| Commit (3) with M commits, or closing (4) | any | 0 | none: nobody failed to deliver |
+| any | not promoted | 0 | none |
+
+The keeper turns the codes into points and consequences: see [ReputationKeeper](reputation-keeper.md#reputation-points). If the keeper call fails, the round is still settled and `SlotSkipped(aggId, type(uint256).max, 4)` is emitted. A caller that sends too little gas gets `OutOfGas()` instead, so it cannot skip the scores on purpose.
 
 ## Security Considerations
 
 ### Commit-Reveal Protection
-- **Front-running Prevention**: Oracles cannot see other responses during commit phase
-- **Hash Verification**: A reveal is accepted only if `bytes16(sha256(abi.encode(operator, likelihoods, salt)))` equals the hash the oracle committed
-- **Salt Randomization**: Each oracle uses unique salt for additional security
+
+- **Bound commits**: the commit covers the round (`aggId`), the operator and a 128-bit salt, and uses all 32 bytes of Keccak-256. A collision would take about 2^128 work and could serve one round only.
+- **Random promotion**: the M revealers are drawn from all commits after the window closes, with a block hash nobody knew when it closed.
+- **One answer per request**: a malformed reveal uses up the request.
+
+### Draw Integrity
+
+- **Unpredictable seed**: the jury depends only on blockhash(B+1) (and, with beacons, the beacon values) and on the keeper's state as of block B. The result is the same whoever draws and whenever.
+- **No free re-roll**: refunds are given only where the requester could not have chosen the outcome. These rounds send their unspent prepay to the treasury:
+    - a missed beacon quorum;
+    - a round with M commits that was never promoted;
+    - a cancelled round;
+    - a draw that fails after a beacon stage when the walk does not cover the class list.
 
 ### Economic Security
-- **Stake Requirements**: Oracles must stake 100 VDKA (`STAKE_REQUIREMENT` in the ReputationKeeper) to register
-- **Penalties**: An oracle whose quality or timeliness score falls below the keeper's thresholds is locked (its stake cannot be withdrawn) for `lockDurationConfig()`, and below the severe threshold it is also left out of selection for that time and loses `slashAmountConfig()` of its stake. On Base mainnet `slashAmountConfig()` returned 0 on 2026-11-22, so no stake is taken today. See [Reputation System](../advanced/reputation.md)
-- **Bonus Alignment**: Rewards encourage honest consensus participation
+
+- **Stake**: arbiters stake 100 VDKA (the keeper's `stakeRequirement()`) and can lose it to burns and bans. See [ReputationKeeper](reputation-keeper.md).
+- **Fee floor**: with `minFee`, every attempt costs at least K × `minFee`, or (K + 2) × `minFee` with beacons.
+- **Bonus alignment**: only the P clustered reveals earn the B × fee bonus.
 
 ### Operational Security
-- **Timeout Handling**: One timeout covers the whole round, commit and reveal together, counted from the request. After it, anyone can call `finalizeEvaluationTimeout()`; the round stays open until someone does
-- **Reputation Tracking**: Long-term performance affects selection probability
-- **Access Control**: Any address can request an evaluation from the aggregator by paying for it. What is restricted is the layer below: only aggregator contracts approved in the ReputationKeeper (`approveContract()`) can select oracles and update their scores, and an ArbiterOperator that has a keeper list accepts requests only from contracts one of those keepers has approved
-- **Pause**: The owner can stop new requests with `pause()`. Rounds in progress, timeout finalization and withdrawals are not affected
+
+- **Gas stipends**: calls to arbiter contracts get a fixed stipend (`dispatchGas()` for requests, 30,000 for `owner()`), and each tolerated call first checks that the stipend is really available. Neither a gas-burning operator nor a caller's gas limit can drop a slot or the scores. A skipped slot emits `SlotSkipped`:
+    - reason 1: `owner()` unreadable;
+    - reason 2: the commit dispatch reverted;
+    - reason 3: the reveal dispatch reverted.
+- **Access control**: anyone can request by paying. The layer below is restricted: only contracts approved in the keeper (`setApproved`) can select arbiters and report outcomes. An ArbiterOperator with a keeper list accepts requests only from contracts that one of those keepers approves (`isContractApproved`).
+- **Pause**: `pause()` stops new requests only.
 
 ## Fee Structure
 
-Fees are paid in ETH. The requester prepays a worst-case budget and is credited what the round does not spend.
-
-**Prepayment**, returned by `maxTotalFee(_maxOracleFee)`:
+**Prepay**, returned by `maxTotalFee(maxFee, minFee, withBeacons, K, P)`:
 
 ```
-ceiling     = min(_maxOracleFee, maxOracleFee())
-prepayment  = ceiling × (K + B × P)
+eff     = min(maxFee, maxOracleFee())          the fee ceiling
+juror   = max(eff, minFee)                     the most a juror or beacon is paid
+prepay  = juror × (K + bonusMultiplier() × P + [beacon quorum, if withBeacons])
+        + eff × (drawRewardFees() + promoteRewardFees())
 ```
 
-With the current settings (K=6, B=3, P=2) the prepayment is `ceiling × 12`. At the contract's own ceiling of 0.0004 ETH that is 0.0048 ETH.
+With the defaults (bonus 3, draw 2, promote 1, quorum 2) that is `juror × (K + 3P [+ 2]) + eff × 3`. At the ceiling of 0.0004 ETH and no floor:
 
-**What a round costs** depends on the fees of the oracles that were selected, not on the ceiling:
+| Preset | Prepay |
+|--------|--------|
+| Small (K 6, P 3) | 0.0004 × (6 + 9 + 3) = 0.0072 ETH |
+| Large (K 21, P 10) | 0.0004 × (21 + 30 + 3) = 0.0216 ETH |
+| Jumbo with beacons (K 50, P 17) | 0.0004 × (50 + 51 + 2 + 3) = 0.0424 ETH |
 
-1. **Base fees**: each of the K polled oracles is credited its registered fee when the request is made (`BasePayment`). An oracle whose request could not be dispatched is not credited
-2. **Bonus**: each of the P clustered oracles is credited `B ×` its registered fee when the round completes (`BonusPayment`)
-3. **Refund**: the rest of the prepayment is credited to the requester (`RequesterRefunded`)
+**What a round spends:**
 
-There is no separate fee for the reveal phase.
+1. **Base fees**, at the draw: each dispatched slot's payee (the operator's `owner()`) is credited the slot's fee, `max(posted fee as of B, minFee)` (`BasePayment`). A skipped slot is not credited.
+2. **Draw reward**, at the draw: `eff × 2` to the drawer, if it earned it (`JuryDrawn`).
+3. **Beacon payments**: `juror` per used beacon value (`BeaconPayment`).
+4. **Promote reward**: `eff × 1` to the caller of `promote`.
+5. **Bonuses**, at finalization: `bonusMultiplier × fee` to each clustered slot's payee (`BonusPayment`).
+6. **The rest**, at the end:
 
-On 2026-11-22 all 40 oracles registered on Base mainnet charged 0.00002 ETH (the ReputationKeeper's `registeredOracles(i)` and `getOracleInfo(operator, jobId)` list them). At that fee:
+| How the round ended | Unspent prepay goes to | When |
+|---------------------|------------------------|------|
+| Finalized | the requester | at finalization |
+| No eligible arbiter, or fewer beacon candidates than the quorum | the requester | at the draw |
+| Draw failed after a beacon stage, and `keeper.scansAll(cls)` is false | the treasury | at the draw |
+| Beacon quorum missed | the treasury | at the second `drawJury` |
+| Commit phase with fewer than M commits | the requester | at settlement |
+| M commits but never promoted (closed and not promoted, or not closed after T+) | the treasury | at settlement |
+| Reveal phase with fewer than N counted reveals | the requester | at settlement |
+| Cancelled (`cancelUnsealed`) | the treasury: the whole prepay | at cancellation |
 
-| Outcome | Cost in oracle fees |
-|---------|---------------------|
-| Round completes | 6 × 0.00002 + 2 × 3 × 0.00002 = 0.00024 ETH |
-| Round times out | 6 × 0.00002 = 0.00012 ETH (base fees stay with the oracles, no bonus) |
+Each refund emits `RequesterRefunded(aggId, to, amount)`, where `to` is the requester or the treasury.
 
-Network gas for the request transaction comes on top.
+A requester that draws its own round within 30 s gets the draw reward back, and one that calls `promote` gets the promote reward back. Both are paid on the ceiling, so none of the floor comes back this way. Network gas comes on top. All credits are entries in `ethOwed`. A requester's credit pays for its next request, or `withdrawEth()` takes it out. Arbiter owners collect their earnings the same way.
 
-All credits are entries in the contract's `ethOwed` ledger. A requester's credit pays for that requester's next request before new ETH is asked for, or can be taken out with `withdrawEth()`. Oracle owners collect their earnings the same way.
-
-For the full accounting see [Fee Mechanisms](../advanced/fees.md) and the [ETH payment implementation notes](../advanced/eth-payment-migration.md).
+For the full accounting see [Fee Mechanisms](../advanced/fees.md).
 
 ## Troubleshooting
 
 ### Common Issues
 
+**`BadJury()`**: check K ≥ M ≥ N ≥ P ≥ 1, N ≤ 40, P ≥ 2 unless N = 1, K ≤ `maxJury()` and ≤ the keeper's `shortlistSize()`, and `tPlus()` < timeout ≤ `maxTimeout()`.
+
 **`InsufficientPayment()`**
 ```javascript
-// Send the worst-case amount, less the credit you already hold
-const required = await contract.maxTotalFee(maxOracleFee);
+const required = await contract.maxTotalFee(maxFee, minFee, withBeacons, jury.K, jury.P);
 const credit = await contract.ethOwed(await signer.getAddress());
 const value = required > credit ? required - credit : 0n;
 await contract.requestAIEvaluationWithApproval(/* ... */, { value });
 ```
 
-**The request transaction runs out of gas**
+**`BadInput()`**: check the CID and addendum limits, `estimatedBaseCost < min(maxFee, maxOracleFee())`, `alpha ≤ 1000` and a scaling factor from 1 to 65,535.
 
-Oracle selection is random, so the gas a request uses differs a little from what a wallet estimates beforehand. Estimate with `estimateGas` and add headroom (the repository's `single-query.js` adds 50%). On 2026-11-22 a request on a fork of Base mainnet used about 3.25 million gas.
+**The round stays in phase 1 (draw)**: nobody has called `drawJury`. An undrawn round never times out. Call `drawJury` from block B+2. After a day it can only be cancelled to the treasury.
 
-**"No active oracles available with fee <= maxFee and requested class"**
-- Ensure requested oracle class exists
-- Check that `_maxOracleFee` is at least the fee the oracles charge
-- Verify oracles aren't all locked/blocked
+**`drawJury` reverts with `TooEarly()` in phase 2**: the beacon values are not in yet. Try again; the stage ends at the beacon deadline (`timeout()` on JuryBeacons, 120 s), ready or expired.
 
-**"Base cost must be less than max fee"**
-- `_estimatedBaseCost` must be lower than `min(_maxOracleFee, maxOracleFee())`
+**The round stays in phase 3 or 4**: if T+ has passed with at least M commits, call `closeCommits`. In phase 4, call `promote` from block C+2.
 
-**The evaluation does not finish**
-```javascript
-// A round is not closed automatically. After the timeout, close it yourself:
-// the unspent part of your prepayment is then credited back to you
-const timeout = await contract.responseTimeoutSeconds();
-const status = await contract.getAggregationStatus(aggregatorId);
-const now = BigInt(Math.floor(Date.now() / 1000));
-if (!status.isComplete && now >= status.startTimestamp + timeout) {
-    await (await contract.finalizeEvaluationTimeout(aggregatorId)).wait();
-}
-```
+**The round failed with no refund**: see the table under [Fee Structure](#fee-structure). Rounds that could be a free re-roll are not refunded.
+
+**The result is in but the round stays in phase 6**: that is normal until the deadline. Settlement only reports the scores to the keeper; the result is valid from phase 6. Call `settle(aggId)` after the deadline if no new request has settled it.
 
 ### Error Codes
 
-The aggregator uses custom errors:
-
 | Error | Cause | Solution |
 |-------|-------|----------|
-| `EmptyCIDList()` | No evidence provided | Include at least one IPFS hash |
-| `TooManyCIDs()` | > 10 evidence files | Combine evidence or split requests |
-| `CIDTooLong()` | Individual CID > 100 bytes | Use valid IPFS hashes |
-| `AddendumTooLong()` | Description > 1000 bytes | Shorten description |
-| `InsufficientPayment()` | `msg.value` plus the caller's credit is below `maxTotalFee(_maxOracleFee)` | Send the missing ETH |
-| `NotTimedOut()` | `finalizeEvaluationTimeout()` called before the timeout | Wait until `startTimestamp + responseTimeoutSeconds()` |
-| `AggregationComplete()` | The round is already closed | Read the result with `getEvaluation()` |
-| `UnknownRequest()` | No round exists for this ID | Check the request ID |
-| `NothingOwed()` | `withdrawEth()` with no credit | Nothing to withdraw |
-| `EnforcedPause()` | New requests are paused by the owner | Try again after `unpause()` |
-| `InvalidConfig()` | Owner passed values to `setConfig()` that break K >= M >= N >= P >= 2 | Use valid K,M,N,P values |
+| `BadJury()` | The jury fails the check above | Fix K/M/N/P or the timeout |
+| `BadInput()` | Malformed request (CIDs, addendum, base cost, alpha, scaling, prepay size) | Fix the parameter |
+| `KeeperNotSet()` | No keeper configured | Owner: `setContracts` |
+| `InsufficientPayment()` | `msg.value` plus credit is below the prepay | Send the missing ETH |
+| `EnforcedPause()` | New requests are paused | Wait for `unpause()` |
+| `WrongPhase()` | The call does not fit the round's phase or deadline | Read `getRoundInfo` |
+| `TooEarly()` | Before B+2, before C+2, beacons pending, or too early to cancel | Wait |
+| `SeedExpired()` | blockhash(B+1) or blockhash(C+1) is no longer readable (older than 8,191 blocks) | Unsealed B+1: `cancelUnsealed`, and draw or `sealSeed` sooner next time. C+1: the round can only be settled after its deadline |
+| `DrawExpired()` | `drawJury` more than 1 day after the request | `cancelUnsealed` |
+| `NotDue()` | `settle` before the deadline | Wait for the deadline |
+| `OutOfGas()` | Too little gas for a tolerated call or for settlement | Raise the gas limit |
+| `NothingOwed()` | Withdrawal with no credit | Nothing to withdraw |
+
+The [Error Reference](../api/errors.md) lists every error of the v2 contracts.
 
 ## Best Practices
 
-1. **Size the prepayment with `maxTotalFee()`** before submitting requests, and count your existing `ethOwed` credit
-2. **Monitor events** to track progress
-3. **Handle timeouts yourself**: call `finalizeEvaluationTimeout()` once the timeout has passed, or your prepayment stays reserved in the round
-4. **Use appropriate alpha values** based on use case priority
-5. **Handle both success and failure cases** in your application
-6. **Withdraw or reuse your credit**: refunds stay in the contract until you call `withdrawEth()` or make another request
-7. **Cache IPFS content** for better user experience
-8. **Implement retry logic** for network failures
+1. **Quote with `maxTotalFee(maxFee, minFee, withBeacons, K, P)`** for the jury you will send, and count your `ethOwed` credit.
+2. **Draw your own rounds** from block B+2: you get the draw reward back, and an undrawn round never ends by itself.
+3. **Keep the round moving**: `closeCommits` after T+, `promote` from C+2, `settle` after the deadline. Anyone may call them.
+4. **Read the phase, not just `isFailed`**: a cancelled round is phase 9 and `isFailed` is false for it.
+5. **Ask one-number questions for one number**: arbiters then return `[score]`, which is clustered exactly. Read the per-arbiter scores with `getOutcomeScores(aggId, 0)`.
+6. **Set a fee floor** for valuable questions, so a re-run costs at least K × `minFee`.
+7. **Withdraw or reuse your credit**: refunds and rewards stay in the contract until `withdrawEth()` or your next request.

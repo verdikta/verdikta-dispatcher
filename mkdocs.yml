@@ -16,8 +16,9 @@ nav:
   - Home: index.md
   - Contracts:
     - ReputationAggregator: contracts/reputation-aggregator.md
-    - ReputationSingleton: contracts/reputation-singleton.md
+    - ReputationSingleton (v1): contracts/reputation-singleton.md
     - ReputationKeeper: contracts/reputation-keeper.md
+    - JuryBeacons: contracts/jury-beacons.md
     - ArbiterOperator: contracts/arbiter-operator.md
     - SimpleContract: contracts/simple-contract.md
   - Examples:

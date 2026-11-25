@@ -2,13 +2,16 @@
 
 The ArbiterOperator is a specialized Chainlink operator contract that enforces access control for Verdikta's oracle network. It extends the standard Chainlink operator with reputation-based allowlists and multi-word response capabilities.
 
+!!! note "Checked against the code"
+    Revised on 2026-11-25 against [`ArbiterOperator.sol`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/arbiterOperator/contracts/ArbiterOperator.sol), v2's [`ReputationKeeper.sol`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/contracts/ReputationKeeper.sol) and [`ReputationAggregator.sol`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/contracts/ReputationAggregator.sol), and [`MIGRATION.md`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/MIGRATION.md), on the `beacon` branch. The operator contract is unchanged in v2: deployed operators keep working. What changes for an operator's owner and node is listed under [Working with v2](#working-with-v2).
+
 ## Overview
 
 The ArbiterOperator serves as the gateway between the Verdikta network and Chainlink infrastructure by:
 
 - **Access Control**: Only approved contracts can request oracle services
 - **Multi-word Responses**: Supports complex data structures in responses
-- **Reputation Integration**: Works with ReputationKeeper allowlists
+- **Reputation Integration**: Works with ReputationKeeper allowlists, and answers the keeper's checks for health-call senders (`isAuthorizedSender`) and the payee (`owner()`)
 - **Standard Compliance**: Maintains full Chainlink operator compatibility
 
 ## Key Features
@@ -44,7 +47,7 @@ function fulfillOracleRequestV(
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `requestId` | `bytes32` | Unique identifier for the oracle request |
-| `payment` | `uint256` | Payment amount in LINK tokens |
+| `payment` | `uint256` | Payment amount in LINK tokens. The v2 aggregator sends its requests with a payment of 0: arbiters are paid in ETH by the aggregator (see below) |
 | `callbackAddress` | `address` | Contract to call with the response |
 | `callbackFunctionId` | `bytes4` | Function selector to call |
 | `expiration` | `uint256` | Request expiration timestamp |
@@ -64,7 +67,27 @@ function isReputationKeeper(address rkAddr) external view returns (bool)
 
 // Check if the allowlist is empty (gate disabled)
 function isReputationKeeperListEmpty() external view returns (bool)
+
+// The whole allowlist
+function getReputationKeepers() external view returns (address[] memory)
 ```
+
+`addReputationKeeper` reverts with `"RK: not contract"` for an address without code, `"RK: exists"` for one already listed, and `"RK: interface"` if a static call to `isContractApproved(address)` on it fails. The v2 keeper keeps that function, so it can be added.
+
+### Inherited Functions Verdikta Relies On
+
+```solidity
+// From OperatorMod / AuthorizedReceiver
+function owner() external view returns (address)
+function isAuthorizedSender(address sender) external view returns (bool)
+function setAuthorizedSenders(address[] calldata senders) external   // owner or authorized sender
+```
+
+- **`owner()`**:
+    - is the payee: the aggregator credits every base fee, bonus and beacon payment to the operator's `owner()`, read with a 30,000-gas stipend at the draw;
+    - may register the arbiter in the keeper, and receives the stake when it exits;
+    - an operator whose `owner()` cannot be read gets no slot (`SlotSkipped`, reason 1).
+- **`isAuthorizedSender`**: the keeper accepts health answers (`answerHealthCall`, `rotateChain`, `requestHealthCall`) only from the operator's `owner()` or an authorized sender. The node answers from its Chainlink node key, so that key must be an authorized sender (`setAuthorizedSenders`), as it already is for fulfilling requests.
 
 ### Interface Detection
 
@@ -145,52 +168,78 @@ contract OracleDeployment {
 
 ### Integration with ReputationKeeper
 
+The v2 keeper registers an arbiter with a stake and a hash-chain head. The caller must be the operator's owner (or the keeper's owner) and pays the stake.
+
 ```solidity
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
+interface IERC20 {
+    function approve(address spender, uint256 amount) external returns (bool);
+}
+
+interface IOperatorGate {
+    function isReputationKeeper(address rkAddr) external view returns (bool);
+    function isReputationKeeperListEmpty() external view returns (bool);
+    function supportsInterface(bytes4 interfaceId) external view returns (bool);
+}
+
+interface IReputationKeeperV2 {
+    function stakeRequirement() external view returns (uint256);
+    function registerArbiter(address oracle, bytes32 jobId, uint64 fee, uint64[] calldata classes, bytes32 chainHead) external;
+}
+
+// Meant to be the operator's owner (operator.transferOwnership to it, then acceptOwnership)
 contract OracleRegistration {
-    ArbiterOperator public operator;
-    ReputationKeeper public reputationKeeper;
-    
-    function registerWithSystem(
-        bytes32 jobId,
-        uint256 fee,
-        uint64[] memory classes
-    ) external {
-        // First, register operator with reputation system
-        reputationKeeper.registerOracle(
-            address(operator),
-            jobId,
-            fee,
-            classes
-        );
-        
-        // Ensure operator recognizes the reputation keeper
+    IOperatorGate public immutable operator;
+    IReputationKeeperV2 public immutable reputationKeeper;
+    IERC20 public immutable verdiktaToken;
+
+    constructor(address _operator, address _keeper, address _token) {
+        operator = IOperatorGate(_operator);
+        reputationKeeper = IReputationKeeperV2(_keeper);
+        verdiktaToken = IERC20(_token);
+    }
+
+    function registerWithSystem(bytes32 jobId, uint64 feeWei, uint64[] calldata classes, bytes32 chainHead) external {
+        // The operator must accept requests from contracts this keeper approves: either it lists
+        // the keeper (addReputationKeeper) or its list is empty (gate off)
         require(
-            operator.isReputationKeeper(address(reputationKeeper)) ||
-            operator.isReputationKeeperListEmpty(),
+            operator.isReputationKeeper(address(reputationKeeper)) || operator.isReputationKeeperListEmpty(),
             "Operator doesn't recognize ReputationKeeper"
         );
+        // The stake (100 VDKA by default) is pulled from this contract
+        verdiktaToken.approve(address(reputationKeeper), reputationKeeper.stakeRequirement());
+        // fee in wei of ETH; chainHead 0 lets the node's health job set the chain (starts frozen)
+        reputationKeeper.registerArbiter(address(operator), jobId, feeWei, classes, chainHead);
     }
-    
+
     function checkCompatibility() external view returns (bool) {
-        // Verify the operator is compatible with Verdikta system
-        return operator.supportsInterface(type(IArbiterOperator).interfaceId);
+        return operator.supportsInterface(0xd9f812f9);   // IArbiterOperator
     }
 }
 ```
 
+The v2 keeper does not itself check the interface or the keeper list at registration (v1 did). An operator that does not list the keeper is registered, but every request to it reverts, so the aggregator skips its slot with `SlotSkipped(aggId, slot, 2)` and it earns nothing.
+
 ### Client Contract Example
 
+A contract can also send a request straight to one operator, without the aggregator, as [SimpleContract](simple-contract.md) does. Such a request carries no `1:` or `2:` prefix, so the arbiter's node evaluates it directly (mode 0) and answers with its scores and justification CID: no commit, no reveal and no reputation. If the operator lists keepers, the client must be approved in one of them (`setApproved` on a v2 keeper). That approval also lets it select arbiters and report outcomes in that keeper, so a keeper owner should approve only contracts it trusts.
+
 ```solidity
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
 import "@chainlink/contracts/src/v0.8/ChainlinkClient.sol";
 
+interface IArbiterOperatorGate {
+    function isReputationKeeperListEmpty() external view returns (bool);
+}
+
 contract VerdiktaClient is ChainlinkClient {
     using Chainlink for Chainlink.Request;
     
-    ArbiterOperator public arbiterOperator;
+    IArbiterOperatorGate public arbiterOperator;
     bytes32 public jobId;
     uint256 public fee;
     
@@ -201,7 +250,7 @@ contract VerdiktaClient is ChainlinkClient {
         uint256 _fee
     ) {
         _setChainlinkToken(_link);
-        arbiterOperator = ArbiterOperator(_operator);
+        arbiterOperator = IArbiterOperatorGate(_operator);
         jobId = _jobId;
         fee = _fee;
     }
@@ -232,9 +281,9 @@ contract VerdiktaClient is ChainlinkClient {
         // Process likelihoods array and justification
     }
     
-    function _isApprovedByReputationKeepers() internal view returns (bool) {
-        // Implementation would check with known ReputationKeeper contracts
-        // This is simplified for the example
+    function _isApprovedByReputationKeepers() internal pure returns (bool) {
+        // Implementation would check isContractApproved(address(this)) on the operator's
+        // keepers (getReputationKeepers()). This is simplified for the example
         return true;
     }
 }
@@ -242,104 +291,76 @@ contract VerdiktaClient is ChainlinkClient {
 
 ### Node.js Oracle Implementation
 
+A sketch of the commit and reveal steps of an external adapter, in the v2 format. The real implementation is `external-adapter/src/handlers/evaluateHandler.js` on the arbiter's `beacon` branch. The job passes the request's `cid` and `aggId` parameters to the adapter.
+
 ```javascript
-const { Requester, Validator } = require('@chainlink/external-adapter');
+const crypto = require('crypto');
+const { ethers } = require('ethers');   // v5, as the arbiter uses
 
-// Example external adapter for Verdikta AI evaluation
-const inputParams = {
-    cid: ['cid', 'hash'],
-    mode: false // Optional mode parameter
-};
+const OPERATOR_ADDRESS = process.env.OPERATOR_ADDRESS;   // the operator contract that fulfills
 
-const customParams = (data) => {
-    const validator = new Validator(data, inputParams);
-    if (validator.error) throw validator.error;
-    
-    return {
-        cid: validator.validated.data.cid,
-        mode: validator.validated.data.mode || '0'
-    };
-};
-
-const createRequest = async (input, callback) => {
-    try {
-        const { cid, mode } = customParams(input);
-        
-        // Determine if this is commit or reveal phase
-        const isCommitPhase = mode.startsWith('1:');
-        const isRevealPhase = mode.startsWith('2:');
-        
-        let responseData;
-        
-        if (isCommitPhase) {
-            // Commit phase: return hash of actual evaluation
-            const actualEvaluation = await performAIEvaluation(cid);
-            const salt = generateRandomSalt();
-            const commitment = computeCommitment(actualEvaluation, salt);
-            
-            responseData = {
-                data: [commitment], // Single value for commit
-                result: commitment
-            };
-            
-            // Store evaluation and salt for reveal phase
-            storeForReveal(input.id, actualEvaluation, salt);
-            
-        } else if (isRevealPhase) {
-            // Reveal phase: return actual evaluation and salt
-            const { evaluation, salt } = retrieveStored(input.id);
-            const cleanCid = extractJustificationCID(evaluation);
-            
-            responseData = {
-                data: evaluation.likelihoods,
-                result: evaluation.likelihoods,
-                cid: `${cleanCid}:${salt.toString(16)}`
-            };
-            
-        } else {
-            // Legacy mode: direct evaluation
-            const evaluation = await performAIEvaluation(cid);
-            responseData = {
-                data: evaluation.likelihoods,
-                result: evaluation.likelihoods,
-                cid: evaluation.justificationCID
-            };
-        }
-        
-        callback(200, Requester.success(input.id, responseData));
-        
-    } catch (error) {
-        console.error('Oracle request failed:', error);
-        callback(500, Requester.errored(input.id, error));
-    }
-};
-
-// AI evaluation function (placeholder)
-async function performAIEvaluation(cid) {
-    // Implementation would:
-    // 1. Fetch data from IPFS using the CID
-    // 2. Send to AI service for evaluation
-    // 3. Return structured response
-    
-    return {
-        likelihoods: [750, 250], // Example: 75% likelihood for first option
-        justificationCID: 'QmNewJustificationHash'
-    };
-}
-
-function computeCommitment(evaluation, salt) {
-    const crypto = require('crypto');
+// v2 commit: keccak256(abi.encode(bytes32 aggId, address operator, uint256[] scores, uint256 salt)),
+// all 32 bytes, sent in full as the single commit word
+function commitmentHash(aggId, scores, saltHex) {
     const encoded = ethers.utils.defaultAbiCoder.encode(
-        ['uint256[]', 'uint256'],
-        [evaluation.likelihoods, salt]
+        ['bytes32', 'address', 'uint256[]', 'uint256'],
+        [aggId, OPERATOR_ADDRESS, scores, ethers.BigNumber.from('0x' + saltHex)]
     );
-    const hash = crypto.createHash('sha256').update(encoded).digest();
-    // Return first 128 bits as integer
-    return BigInt('0x' + hash.toString('hex').substring(0, 32));
+    return ethers.utils.keccak256(encoded);   // 0x + 64 hex
 }
 
-module.exports.createRequest = createRequest;
+async function handleRequest({ cid, aggId }) {
+    if (cid.startsWith('1:')) {
+        // Commit: evaluate, then commit to the answer with a fresh 128-bit salt
+        const { scores, justificationCid } = await performAIEvaluation(cid.slice(2));
+        const salt = crypto.randomBytes(16).toString('hex');        // exactly 32 hex digits
+        const hash = commitmentHash(aggId, scores, salt);
+        store(hash.slice(2).toLowerCase(), { scores, justificationCid, salt });
+        return { data: [hash], cid: '' };                            // one word, empty CID
+    }
+    if (cid.startsWith('2:')) {
+        // Reveal: the request carries the full commit hash, 64 lowercase hex digits
+        const entry = load(cid.slice(2).toLowerCase());
+        return { data: entry.scores, cid: `${entry.justificationCid}:${entry.salt}` };
+    }
+    // No prefix (mode 0): a direct request, as SimpleContract sends; answer without commit/reveal
+    const { scores, justificationCid } = await performAIEvaluation(cid);
+    return { data: scores, cid: justificationCid };
+}
+
+// Placeholders
+async function performAIEvaluation(cidAndAddendum) {
+    // 1. fetch the query package(s) from IPFS, 2. run the models, 3. upload the justification.
+    // Scores are on the 0..1,000,000 scale. A question that asks for one number gets [score]
+    return { scores: [750000, 250000], justificationCid: 'QmJustification' };
+}
+const memory = new Map();
+function store(k, v) { memory.set(k, v); }   // persist this in a real node
+function load(k) { return memory.get(k); }
 ```
+
+Each request gets one answer: a malformed reveal still uses up the request, and there is no retry. A commit in v1's format (the first 16 bytes of `sha256(abi.encode(operator, scores, salt))`) is accepted but can never be revealed.
+
+## Working with v2
+
+The operator contract is unchanged in v2, but every operator owner and node has work to do ([`MIGRATION.md`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/MIGRATION.md)):
+
+1. **Add the v2 keeper to the gate**: `addReputationKeeper(<v2 keeper>)`, unless the list is empty. The v2 keeper answers `isContractApproved(requester)` (its `approvedContracts`, set with `setApproved`) and approves the v2 aggregator at deployment. Without the keeper on the list, every dispatch from the v2 aggregator reverts and the aggregator skips the slot.
+2. **Register again** in the v2 keeper with `registerArbiter(operator, jobId, fee, classes, chainHead)`. The stake is pulled from the caller. See [ReputationKeeper](reputation-keeper.md#registration).
+3. **Switch the commit and reveal format** when the v2 aggregator goes live:
+
+    | | v1 | v2 |
+    |--|----|----|
+    | Commit request `cid` | `1:<cids>[:addendum]` | same |
+    | Commit word | first 16 bytes of `sha256(abi.encode(operator, scores, salt))` | `keccak256(abi.encode(aggId, operator, scores, salt))`, all 32 bytes |
+    | Salt | 80 bits, 20 hex | 128 bits, 32 hex, fresh per commit |
+    | Reveal request `cid` | `2:<32 hex>` | `2:<64 hex>`, the full commit hash in lowercase |
+    | Reveal answer | scores (at least 2), `"<cid>:<salt>"` | scores (1 to 20 values), `"<cid>:<32 hex salt>"` |
+    | `aggId` parameter | a hash | `bytes32(roundId)`, sequential, as `0x` + 64 hex |
+
+    The callback is still `fulfill(bytes32 requestId, uint256[] response, string cid)`, delivered through `fulfillOracleRequestV`.
+4. **Answer health calls.** The keeper emits `HealthCall(key, sentAt)`. The node answers with `answerHealthCall` or `rotateChain` within 60 s, from an authorized sender of this operator, or the arbiter is frozen. A beacon call is the same health call.
+5. **Raise the job's gas limit.** The N-th counted reveal finalizes the round and pays for clustering: up to 6.9M gas at Jumbo with 20 outcomes. The operator also requires at least 400,000 gas left for the callback.
 
 ## Access Control Mechanism
 
@@ -357,7 +378,7 @@ The ArbiterOperator enforces access control through ReputationKeeper contracts:
 | State | ReputationKeepers | Behavior |
 |-------|------------------|----------|
 | **Open** | None registered | All requests allowed |
-| **Gated** | ≥1 registered | Only approved contracts allowed |
+| **Gated** | ≥1 registered | Only approved contracts allowed. A keeper approves a contract with `setApproved` (v2) or `approveContract` (v1) |
 | **Multi-Keeper** | Multiple registered | Approved by ANY keeper |
 
 ## Interface Specification
@@ -404,7 +425,7 @@ bytes4(keccak256("fulfillOracleRequestV(bytes32,uint256,address,bytes4,uint256,b
 - **Error Isolation**: Callback failures don't affect operator state
 
 ### Integration Security
-- **Interface Verification**: Operators must implement IArbiterOperator interface
+- **Interface Verification**: The v1 keeper required the IArbiterOperator interface at registration. The v2 keeper requires only code and an `owner()`, so check the interface yourself if it matters to you
 - **Version Compatibility**: Maintains compatibility with standard Chainlink infrastructure
 - **Upgrade Path**: Reputation Keeper list can be updated without operator redeployment
 
@@ -438,23 +459,33 @@ bytes4(keccak256("fulfillOracleRequestV(bytes32,uint256,address,bytes4,uint256,b
 **"Operator: requester not approved"**
 ```javascript
 // Check if contract is approved by any ReputationKeeper
-const keepers = await getRegisteredReputationKeepers(operatorAddress);
-for (const keeper of keepers) {
-    const approved = await keeper.isContractApproved(contractAddress);
-    if (approved) {
-        console.log(`Approved by keeper: ${keeper}`);
+const operator = new ethers.Contract(operatorAddress,
+    ['function getReputationKeepers() view returns (address[])'], provider);
+for (const addr of await operator.getReputationKeepers()) {
+    const keeper = new ethers.Contract(addr, ['function isContractApproved(address) view returns (bool)'], provider);
+    if (await keeper.isContractApproved(contractAddress)) {
+        console.log(`Approved by keeper: ${addr}`);
         break;
     }
 }
+// None: the keeper's owner calls setApproved(contractAddress, true) on a v2 keeper,
+// or the operator's owner adds a keeper that approves it (addReputationKeeper)
 ```
 
-**"Oracle not ArbiterOperator type"**
+**"Oracle not ArbiterOperator type"** (v1 keeper only: the v2 keeper's `registerArbiter` does not check the interface)
 ```javascript
 // Verify operator implements correct interface
 const operator = new ethers.Contract(address, OPERATOR_ABI, provider);
 const isArbiter = await operator.supportsInterface('0xd9f812f9');
 console.log('Is ArbiterOperator:', isArbiter);
 ```
+
+**The v2 aggregator skips the slot (`SlotSkipped(aggId, slot, 2)`)**
+- The operator's keeper list does not include the v2 keeper: `addReputationKeeper(<v2 keeper>)`
+- The operator reverted or used up the dispatch stipend (`dispatchGas()` on the aggregator, 250,000)
+
+**`NotAuthorizedResponder()` from the keeper on a health answer**
+- Send the answer from the operator's `owner()` or an address in `getAuthorizedSenders()`
 
 **"Callback execution failed"**
 - Check gas limits in oracle job specification
@@ -474,8 +505,6 @@ function diagnoseOperator(address operatorAddr) external view returns (
     
     isArbiterOperator = op.supportsInterface(type(IArbiterOperator).interfaceId);
     hasReputationKeepers = !op.isReputationKeeperListEmpty();
-    
-    // Note: registeredKeepers would need additional enumeration logic
-    // This is simplified for the example
+    registeredKeepers = op.getReputationKeepers();
 }
 ``` 
