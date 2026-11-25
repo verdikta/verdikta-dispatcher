@@ -112,6 +112,7 @@ function completeExit(bytes32 key) external
     - `Blocked()` while the arbiter is blocked.
 - The stake left after any burns goes to the operator's `owner()`, not to the caller. `ArbiterRemoved(key, refunded)` is emitted.
 - The arbiter's slot in each class is freed for the next registration, and `arbiterClasses(key)` becomes empty.
+- The arbiter leaves the registry of registered arbiters (`registryLength()` drops by one), so it can no longer win an [arbiter pool](#the-arbiter-pool-draw) payout.
 - Both calls also work for a frozen arbiter: a freeze exists to get a broken arbiter fixed or removed.
 - A banned key keeps its record (a tombstone) and can never register again.
 - `requestExit` and `completeExit` replace v1's `deregisterOracle`, and `setPaused` replaces `setOracleActive`.
@@ -218,6 +219,19 @@ Both revert with `NotApproved()` for a caller that `setApproved` has not approve
 
 `pickBeacons` uses the same walk and eligibility rules, without the fee test, and returns up to `count` keys, each sent a health call.
 
+### The arbiter pool draw
+
+```solidity
+// A registered arbiter picked uniformly from seed, returned as its payee (its operator's owner()),
+// or address(0) if neither of two picks is available
+function poolPayee(bytes32 seed) external view returns (address)
+
+// Registered arbiters (exited ones are removed; banned ones stay until they complete their exit)
+function registryLength() external view returns (uint256)
+```
+
+The keeper keeps a registry of every registered arbiter: `registerArbiter` adds the key and `completeExit` removes it. The aggregator calls `poolPayee` at each draw that draws a jury, with a seed derived from that draw's seed, to pay an eighth of its arbiter pool (the forfeits that earlier v2 drafts sent to a treasury; see [ReputationAggregator](reputation-aggregator.md#the-arbiter-pool)). `poolPayee` makes at most two picks and returns the first arbiter that is registered and not paused, banned, exiting or understaked; otherwise address(0), and the pool waits for the next draw. Anyone may call it. The aggregator caps the call at 80,000 gas and catches its failure, so an operator's `owner()` cannot make the draw fail.
+
 ### Outcomes (approved contracts only)
 
 ```solidity
@@ -274,7 +288,7 @@ The settings in [Configuration Parameters](#configuration-parameters) have gette
 - `C_COMMITTED` 0x80;
 - `Q_NONE` 0, `Q_CLOSE` 1, `Q_OFF` 2, `Q_FAR` 3.
 
-v1's `registeredOracles`/`getOracleInfo`/`getOracleClasses` have no list equivalent. Follow the `ArbiterRegistered` events, then read `getArbiter(key)` and `arbiterClasses(key)`.
+v1's `registeredOracles`/`getOracleInfo`/`getOracleClasses` have no list equivalent (`registryLength()` gives only the count). Follow the `ArbiterRegistered` events, then read `getArbiter(key)` and `arbiterClasses(key)`.
 
 ### Contract Approval and Configuration (Owner Only)
 

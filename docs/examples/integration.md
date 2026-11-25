@@ -216,7 +216,7 @@ Two limits apply:
 - **Seal the seed in time.** `blockhash(B+1)` stays readable for 8,191 blocks (about 27 minutes on Base). `drawJury` stores it, and so does `sealSeed(aggId)`.
 - **Draw within a day.** After that `drawJury` reverts with `DrawExpired()`.
 
-A round that misses either can only be closed with `cancelUnsealed(aggId)`, and its whole prepayment goes to the treasury: a refund would be a free re-roll of the jury.
+A round that misses either can only be closed with `cancelUnsealed(aggId)`, and its whole prepayment goes to the arbiter pool: a refund would be a free re-roll of the jury.
 
 With `withBeacons`, the first `drawJury` starts the beacon stage and the jury is drawn by a second call once the beacon values are in (or the 120-second beacon deadline has passed, which ends the round with no result).
 
@@ -299,7 +299,7 @@ A round that is still in the commit, closing or reveal phase at its `deadline` h
 agg.settle(aggId);
 ```
 
-Before the deadline `settle` reverts with `NotDue()`. It marks the round failed (`isFailed(aggId)` returns true), reports every juror's outcome to the keeper, and credits the unspent prepayment back, either to the requester or, when M commits arrived but the round was never promoted, to the treasury. The base fees credited at the draw stay with the jurors. New requests also settle due rounds, in queue order until `settlePerRequest()` × their own K slots are spent, but the walk stops at the first round not yet past its deadline, so a round behind a long-timeout round waits for it: call `settle` yourself rather than rely on that. The refund waits until the round is settled. Nothing is retried: send a new request if you still need the evaluation. `VerdiktaClient.publish()` makes the call itself.
+Before the deadline `settle` reverts with `NotDue()`. It marks the round failed (`isFailed(aggId)` returns true), reports every juror's outcome to the keeper, and credits the unspent prepayment back, either to the requester or, when M commits arrived but the round was never promoted, in equal shares to the slots that committed (`CommitPayment`; the indivisible remainder goes to the arbiter pool). The base fees credited at the draw stay with the jurors. New requests also settle due rounds, in queue order until `settlePerRequest()` × their own K slots are spent, but the walk stops at the first round not yet past its deadline, so a round behind a long-timeout round waits for it: call `settle` yourself rather than rely on that. The refund waits until the round is settled. Nothing is retried: send a new request if you still need the evaluation. `VerdiktaClient.publish()` makes the call itself.
 
 ### Step 8: Collect the Credit
 
@@ -359,7 +359,7 @@ contract ConcurrentClient {
 
 ### User-Funded Requests with Exact Refunds
 
-When users pay for their own requests, each user's refund should go back to that user. A client contract that makes every request itself cannot tell from the aggregator where a failed round's refund went: it may have gone to the treasury, and a refund may land inside somebody else's request (which settles due rounds). The simple exact way is one small wallet contract per request: the wallet is the requester, so its credit is exactly what its round returned. This is the bounty program's `EvaluationWallet` pattern. (A refund beneficiary set in the request, TODO item 3, is not built.)
+When users pay for their own requests, each user's refund should go back to that user. A client contract that makes every request itself cannot tell from the aggregator where a failed round's refund went: it may have gone to the committers or the arbiter pool, and a refund may land inside somebody else's request (which settles due rounds). The simple exact way is one small wallet contract per request: the wallet is the requester, so its credit is exactly what its round returned. This is the bounty program's `EvaluationWallet` pattern. (A refund beneficiary set in the request, TODO item 3, is not built.)
 
 ```solidity
 contract RequestWallet {
@@ -417,7 +417,7 @@ contract UserFundedClient {
 }
 ```
 
-A finished round (phase 6) credited its refund at finalization, and nothing more is credited to the requester after that, so `reclaim()` at phase 6 is final. A failed round (phase 8) credited its refund at the draw or at settlement, unless it went to the treasury. A cancelled round (phase 9) returns nothing.
+A finished round (phase 6) credited its refund at finalization, and nothing more is credited to the requester after that, so `reclaim()` at phase 6 is final. A failed round (phase 8) credited its refund at the draw or at settlement, unless it went to the committers or the arbiter pool. A cancelled round (phase 9) returns nothing.
 
 ## Error Handling
 

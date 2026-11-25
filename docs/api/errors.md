@@ -48,7 +48,7 @@ The request first settles due rounds. A revert in the request undoes that too.
 |-------|---------|---------|
 | `NothingOwed()` | `withdrawEth()` or `withdrawEthFor(payee)` when `ethOwed[payee]` is 0 | Nothing to withdraw |
 | `EthTransferFailed()` | The ETH transfer in `_withdrawTo(payee)` failed | The payee did not accept ETH (for example a contract without `receive()`). The credit stays |
-| `NotAuthorized()` | `withdrawEthFor(payee)` from neither `payee` nor the owner | Only the payee or the owner can trigger a payout, and it always goes to the payee |
+| `NotAuthorized()` | `withdrawEthFor(payee)` from neither `payee` nor the owner, or for `payee` = address(0) (the arbiter pool, which nobody can withdraw) | Only the payee or the owner can trigger a payout, and it always goes to the payee |
 
 ### Configuration Errors
 
@@ -57,7 +57,7 @@ The request first settles due rounds. A revert in the request undoes that too.
 | `InvalidConfig()` | `setLimits` with `maxJury_ == 0`, `tPlus_ == 0` or `maxTimeout_ <= tPlus_` | A `maxTimeout_` above one day is accepted, but `checkJury` caps every request's timeout at one day, so no request can use more |
 | `InvalidConfig()` | `setParams` with `bonusMult > 20`, `dispatchGas_` outside 100,000..2,000,000, or `spreadFloor_ > 1e34` | `settlePerReq` and `maxOracleFee_` are not checked; `settlePerReq = 0` turns settlement by requests off |
 | `InvalidConfig()` | `setRewards` with `revealWindow_ == 0` | |
-| `InvalidConfig()` | `setContracts` with a zero keeper or treasury | A zero beacon address is allowed and turns beacons off |
+| `InvalidConfig()` | `setContracts` with a zero keeper | A zero beacon address is allowed and turns beacons off |
 | `OwnableUnauthorizedAccount(address)` | An owner-only function from another address | Inherited from OpenZeppelin `Ownable` |
 | `OwnableInvalidOwner(address)` | `transferOwnership(address(0))` | Inherited from OpenZeppelin `Ownable` |
 | `ExpectedPause()` | `unpause()` while not paused | Inherited from OpenZeppelin `Pausable`. `pause()` while paused gives `EnforcedPause()` |

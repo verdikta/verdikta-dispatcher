@@ -11,22 +11,27 @@ arbiter node, the operator contract and the scripts.
 
 | Contract | Role |
 |---|---|
-| `ReputationKeeper` | Arbiter registry (and `healthState(key)`, what a node needs to answer its health calls), stake, unbonding, burns, two scores (Table 1 via `applyOutcomes`, −400 for a live non-committer when the round failed for lack of commits), blocks / bans / 90-day decay (Table 2), hash-chain health calls (each reveal recorded with its block and time), freeze and chain rotation, reputation-weighted selection (the fee weight scored on what the requester pays, item 8) from a bounded walk of the class list in random order, and the beacon pick. Selection state is checkpointed by block, so a draw reads the state as of the request block (item 9). Answers `isContractApproved`, which every deployed `ArbiterOperator` uses to gate requests |
-| `ReputationAggregator` | Two-phase request (escrow at block B; `drawJury` from B+2, seeded by `blockhash(B+1)`, read through EIP-2935 after 256 blocks; 2 x fee draw reward; `sealSeed`, `cancelUnsealed`), the optional beacon stage, M+ / T+ promotion (closes at the M+-th commit or after T+ with at least M; `promote` from C+2 draws M of all commits), late reveals, settlement after the deadline with one batched keeper call, a settlement queue drained by new requests, `getOutcomeScores` (item 11), the requester-set fee floor (item 8) |
+| `ReputationKeeper` | Arbiter registry (and `healthState(key)`, what a node needs to answer its health calls), stake, unbonding, burns, two scores (Table 1 via `applyOutcomes`, −400 for a live non-committer when the round failed for lack of commits), blocks / bans / 90-day decay (Table 2), hash-chain health calls (each reveal recorded with its block and time), freeze and chain rotation, reputation-weighted selection (the fee weight scored on what the requester pays, item 8) from a bounded walk of the class list in random order, and the beacon pick, and the arbiter pool's pick (`poolPayee`, over a registry of registered arbiters; `registryLength()`). Selection state is checkpointed by block, so a draw reads the state as of the request block (item 9). Answers `isContractApproved`, which every deployed `ArbiterOperator` uses to gate requests |
+| `ReputationAggregator` | Two-phase request (escrow at block B; `drawJury` from B+2, seeded by `blockhash(B+1)`, read through EIP-2935 after 256 blocks; 2 x fee draw reward; `sealSeed`, `cancelUnsealed`), the optional beacon stage, M+ / T+ promotion (closes at the M+-th commit or after T+ with at least M; `promote` from C+2 draws M of all commits), late reveals, settlement after the deadline with one batched keeper call, a settlement queue drained by new requests, `getOutcomeScores` (item 11), the requester-set fee floor (item 8), no treasury: a never-promoted round's unspent prepay to its committers (`CommitPayment`), other forfeits to the arbiter pool `ethOwed(address(0))`, an eighth of which goes to one random registered arbiter at each jury draw (`PoolPayment`) |
 | `JuryBeacons` | Item 9's beacon flag, kept out of the aggregator for bytecode: picks 4 beacons through the keeper (which sends each a health call), reads their answers from the keeper, and reports the mix of the first 2 |
 | `ScoringLib` | External library: finalization in one call (v1's length normalization, cluster, mean, quality classes), the promotion draw. One-number answers get the exact 1-D cluster; longer vectors item 10's nearest-neighbour rule, which replaces v1's greedy one |
-| `AggregatorLib` | External library: v1's helpers plus the commit payload builder, a one-pass CID/salt parser for the 128-bit salt, and word-level hex encoders |
+| `AggregatorLib` | External library: v1's helpers plus the arbiter pool's payout (`payPool`, which emits `PoolPayment`), the commit payload builder, a one-pass CID/salt parser for the 128-bit salt, and word-level hex encoders |
 | `test/TestOperator` | Gas-faithful stand-in for Chainlink's Operator (the real one pins solc 0.8.19), with `ArbiterOperator`'s keeper gate (on by default in the tests). `setBomb` makes it burn all gas |
 | `test/MockHistory` | Stand-in for the EIP-2935 history contract, installed at its address (Hardhat's stub reverts) |
 
 ## Run
 
 ```
-npx hardhat test                       # all 147 tests, ~4 min
+npx hardhat test                       # all 152 tests, ~4 min
 npx hardhat test test/gas.test.js      # gas and cost report per class
 npx hardhat test test/beacons.test.js  # the beacon stage
 npx hardhat deploy --tags aggregator,keeper,config   # in-process deploy check
 ```
+
+The optimizer runs are 20 (200 until 2026-11-25, then 50, then 20), to keep the aggregator under the
+24,576-byte limit: it is 24,500 B. The gas figures quoted below were measured at 200 runs unless a
+line says otherwise; fewer runs can cost somewhat more per call, so re-run `gas.test.js` before
+relying on a tight figure. The gas budgets in the tests still pass.
 
 `hardhat.config.js` loads the deploy secrets like v1's config does. The tests use only the in-process
 network. `deploy.sh` runs the same three tags against `NET` (default `base_sepolia`).
@@ -39,7 +44,9 @@ Tests:
   random-sample tails, and a walk that must reach every entry), the operator gate.
 - `aggregator.flow.test.js`:
   - item 9: draw timing; determinism whoever draws and whenever; EIP-2935 reads; reward; no expiry;
-    cancel to the treasury; empty pool;
+    cancel to the arbiter pool; empty pool; the committers' shares of a never-promoted round; the
+    arbiter pool's payouts (an eighth per draw, the keeper's two picks, nobody can withdraw it, the
+    registry after an exit);
   - M+ / T+ promotion, finalize, late reveals and settlement;
   - the 0..1,000,000 score scale, failed rounds, the freeze dodge, the queue;
   - ETH solvency, item 11 scores, gas griefing, the operator gate;
@@ -69,7 +76,8 @@ Tests:
 keeper and `JuryBeacons` and wires the three:
 - the keeper approves the aggregator and `JuryBeacons`;
 - `JuryBeacons` approves the aggregator;
-- `setContracts` sets the keeper, beacons and treasury (`TREASURY_ADDRESS`, else the deployer).
+- `setContracts(keeper, beacons)` sets the keeper and beacons. There is no treasury, and
+  `TREASURY_ADDRESS` is no longer read.
 
 `03_config.js` sets the bounds a request's jury must keep to (`setLimits`: K up to 50, timeouts up to
 3,600 s, T+ 155 s) and the shared parameters. Each request carries its own jury (K/M/N/P and the
@@ -106,7 +114,7 @@ timeout), so one deployment serves every class. Local networks get a `MockLinkTo
   settling, so its penalties land before the stake is refunded. A new period applies to exits
   requested afterwards.
 - **No draw more than a day after the request.** `drawJury` reverts with `DrawExpired`, and the round
-  can only be cancelled to the treasury (`cancelUnsealed`). Selection also refuses a request block
+  can only be cancelled to the arbiter pool (`cancelUnsealed`). Selection also refuses a request block
   more than a day old (`StaleBlock`). Slot reuse and the unbonding floor rely on this bound.
 - **Selection visits the class list in random order.** The walk draws random positions without
   repeats (a bitmap of visited positions), so where an arbiter sits in the list does not matter: a
@@ -171,8 +179,8 @@ timeout), so one deployment serves every class. Local networks get a `MockLinkTo
   it until it is due or anyone calls `settle()`. Until a round settles its scores and penalties wait
   (an arbiter that completes its exit first escapes them). `settlePerRequest = 0` turns this off.
 - **`promote` pays its caller 1 x eff** (`promoteRewardFees`, in the escrow), so third parties call it
-  and a requester cannot withhold it. A round that closed but was never promoted sends its unspent
-  prepay to the treasury, not back to the requester, so aborting a promotion draw buys no refund.
+  and a requester cannot withhold it. A round that closed but was never promoted pays its unspent
+  prepay to its committers, not back to the requester, so aborting a promotion draw buys no refund.
 - **Promoted arbiters always get `revealWindow`** (120 s) after `promote`, which extends the deadline if
   needed: calling `promote` late cannot make honest arbiters miss their reveals.
 - **Rewards are fixed per round at request**, as is the beacon quorum, so an owner change before the
@@ -190,14 +198,28 @@ timeout), so one deployment serves every class. Local networks get a `MockLinkTo
 - **Every answer is recorded.** Each health answer adds a head entry with its block and time; entries
   are never overwritten. A rotation records the revealed value, then the new head.
 - **A sealed round nobody drew** (for example a draw too large for one transaction, or a beacon stage
-  nobody concluded) can be cancelled to the treasury after a day, and can no longer be drawn.
+  nobody concluded) can be cancelled to the arbiter pool after a day, and can no longer be drawn.
 - **`owner()` is read with a low-level call** that copies only one word. A malformed answer skips the
   slot instead of reverting the draw, and a huge return buffer costs the draw no more than the 30k
   stipend.
 - **No refund for an abandoned commit phase.** A round that had M commits but was never promoted
-  sends its unspent prepay to the treasury. That covers a phase that was closed but never promoted,
-  and one nobody closed after T+. Otherwise a requester that dislikes the jury could skip
-  `closeCommits`, with one colluding juror not committing, and get a re-roll for the base fees.
+  shares its unspent prepay equally among the slots that committed (one `CommitPayment` per slot, to
+  its payee, counted in `rewards`); the indivisible rest, under one wei per committer, goes to the
+  arbiter pool. That covers a phase that was closed but never promoted, and one nobody closed after
+  T+. Otherwise a requester that dislikes the jury could skip `closeCommits`, with one colluding
+  juror not committing, and get a re-roll for the base fees. The committers did the work, and
+  anyone could have promoted.
+- **The arbiter pool replaces the treasury** (of the v2 drafts until 2026-11-25). The forfeits (a cancelled round's whole prepay, a
+  missed beacon quorum's rest, a seed-dependent draw failure after beacons, the committers' dust)
+  credit `ethOwed(address(0))`. Nobody can withdraw it: `withdrawEthFor(address(0))` reverts
+  `NotAuthorized`, and `msg.sender` is never address(0). Each `drawJury` that draws a jury pays an
+  eighth of it to one registered arbiter's payee (`PoolPayment`), picked uniformly by the keeper's
+  `poolPayee` from the draw's seed: two picks at most, skipping paused, banned, exiting and
+  understaked arbiters; with none, the pool waits for the next draw. The keeper call gets 80k gas and
+  its failure is caught, so it cannot make the draw fail. The seed is fixed by a block hash after the
+  request and is the same whoever draws, a forfeiting round never picks its own winner, and an
+  eighth per draw makes grinding with many requests cost more than it wins. The registry is dense:
+  added to at registration, swap-and-pop at `completeExit`; `registryLength()` is its size.
 - **A late close leaves time to promote.** A commit that closes the phase near the deadline extends
   it to at least 30 s after the close.
 - **Credit covers only what `msg.value` does not.** Any excess value returns to credit, so the escrow
@@ -260,13 +282,13 @@ timeout), so one deployment serves every class. Local networks get a `MockLinkTo
 - **Missed quorum.** If fewer than 2 values are revealed within 120 s of the start, the next
   `drawJury` ends the round with no result:
   - the beacon that answered in time is paid;
-  - the rest of the prepay goes to the treasury, since a refund would be a free re-roll;
+  - the rest of the prepay goes to the arbiter pool, since a refund would be a free re-roll;
   - silent beacons are frozen by their health call, and are not scored.
 - **Pool shortage.** If fewer than 2 candidates qualify, the round fails with a refund, as for an empty
   jury pool.
 - **Jury shortage after the stage.** If the jury can't be drawn once the values are in, the beacons
   are paid. The rest is refunded only if selection walks the whole class list (`keeper.scansAll`), so
-  the failure did not depend on the seed. Otherwise it goes to the treasury: a beacon could choose by
+  the failure did not depend on the seed. Otherwise it goes to the arbiter pool: a beacon could choose by
   its timing between a jury and a refund.
 - **Cost.** The stage costs the requester ~0.39M gas to start. A beacon's answer is an ordinary health
   answer (123k). Jumbo with beacons costs about $0.53 a round in gas (all transactions, 0.006 gwei)
@@ -279,7 +301,7 @@ timeout), so one deployment serves every class. Local networks get a `MockLinkTo
     owner change between B and the start alters the pick.
   - Don't swap the beacon contract (`setContracts`) while a round is in its beacon stage. That round
     would then read the new contract, never become ready, and could only be cancelled to the
-    treasury after a day.
+    arbiter pool after a day.
 
 ## Not implemented
 
@@ -296,7 +318,8 @@ timeout), so one deployment serves every class. Local networks get a `MockLinkTo
 - **Jumbo draw size.** Jumbo's draw uses 12.3–13.2M of the 16.8M per-transaction cap, depending on
   the jury, with the operator gate. Each juror whose operator burns its whole stipend adds about 98k.
   With beacons, 33 such jurors of 50 still fit and 35 do not; without, 35 fit and 38 do not (measured
-  with the test operator, 2026-11-20). The round can then only be cancelled to the treasury after a
+  with the test operator, 2026-11-20, at 200 optimizer runs and before the pool payout, which adds a
+  keeper call of up to 80k gas). The round can then only be cancelled to the arbiter pool after a
   day. With selection in random order, a 15% cartel gets 34 seats with probability about 3 × 10⁻¹⁹ per
   round, so the draw stays one transaction.
 - **`setContracts` does not check that the beacon contract uses the same keeper** (its keeper is

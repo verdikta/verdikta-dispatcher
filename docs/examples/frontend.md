@@ -83,8 +83,9 @@ const AGGREGATOR_ABI = [
   'event FulfillAIEvaluation(bytes32 indexed aggRequestId, uint256[] aggregated, string justifications)',
   'event EvaluationFailed(bytes32 indexed aggRequestId, uint8 phase)',
   'event RoundSettled(bytes32 indexed aggRequestId, bool failed)',
-  'event RoundCancelled(bytes32 indexed aggRequestId, uint256 toTreasury)',
-  'event RequesterRefunded(bytes32 indexed aggRequestId, address indexed requester, uint256 amount)',
+  'event RoundCancelled(bytes32 indexed aggRequestId, uint256 toPool)',   // the amount goes to the arbiter pool
+  'event RequesterRefunded(bytes32 indexed aggRequestId, address indexed requester, uint256 amount)',   // requester 0 = the pool
+  'event CommitPayment(bytes32 indexed aggRequestId, address indexed payee, uint256 amount)',
 
   // Custom errors, so that a revert can be decoded by name
   'error InsufficientPayment()',
@@ -312,7 +313,7 @@ async function sendStep(signer, aggregatorAddress, requestId, step) {
 }
 ```
 
-Each step can fail because someone else sent it first (`WrongPhase()`), or a block too early (`TooEarly()`): read the phase again and carry on. `cancelUnsealed` sends the whole prepayment to the treasury, so it is worth sending only to tidy up; a frontend that draws promptly never needs it.
+Each step can fail because someone else sent it first (`WrongPhase()`), or a block too early (`TooEarly()`): read the phase again and carry on. `cancelUnsealed` sends the whole prepayment to the arbiter pool, so it is worth sending only to tidy up; a frontend that draws promptly never needs it.
 
 ### 4. Reading Evaluation Results
 
@@ -343,7 +344,7 @@ Scores are on the arbiters' 0 to 1,000,000 scale. A question that asks for one n
 
 ### 5. Dead Rounds
 
-A round still in the commit, closing or reveal phase at its `deadline` has failed, but `isFailed()` stays false until someone calls `settle()`. Until then its refund stays in the round. `nextStep()` returns `'settle'` for it. Settling credits the unspent prepayment back to the requester, except when M commits arrived and the round was never promoted: that refund goes to the treasury, so that nobody can abort a jury they dislike for a refund. New requests settle due rounds too (in queue order, until `settlePerRequest()` × their own K slots are spent), but a round not yet past its deadline stops that walk, so don't count on it.
+A round still in the commit, closing or reveal phase at its `deadline` has failed, but `isFailed()` stays false until someone calls `settle()`. Until then its refund stays in the round. `nextStep()` returns `'settle'` for it. Settling credits the unspent prepayment back to the requester, except when M commits arrived and the round was never promoted: then the slots that committed share it (`CommitPayment`), so that nobody can abort a jury they dislike for a refund. New requests settle due rounds too (in queue order, until `settlePerRequest()` × their own K slots are spent), but a round not yet past its deadline stops that walk, so don't count on it.
 
 ```javascript
 async function settleDeadRound(signer, aggregatorAddress, requestId) {
@@ -356,7 +357,7 @@ async function settleDeadRound(signer, aggregatorAddress, requestId) {
 }
 ```
 
-Calling `settle()` before the deadline reverts with `NotDue()`. The `RequesterRefunded` event names the address credited, which is the treasury in the cases above.
+Calling `settle()` before the deadline reverts with `NotDue()`. The `RequesterRefunded` event names the address credited: address(0), the arbiter pool, for the indivisible remainder of the committers' shares, if there is one.
 
 ### 6. Collecting Refunds and Rewards
 

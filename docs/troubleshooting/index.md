@@ -47,7 +47,7 @@ const value = required > credit ? required - credit : 0n;
 
 #### `SeedExpired()` / `DrawExpired()`
 - **Cause**: The draw came too late: `blockhash(B+1)` was not stored within 8,191 blocks (about 27 minutes on Base), or it is more than a day after the request
-- **Solution**: None for this round. `cancelUnsealed(aggId)` closes it, and the whole prepayment goes to the treasury (a refund would be a free re-roll). Draw promptly next time; `sealSeed(aggId)` stores the hash without drawing
+- **Solution**: None for this round. `cancelUnsealed(aggId)` closes it, and the whole prepayment goes to the arbiter pool (a refund would be a free re-roll). Draw promptly next time; `sealSeed(aggId)` stores the hash without drawing
 
 #### The commit phase stays open
 - **Cause**: It closes by itself at the M+-th commit (M + ⌈(K − M)/2⌉), or with a commit after T+ (155 s from the draw) that brings the count to at least M. If no commit comes after T+, it stays open
@@ -76,7 +76,7 @@ const value = required > credit ? required - credit : 0n;
 - **Solution**: Wait until after `deadline`. Promoted arbiters always get 120 seconds after `promote`, and a late close extends the deadline, so re-read it
 
 #### The beacon stage ended the round
-- **Cause**: Fewer than 2 beacon values were revealed within 120 seconds of the start. The second `drawJury` ends the round (`EvaluationFailed(aggId, 2)`), pays the beacons that answered, and sends the rest of the prepayment to the treasury
+- **Cause**: Fewer than 2 beacon values were revealed within 120 seconds of the start. The second `drawJury` ends the round (`EvaluationFailed(aggId, 2)`), pays the beacons that answered, and sends the rest of the prepayment to the arbiter pool
 - **Solution**: Send a new request. This is the cost of beacons: a refund would let a requester re-roll the seed
 
 ### Refunds and Withdrawals
@@ -86,8 +86,8 @@ const value = required > credit ? required - credit : 0n;
 - **Solution**: Leave the credit, which pays for your next request, or collect it with `withdrawEth()`
 
 #### There was no refund
-- **Cause**: Some endings send the unspent prepayment to the treasury: a round that had M commits but was never promoted, a missed beacon quorum, a beacon round whose jury could not be drawn when the keeper's walk did not cover the whole class, and a round cancelled with `cancelUnsealed`. `RequesterRefunded(aggId, to, amount)` names the address credited
-- **Solution**: Drive your rounds: draw promptly, and call `closeCommits` and `promote` when they are due. See [Fee Mechanisms](../advanced/fees.md#refunds-and-the-treasury)
+- **Cause**: Some endings give the requester nothing back. A round that had M commits but was never promoted pays its unspent prepayment to the slots that committed (`CommitPayment`). A missed beacon quorum, a beacon round whose jury could not be drawn when the keeper's walk did not cover the whole class, and a round cancelled with `cancelUnsealed` send it to the arbiter pool. `RequesterRefunded(aggId, to, amount)` names the address credited (address(0) for the pool)
+- **Solution**: Drive your rounds: draw promptly, and call `closeCommits` and `promote` when they are due. See [Fee Mechanisms](../advanced/fees.md#refunds-and-the-arbiter-pool)
 
 #### `NothingOwed()`
 - **Cause**: `withdrawEth()` by an address with no credit

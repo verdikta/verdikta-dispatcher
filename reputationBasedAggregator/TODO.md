@@ -776,6 +776,18 @@ the randomness exists.
 - **The one exception.** If nobody sealed or drew the round within the history window (8,191
   blocks, about 27 min), the round can never be drawn. A permissionless cancel then sends the prepay to the treasury. It must not refund the
   requester: a refund would be a free re-roll.
+- **No treasury (owner decision, 2026-11-25; commits 2d87e7a, 366e70c).** The treasury in the notes
+  here and below is history. A round with M commits that was never promoted now shares its unspent
+  prepay equally among the slots that committed (`CommitPayment`, counted in `rewards`): they did the
+  work, and anyone could have promoted. Every other forfeit (this cancel, a missed beacon quorum, a
+  seed-dependent draw failure after beacons, and the committers' indivisible remainder) credits the
+  arbiter pool, `ethOwed[address(0)]`, which nobody can withdraw. Each draw that draws a jury pays an
+  eighth of it to one registered arbiter that the keeper picks uniformly from the draw's seed
+  (`poolPayee`: two tries, skipping paused, banned, exiting and understaked; 80k gas, failure caught).
+  The seed is fixed by a block hash after the request and is the same whoever draws, a forfeiting
+  round never picks its own winner, and an eighth per draw makes grinding cost more than it wins. The
+  requester still gets nothing back. `setContracts(keeper, beacons)`; `treasury()` and
+  `TREASURY_ADDRESS` are gone. Optimizer runs 200 → 20 to fit (aggregator 24,500 B, 76 to spare).
 - **Lessons from the v2 example contracts** (reviewed 2026-11-18):
   - **A sealed round can become undrawable.** A selected arbiter could revert the draw by burning all
     gas in its operator or by returning malformed `owner()` data. Since the seed is fixed, the round

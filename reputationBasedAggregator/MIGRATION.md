@@ -85,8 +85,16 @@ comparing the two ABIs and the code that calls them.
   1,000,000, a one-outcome question would always score 1,000,000: one-number questions need a
   score mode that skips that step.
 - **Job gas limit.** The N-th counted reveal finalizes the round and pays for it: at Jumbo 1.3M gas
-  with one-number answers, 2.6M with two outcomes, 6.9M at 20 outcomes. Set the job's gas limit
+  with one-number answers, 2.6M with two outcomes, 6.9M at 20 outcomes (measured at optimizer runs 200; the build uses 20 since 2026-11-25, which can
+  cost somewhat more). Set the job's gas limit
   above the largest answer the class allows; a reveal that runs out of gas is lost.
+- **New earnings (2026-11-25).** An arbiter's owner can also be credited, in `ethOwed` like the fees:
+  - a committer's share (`CommitPayment`) when a round it committed in had M commits but was never
+    promoted;
+  - an arbiter pool payout (`PoolPayment`) at any jury draw, while the arbiter is registered and not
+    paused, banned, exiting or understaked. It need not be on that jury.
+
+  Nodes need no change for either; a dashboard that sums earnings should add both events.
 - **Posted fees and the floor (item 8).** A request may set a fee floor, and every juror is then paid
   at least the floor. Selection weighs the fee the requester pays, so a fee posted below a round's
   floor gains no weight there. A fee at or below the request's base cost now gets the full fee boost
@@ -106,21 +114,28 @@ comparing the two ABIs and the code that calls them.
 | `getAggregationStatus(aggId)` → `isComplete, failed, …` | `getRoundInfo(aggId)` → `phase, …`. Settled = phase 7 (settled) or 8 (failed); `isFailed(aggId)`. After the escrow fields it also returns `deadline` (0 until the draw; `settle` is due after it), `windowEnd` (0 until the draw, then the draw time + the request's T+; changed 2026-11-25), `commits` and `requestTime` (added 2026-11-23, for consumers' on-chain views) |
 | `getEvaluation(aggId)` | same; valid from finalization (phase 6), before settlement |
 | `responseTimeoutSeconds()` | none: the jury's `timeout`, run from the draw, not the request |
+| (none; v2 drafts until 2026-11-25 had `treasury()`) | none: `treasury()` is removed and there is no treasury. Prepay that is not refunded goes to the committers of a never-promoted round or to the arbiter pool (changed 2026-11-25) |
+| (none; v2 drafts had `setContracts(keeper, beacons, treasury)`) | `setContracts(keeper, beacons)`: two arguments; reverts `InvalidConfig` only for a zero keeper. The deploy no longer reads `TREASURY_ADDRESS` (changed 2026-11-25) |
+| (none) | new events: `CommitPayment(aggId, payee, amount)`, one per committed slot of a never-promoted round, at settlement; `PoolPayment(aggId, payee, amount)`, an arbiter pool payout at a draw (declared in `AggregatorLib`, emitted in the aggregator's context: include it in the ABI you decode with). `RequesterRefunded(aggId, address(0), amount)` now marks a credit to the pool (added 2026-11-25) |
+| (none) | the arbiter pool: `ethOwed(address(0))`, which nobody can withdraw (`withdrawEthFor(address(0))` reverts `NotAuthorized`). Each `drawJury` that draws a jury pays an eighth of it to one registered arbiter picked by the keeper's new `poolPayee(seed)`; the keeper also has `registryLength()` (added 2026-11-25) |
 
 Behaviour BountyEscrow must allow for:
 
 - **The submission stays `PendingVerdikta` until drawn, and an undrawn round never times out.**
   `failTimedOutSubmission` must not treat it as failed.
 - **Draw within a day.** `drawJury` reverts with `DrawExpired` more than a day after the request; the
-  round can then only be cancelled (to the treasury, below).
+  round can then only be cancelled (to the arbiter pool, below).
 - **No refund when the round ends this way.** A refund would be a free re-roll, so the unspent prepay
-  goes to the treasury:
-  - a missed beacon quorum (phase 8, `EvaluationFailed(aggId, 2)`);
+  does not come back:
   - a commit phase that had M commits but was never promoted (closed and not promoted, or nobody
-    called `closeCommits` after T+);
-  - a cancelled round (phase 9: never sealed within ~27 min, or sealed but undrawn for a day);
-  - a beacon round whose jury can't be drawn once the beacon values are in, when the class list is
-    longer than the keeper's `maxScan` (`keeper.scansAll(cls)` is false). The beacons are still paid.
+    called `closeCommits` after T+): the slots that committed share it equally (`CommitPayment`),
+    and only the indivisible remainder goes to the arbiter pool;
+  - these go to the arbiter pool (`ethOwed(address(0))`, `RequesterRefunded(aggId, address(0), amount)`,
+    or `RoundCancelled` for a cancel):
+    - a missed beacon quorum (phase 8, `EvaluationFailed(aggId, 2)`);
+    - a cancelled round (phase 9: never sealed within ~27 min, or sealed but undrawn for a day);
+    - a beacon round whose jury can't be drawn once the beacon values are in, when the class list is
+      longer than the keeper's `maxScan` (`keeper.scansAll(cls)` is false). The beacons are still paid.
 
   The hunter may re-run (item 12), but its `refundLeftoverEth` gets nothing back for that round.
 - **Refunds land in `ethOwed[wallet]`:**

@@ -40,14 +40,15 @@ Create a `.env` file in `reputationBasedAggregator/`.
 | `PRIVATE_KEY_2` | Second key (optional) |
 | `INFURA_API_KEY` | Infura project ID, unless `BASE_RPC_URL` / `BASE_SEPOLIA_RPC_URL` are set |
 
-### Token and Treasury Variables
+### Token Variables
 
 | Variable | Network | Description |
 |----------|---------|-------------|
 | `WRAPPED_VERDIKTA_TOKEN_BASE` | Base mainnet | The stake token for the keeper |
 | `WRAPPED_VERDIKTA_TOKEN_BASE_SEPOLIA` | Base Sepolia | Same, testnet |
 | `WRAPPED_VERDIKTA_TOKEN` | any other non-local network | Fallback |
-| `TREASURY_ADDRESS` | all | Receives the refunds that would be free re-rolls (see [Fee Mechanisms](../advanced/fees.md#refunds-and-the-treasury)). Default: the aggregator's current treasury, which is the deployer after the constructor |
+
+There is no treasury to configure: `TREASURY_ADDRESS` is no longer read (an older `.env` may still set it; it is ignored). The prepay that would be a free re-roll goes to the round's committers or to the aggregator's arbiter pool (see [Fee Mechanisms](../advanced/fees.md#refunds-and-the-arbiter-pool)).
 
 ### Verification and Other Variables
 
@@ -126,7 +127,7 @@ The LINK address is chosen by network (Base, Base Sepolia); local networks get a
    - `keeper.setApproved(aggregator, true)`: the aggregator selects juries and reports outcomes;
    - `keeper.setApproved(beacons, true)`: JuryBeacons picks beacons;
    - `beacons.setApproved(aggregator, true)`: the aggregator starts beacon stages;
-   - `aggregator.setContracts(keeper, beacons, treasury)`, with `TREASURY_ADDRESS` or the current treasury.
+   - `aggregator.setContracts(keeper, beacons)`: two arguments, the keeper and the beacon contract.
 
 `setContracts` does not check that the beacon contract uses the same keeper, which is why the script deploys them as a pair. Don't swap the keeper while rounds await settlement, or the beacon contract while a round is in its beacon stage.
 
@@ -245,7 +246,7 @@ with `libraries.js` exporting `{ AggregatorLib: "<address>", ScoringLib: "<addre
    ```javascript
    await aggregator.keeper();     // the keeper's address, not address(0)
    await aggregator.beacons();    // JuryBeacons
-   await aggregator.treasury();
+   await aggregator.ethOwed(ethers.ZeroAddress);   // the arbiter pool: 0 on a fresh deployment
    await keeper.approvedContracts(aggregator.target);   // true
    await keeper.isContractApproved(aggregator.target);  // true (what operators ask)
    await keeper.approvedContracts(beacons.target);      // true
@@ -277,7 +278,7 @@ with `libraries.js` exporting `{ AggregatorLib: "<address>", ScoringLib: "<addre
 
 | Project | Solidity Version | Optimizer | viaIR |
 |---------|-----------------|-----------|-------|
-| reputationBasedAggregator | 0.8.30 | 200 runs | Yes |
+| reputationBasedAggregator | 0.8.30 | 20 runs (200 until 2026-11-25; lowered to fit the aggregator under the 24,576-byte limit: 24,500 B) | Yes |
 | reputationBasedSingleton | 0.8.30 | 200 runs | Yes |
 | arbiterOperator | 0.8.19 | 200 runs | No |
 | simpleContract | 0.8.21 | 200 runs | No |

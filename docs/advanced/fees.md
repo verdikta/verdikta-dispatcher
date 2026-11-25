@@ -3,13 +3,13 @@
 Every fee, who pays it, when it is credited, and how payment flows through the Verdikta Dispatcher system end to end.
 
 !!! note "Checked against the code (v2)"
-    Rewritten on 2026-11-25 for the v2 contracts on the `beacon` branch, in [`reputationBasedAggregator/contracts`](https://github.com/verdikta/verdikta-dispatcher/tree/beacon/reputationBasedAggregator/contracts). v2 is not deployed yet; its addresses are set at the v2 deployment. The quotes in the worked examples were checked by calling `maxTotalFee` on the v2 contracts, and the Small round's accounting by running one on Hardhat's in-process network. The ReputationAggregator is paid in ETH. ReputationSingleton and SimpleContract are legacy contracts, still paid in LINK and written for the v1 keeper. Values that the owner can change are given with the function that returns the current value. For the v1 aggregator (`maxTotalFee(fee) = fee × (K + B × P)`, all base fees credited at the request, `finalizeEvaluationTimeout`) see the `aggregator-v0.1.0` tag and the [ETH payment history](eth-payment-migration.md).
+    Rewritten on 2026-11-25 for the v2 contracts on the `beacon` branch, in [`reputationBasedAggregator/contracts`](https://github.com/verdikta/verdikta-dispatcher/tree/beacon/reputationBasedAggregator/contracts). v2 is not deployed yet; its addresses are set at the v2 deployment. The quotes in the worked examples were checked by calling `maxTotalFee` on the v2 contracts, and the Small round's accounting by running one on Hardhat's in-process network. The committer-share and pool figures, added on 2026-11-25, are computed from the code's formulas, not from a run. The ReputationAggregator is paid in ETH. ReputationSingleton and SimpleContract are legacy contracts, still paid in LINK and written for the v1 keeper. Values that the owner can change are given with the function that returns the current value. For the v1 aggregator (`maxTotalFee(fee) = fee × (K + B × P)`, all base fees credited at the request, `finalizeEvaluationTimeout`) see the `aggregator-v0.1.0` tag and the [ETH payment history](eth-payment-migration.md).
 
 ## Token Overview
 
 | Token | Purpose | Held By |
 |-------|---------|---------|
-| **ETH** | Pays for evaluations made through the ReputationAggregator: base fees, bonuses, beacon payments and the draw and promote rewards | Requesters, the aggregator (escrow and the `ethOwed` ledger), arbiter owners, the treasury |
+| **ETH** | Pays for evaluations made through the ReputationAggregator: base fees, bonuses, beacon payments and the draw and promote rewards | Requesters, the aggregator (escrow, the `ethOwed` ledger and the arbiter pool in it), arbiter owners |
 | **LINK** (Chainlink) | Pays arbiters of the legacy ReputationSingleton and SimpleContract. The aggregator still sends its requests over the Chainlink request path, with a LINK amount of zero, and holds no LINK | Requesters of the legacy contracts, those contracts, operators |
 | **VDKA** (Wrapped Verdikta) | Staked by arbiter operators in the ReputationKeeper | Arbiter operators, the ReputationKeeper |
 
@@ -65,11 +65,13 @@ with the defaults B = `bonusMultiplier()` = 3, `drawRewardFees()` = 2, `promoteR
 | **Draw reward** | `eff × drawRewardFees` (2 × eff) (`JuryDrawn`) | At the draw | The caller of the drawing `drawJury`: the requester within `requesterDrawPriority()` (30 s) of the request, anyone after that. A third party drawing earlier gets nothing, and the amount stays in the refund |
 | **Promote reward** | `eff × promoteRewardFees` (1 × eff) | At `promote` | Its caller, whoever it is |
 | **Beacon payment** | `max(eff, minFee)` per used beacon value (`BeaconPayment`) | At the second `drawJury`, also when the quorum was missed | The operator owner of each beacon whose value was used |
-| **Refund** | `received − baseFees − bonuses − rewards` (`RequesterRefunded`) | When the round ends; see [Refunds and the Treasury](#refunds-and-the-treasury) | The requester, or the treasury |
+| **Committer share** | `(received − baseFees − bonuses − rewards) / commits` per committed slot (`CommitPayment`) | At `settle`, only for a round with at least M commits that was never promoted | The owner of each committed slot's operator, read at the draw |
+| **Refund** | `received − baseFees − bonuses − rewards` (`RequesterRefunded`) | When the round ends; see [Refunds and the Arbiter Pool](#refunds-and-the-arbiter-pool) | The requester, or the arbiter pool (`address(0)`) |
+| **Pool payout** | `ethOwed(address(0)) / 8` (`PoolPayment`) | At every `drawJury` that draws a jury, from the pool, not from that round's prepay | One registered arbiter's operator owner, picked from the draw's seed |
 
 A juror keeps its base fee whether or not it answers: a fee conditional on committing would reward fake commits, and silence is handled by the [reputation rules](reputation.md). A slot whose request could not be dispatched (its operator's `owner()` unreadable, or the dispatch reverted; `SlotSkipped`) is not credited, and its fee stays in the refund. In a thin pool one arbiter can hold several slots; it is paid per slot.
 
-Beacons are paid the round's **ceiling** (or the floor, if higher), not their posted fee. The bonus is paid to exactly P reveals (the cluster), on each one's paid fee, so it is at most `B × P × juror`. `getRoundInfo(aggId)` returns `received`, `baseFees`, `bonuses` and `rewards` (draw and promote rewards and beacon payments together); `getSlot(aggId, i).fee` is the fee a slot was paid.
+Beacons are paid the round's **ceiling** (or the floor, if higher), not their posted fee. The bonus is paid to exactly P reveals (the cluster), on each one's paid fee, so it is at most `B × P × juror`. `getRoundInfo(aggId)` returns `received`, `baseFees`, `bonuses` and `rewards` (draw and promote rewards, beacon payments and committer shares together); `getSlot(aggId, i).fee` is the fee a slot was paid.
 
 #### Worked Example: Small
 
@@ -85,6 +87,10 @@ maxTotalFee = 0.00015 × (6 + 3 × 3) + 0.00015 × (2 + 1) = 0.00015 × 18 = 0.0
 |---------|--------------------|-------------------------|
 | Round completes | base 6 × 0.00002 = 0.00012; bonus 3 × 3 × 0.00002 = 0.00018; draw reward 0.0003; promote reward 0.00015 | 0.0027 − 0.00075 = **0.00195 ETH** |
 | Round dies in the commit phase with fewer than 5 commits (settled) | base 0.00012; draw reward 0.0003 | 0.0027 − 0.00042 = 0.00228 ETH |
+| All 6 commit, the phase closes, but nobody sends `promote` (settled) | base 0.00012; draw reward 0.0003; 0.00228 shared by the 6 committed slots, 0.00038 each (`CommitPayment`) | **0** |
+| 5 commit, nobody closes the phase or promotes (settled) | base 0.00012; draw reward 0.0003; 0.00228 shared by the 5 committed slots, 0.000456 each | **0** |
+
+In the last two rows 0.00228 ETH divides evenly, so nothing is left for the arbiter pool. The rows assume a third party earned the draw reward; had the requester drawn within 30 s, that 0.0003 would be its credit and the shares would be 0.00038 ETH smaller in total, since the unspent prepay is what is left after the draw reward.
 
 If the requester draws its own round within 30 seconds, the draw reward (0.0003 ETH) is credited to it as well: a completed round then costs it 0.00045 ETH, or 0.0003 ETH if it also sends `promote`. The bounty program's Small class sets no floor, so its cost per round follows the arbiters' posted fees. Network gas comes on top.
 
@@ -111,27 +117,35 @@ Each juror is paid the floor, 0.00011 ETH, since its posted fee is lower. If the
 
 The requester's priority for the draw runs from the second beacon value (`readyAt`), not from the request. If it draws and promotes itself, the round costs it 0.01191 ETH. Every attempt costs at least K × floor plus the beacons, here 0.0055 + 0.0008 ETH, whatever the arbiters post: that is what the floor is for.
 
+If instead the phase closes at the M+-th commit (44) and nobody promotes, the round spends the base fees, the beacons and the draw reward (0.0071 ETH), and the 44 committed slots share the other 0.0353 ETH at settlement: 802,272,727,272,727 wei each, with the indivisible 12 wei credited to the arbiter pool (`RequesterRefunded(aggId, address(0), 12)`). The requester gets nothing back.
+
+#### Worked Example: the Pool
+
+Suppose a cancelled Small round has put its whole 0.0027 ETH in the arbiter pool and nothing else is in it. The next `drawJury` that draws a jury, in any round, pays 0.0027 / 8 = 0.0003375 ETH to one registered arbiter (`PoolPayment`), leaving 0.0023625 ETH; the draw after that pays an eighth of what is left, and so on. If the keeper's two picks both land on paused, banned, exiting or understaked arbiters, that draw pays nobody and the pool stays as it was.
+
 #### The Fee Floor
 
 The floor (item 8) makes repeated attempts expensive: a requester who re-submits until it gets a jury it likes pays at least `K × minFee` per attempt. Selection also scores the fee the requester pays, so below the floor every arbiter weighs the same, and a near-zero posted fee wins no extra weight. The floor deters only a requester who cannot choose it. In the bounty program that is the bounty creator's setting, passed into every request for the bounty; it protects nothing when a submitter calls the aggregator directly with its own floor.
 
-#### Refunds and the Treasury
+#### Refunds and the Arbiter Pool
 
-The refund, `received − baseFees − bonuses − rewards`, is credited once, when the round ends. Where it goes depends on how the round ended. Whenever a refund would let a requester throw away a jury it dislikes and draw again for the price of the base fees (a free re-roll), the refund goes to the treasury instead.
+The refund, `received − baseFees − bonuses − rewards`, is credited once, when the round ends. Where it goes depends on how the round ended. Whenever a refund would let a requester throw away a jury it dislikes and draw again for the price of the base fees (a free re-roll), the requester gets nothing back: a round that had M commits but was never promoted pays it to the slots that committed, and every other such round sends it to the arbiter pool. v2 has no treasury: v2 drafts before 2026-11-25 sent these amounts to one.
 
 | How the round ended | When | Refund to |
 |---------------------|------|-----------|
 | Result (phase 6) | at finalization | requester |
 | Draw found no eligible arbiter (phase 8) | at the draw | requester (no jury could be drawn) |
 | Beacon stage: fewer candidates than the quorum (phase 8) | at the first `drawJury` | requester |
-| Beacon quorum missed by the deadline (phase 8) | at the second `drawJury`; the beacons that answered are paid | **treasury** |
-| No jury after the beacon stage (phase 8) | at the second `drawJury`; the beacons are paid | requester if the keeper's walk covers the whole class list (`scansAll(class)`), else **treasury** |
+| Beacon quorum missed by the deadline (phase 8) | at the second `drawJury`; the beacons that answered are paid | **arbiter pool** |
+| No jury after the beacon stage (phase 8) | at the second `drawJury`; the beacons are paid | requester if the keeper's walk covers the whole class list (`scansAll(class)`), else **arbiter pool** |
 | Dead in the commit phase with fewer than M commits (phase 8) | at `settle` | requester |
-| Dead with at least M commits but never promoted, closed or not (phase 8) | at `settle` | **treasury** |
+| Dead with at least M commits but never promoted, closed or not (phase 8) | at `settle` | **the committed slots**, in equal shares (`CommitPayment`); the remainder, under one wei per committer, to the **arbiter pool** |
 | Dead in the reveal phase: fewer than N reveals (phase 8) | at `settle` | requester |
-| Never drawable: unsealed for 8,191 blocks, or undrawn a day after the request (phase 9) | `cancelUnsealed`: the whole prepayment | **treasury** |
+| Never drawable: unsealed for 8,191 blocks, or undrawn a day after the request (phase 9) | `cancelUnsealed`: the whole prepayment | **arbiter pool** (`RoundCancelled`) |
 
-The `RequesterRefunded(aggId, to, amount)` event names the address credited. A dead round's refund waits until someone calls `settle(aggId)` after the deadline. New requests also settle due rounds, in queue order, until `settlePerRequest()` (2) × their own K slots are spent; the last round settled may overshoot, so the first due round is always settled, whatever its size. The walk stops at the first round not yet past its deadline, so a long-timeout round at the head holds back shorter ones behind it, and `settlePerRequest = 0` turns this off. Call `settle` yourself.
+The `RequesterRefunded(aggId, to, amount)` event names the address credited, address(0) for the pool; it fires only for a non-zero amount.
+
+**The arbiter pool** is the ledger entry `ethOwed(address(0))`. Nobody can withdraw it: `withdrawEthFor(address(0))` reverts `NotAuthorized()`, and `msg.sender` is never address(0). Every `drawJury` that draws a jury pays an eighth of it to one registered arbiter's payee (its operator's `owner()`), picked uniformly by the keeper's `poolPayee(seed)` from that draw's seed. The keeper makes at most two picks and skips arbiters that are paused, banned, exiting or understaked; if both miss, nobody is paid and the pool waits for the next draw. The call is capped at 80,000 gas, so it cannot make the draw fail. The seed is fixed by a block hash after the request and is the same whoever draws, a forfeiting round never picks its own winner, and an eighth per draw makes grinding with many requests cost more than it wins. A dead round's refund waits until someone calls `settle(aggId)` after the deadline. New requests also settle due rounds, in queue order, until `settlePerRequest()` (2) × their own K slots are spent; the last round settled may overshoot, so the first due round is always settled, whatever its size. The walk stops at the first round not yet past its deadline, so a long-timeout round at the head holds back shorter ones behind it, and `settlePerRequest = 0` turns this off. Call `settle` yourself.
 
 #### ETH Flow Diagram
 
@@ -146,7 +160,10 @@ Requester Wallet
           (at the second draw, with beacons:)            ├── max(eff, floor) ──→ ethOwed[beacon owner] × used values
           (at promote:)                                  ├── 1 × eff ──→ ethOwed[promote caller]
           (at finalization, for each of the P clustered:)├── paid fee × B ──→ ethOwed[operator owner]
-          (when the round ends:)                         └── the rest ──→ ethOwed[requester] or ethOwed[treasury]
+          (when the round ends:)                         └── the rest ──→ ethOwed[requester], or the committed slots'
+                                                                          owners (never promoted), or ethOwed[address(0)]
+
+ethOwed[address(0)], the arbiter pool ── 1/8 at each jury draw ──→ ethOwed[a random registered arbiter's owner]
 
 ethOwed[address] ──→ withdrawEth() ──→ that address's wallet
 ```
@@ -161,7 +178,7 @@ Every payment above is an entry in the contract's `ethOwed` ledger, not a transf
 - `withdrawEthFor(payee)` sends `payee`'s whole balance to `payee`. Only `payee` or the contract owner can call it, and the ETH always goes to `payee`.
 - A requester's credit is used automatically for that requester's next request, for whatever `msg.value` does not cover.
 
-The owner cannot take ETH out of the aggregator any other way; the treasury is credited like any other payee.
+The owner cannot take ETH out of the aggregator any other way, and nobody can withdraw the arbiter pool: `withdrawEthFor(address(0))` reverts `NotAuthorized()`. The pool leaves only through its payouts to arbiters.
 
 ### ReputationSingleton (legacy, LINK)
 
@@ -276,7 +293,7 @@ Either the operator's owner or the keeper owner can run both steps, also for a f
 
 ### Burns
 
-Burned VDKA is burned with the token's `burn`, or sent to `0x…dEaD` if the token has none. Slashed stake never goes to a requester, a reporter or the treasury: paying anyone from slashing would reward making other arbiters fail. Both burns are off by default.
+Burned VDKA is burned with the token's `burn`, or sent to `0x…dEaD` if the token has none. Slashed stake never goes to a requester, a reporter or the aggregator's arbiter pool: paying anyone from slashing would reward making other arbiters fail. Both burns are off by default.
 
 ## Fee Configuration
 
@@ -293,7 +310,8 @@ The constructor sets the defaults; `deploy/03_config.js` sets the request bounds
 | `requesterDrawPriority` | 30 s | `setRewards(...)` | Seconds in which only the requester earns the draw reward |
 | `promoteRewardFees` | 1 | `setRewards(...)` | Promote reward, in multiples of eff. Stored per round |
 | `maxJury`, `maxTimeout`, `tPlus` | 50, 3,600 s, 155 s | `setLimits(maxJury, maxTimeout, tPlus)` | Bounds on the request's jury; no timeout may exceed 1 day, whatever `maxTimeout` says |
-| `treasury` | the deployer | `setContracts(keeper, beacons, treasury)` | Receives the refunds that would be re-rolls |
+
+There is no treasury setting: `setContracts(keeper, beacons)` takes only the keeper and the beacon contract, and the forfeits go to the committers or the arbiter pool. The pool's share per draw (1/8) and the keeper call's gas cap (80,000) are constants in `AggregatorLib`.
 
 The beacon quorum is `JuryBeacons.quorum()` (2 by default), set with `JuryBeacons.setParams(polled, quorum, timeout)`; each round stores it at request.
 
@@ -349,7 +367,7 @@ The v2 ReputationAggregator has no `withdrawLink`: it holds no LINK. It has no E
 ### For Arbiter Operators
 
 1. **Set competitive fees**: a lower fee raises the selection weight (see [fee weighting](oracle-selection.md#weight)), but only down to the round's floor: below it every arbiter costs the requester the same.
-2. **Earnings per round**, in ETH: `max(fee, floor)` for every slot the arbiter is drawn for, `B × max(fee, floor)` more if its reveal is in the cluster, and `max(ceiling, floor)` for a used beacon value.
+2. **Earnings per round**, in ETH: `max(fee, floor)` for every slot the arbiter is drawn for, `B × max(fee, floor)` more if its reveal is in the cluster, and `max(ceiling, floor)` for a used beacon value. If it committed in a round that had M commits but was never promoted, an equal share of that round's unspent prepay. And while it is registered and not paused, banned, exiting or understaked, any jury draw may pick it for an eighth of the arbiter pool (`PoolPayment`), whether or not it is on that jury.
 3. **Collect them**: they are credited to the address that the operator contract's `owner()` returned at the draw (or at the beacon payment). That address calls `withdrawEth()` on the aggregator; `ethOwed(address)` shows the balance.
 
 ### Cost Comparison
@@ -358,4 +376,4 @@ The v2 ReputationAggregator has no `withdrawLink`: it holds no LINK. It has no E
 |----------|---------|----------|----------|---------|
 | SimpleContract (legacy) | LINK | `2 × fee` | `2 × fee` | Fixed: base + bonus |
 | ReputationSingleton (legacy) | LINK | `2 × oracleFee` | `2 × maxOracleFee` | 2 × selected oracle's fee |
-| ReputationAggregator (v2) | ETH | nothing if no arbiter is eligible; otherwise at least the K base fees, less the rewards the requester earns back | the quote, `maxTotalFee` (a cancelled round sends all of it to the treasury) | Base fees + bonuses + beacons + rewards; the rest is refunded unless the round ended in a way that would be a re-roll |
+| ReputationAggregator (v2) | ETH | nothing if no arbiter is eligible; otherwise at least the K base fees, less the rewards the requester earns back | the quote, `maxTotalFee` (a cancelled round sends all of it to the arbiter pool) | Base fees + bonuses + beacons + rewards; the rest is refunded unless the round ended in a way that would be a re-roll |

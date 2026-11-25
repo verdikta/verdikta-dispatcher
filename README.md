@@ -52,7 +52,7 @@ Decentralized oracle infrastructure for AI-powered evaluation and dispute resolu
 
 - Read `maxTotalFee(maxFee, minFee, withBeacons, K, P)` for the worst-case budget of a round with that jury, in **ETH wei** (v1: `maxTotalFee(maxOracleFee)`). The aggregator takes from the requester's existing `ethOwed` credit only what `msg.value` does not cover. Keep enough additional ETH for gas.
 - `requestAIEvaluationWithApproval` retains its historical name, but the current aggregator needs **no LINK approval or LINK balance** from the requester. Chainlink request/response transport remains in use with a zero-LINK payment.
-- When the round ends, any unspent prepayment becomes `ethOwed` credit, except where a refund would be a free re-roll of the jury (then it goes to the treasury). It can fund another request or be claimed with `withdrawEth()`; arbiter owners, and whoever earned the draw and promote rewards, also withdraw their credited ETH from the aggregator. The worst-case prepayment is a budget, not a promise that part of it will be refunded.
+- When the round ends, any unspent prepayment becomes `ethOwed` credit, except where a refund would be a free re-roll of the jury: then a round that had M commits but was never promoted pays it to the slots that committed, and the other cases send it to the arbiter pool, which pays an eighth of itself to one random registered arbiter at each jury draw. There is no treasury. The credit can fund another request or be claimed with `withdrawEth()`; arbiter owners, and whoever earned the draw and promote rewards, also withdraw their credited ETH from the aggregator. The worst-case prepayment is a budget, not a promise that part of it will be refunded.
 
 See [Fee Mechanisms](docs/advanced/fees.md) and the [integration examples](docs/examples/index.md). The `scripts/` in `reputationBasedAggregator/` (such as `single-query.js` and `refund.js`) are v1 and not yet ported to v2; the [ETH payment note](docs/advanced/eth-payment-migration.md) is the v1 design history. For Verdikta Bounties, use its [current agent/API guide](https://bounties.verdikta.org/agents.txt): bounty rewards, evaluation prepayment, and network gas are separate ETH costs.
 
@@ -143,7 +143,7 @@ Key pages:
 - [Reputation System](docs/advanced/reputation.md) — two scores, points per round, settlement codes, blocks, bans and the freeze
 - [Oracle Selection](docs/advanced/oracle-selection.md) — the two-phase draw, beacons, the shortlist, and K drawn → M promoted → N counted → P clustered
 - [Security Model](docs/advanced/security.md) — the v2 threat model
-- [Fee Mechanisms](docs/advanced/fees.md) — the quote, fee ceiling and floor, rewards, refunds and the treasury, with worked examples
+- [Fee Mechanisms](docs/advanced/fees.md) — the quote, fee ceiling and floor, rewards, refunds, committer shares and the arbiter pool, with worked examples
 - [Integration Walkthrough](docs/examples/integration.md) — a v2 client contract and a Node script that drives its round
 - [Integration Examples](docs/examples/index.md) — client contracts, a Hardhat test and frontend code for the v2 aggregator
 - [MIGRATION.md](reputationBasedAggregator/MIGRATION.md) — v1 → v2 for BountyEscrow, arbiter nodes, operators and scripts

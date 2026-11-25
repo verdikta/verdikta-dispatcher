@@ -31,13 +31,13 @@ interface IJuryBeacons {
  *     drawer earns 2 x the per-arbiter fee (the requester only, for the first 30 s). Block hashes are
  *     read with BLOCKHASH within 256 blocks (51 s at Base's 0.2 s blocks) and from the EIP-2935
  *     history contract up to 8,191 blocks (~27 min). Rounds never expire before the draw; a round
- *     whose seed was never sealed within that window is cancelled to the treasury, never refunded (a
- *     refund would be a free re-roll). A draw that finds no eligible arbiter fails and refunds;
+ *     whose seed was never sealed within that window is cancelled to the arbiter pool, never refunded
+ *     (a refund would be a free re-roll). A draw that finds no eligible arbiter fails and refunds;
  *   - optional beacons (item 9's per-request flag, for Jumbo): the first drawJury() starts the beacon
  *     stage in JuryBeacons, a second one draws with keccak256(aggId, blockhash(B+1), mix of the first
  *     `quorum` beacon values) once they are in. Each used beacon is paid one fee. If the quorum is
  *     missed by the beacon deadline the round ends with no result and the unspent prepay goes to the
- *     treasury (a refund would be a free re-roll);
+ *     arbiter pool (a refund would be a free re-roll);
  *   - M+ / T+ promotion (item 14): the commit phase closes at the M+-th commit (M+ = M + ceil((K-M)/2)),
  *     or once T+ has passed since the draw with at least M commits. Closing records block C, and
  *     promote() draws M of all commits received from block C+2 with
@@ -60,7 +60,11 @@ interface IJuryBeacons {
  *     scales off that, so a requester can make every attempt cost at least K x minFee. Eligibility
  *     still uses the ceiling only;
  *   - commits bound to the round (items 4 and 5): keccak256(abi.encode(aggId, operator, response, salt)),
- *     all 32 bytes, with a 128-bit salt, so no commit can be opened two ways in practice.
+ *     all 32 bytes, with a 128-bit salt, so no commit can be opened two ways in practice;
+ *   - no treasury: a round with M commits that was never promoted shares its unspent prepay equally among
+ *     the slots that committed (CommitPayment); every other forfeit credits the arbiter pool
+ *     (ethOwed[address(0)], which nobody can withdraw), and each successful draw pays an eighth of the
+ *     pool to one registered arbiter that the keeper picks from the draw's seed (PoolPayment).
  *   Calls to arbiter contracts get a fixed gas stipend, and every call whose failure is tolerated
  *   first checks that enough gas is left, so neither an arbiter (gas bomb) nor a caller (a tight
  *   gas limit) can make one slot, or the keeper's settlement, fail on purpose.
@@ -79,11 +83,11 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
     uint8 private constant PH_FINAL = 6;          // aggregated, awaiting settlement
     uint8 private constant PH_SETTLED = 7;
     uint8 private constant PH_FAILED = 8;         // failed and settled
-    /// @dev The arbiter pool (where v1-style "treasury" forfeits go): the ledger entry ethOwed[address(0)],
-    ///      which nobody can withdraw (msg.sender is never address(0), and withdrawEthFor refuses it). Each
-    ///      draw pays an eighth of it to one registered arbiter (AggregatorLib.payPool).
+    /// @dev The arbiter pool (it replaces the treasury of earlier v2 drafts): the ledger entry
+    ///      ethOwed[address(0)], which nobody can withdraw (msg.sender is never address(0), and withdrawEthFor
+    ///      refuses it). Each draw pays an eighth of it to one registered arbiter (AggregatorLib.payPool).
     address private constant POOL = address(0);
-    uint8 private constant PH_CANCELLED = 9;      // never drawable: prepay sent to the treasury
+    uint8 private constant PH_CANCELLED = 9;      // never drawable: prepay sent to the arbiter pool
 
     uint8 private constant S_DISPATCHED = 1;
     uint8 private constant S_COMMITTED = 2;
@@ -207,13 +211,15 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
     event PoolPayment(bytes32 indexed aggRequestId, address indexed payee, uint256 amount);
     /// @notice A never-promoted round's unspent prepay, shared by the slots that committed (one per slot)
     event CommitPayment(bytes32 indexed aggRequestId, address indexed payee, uint256 amount);
-    event RoundCancelled(bytes32 indexed aggRequestId, uint256 toTreasury);
+    /// @notice An undrawable round cancelled: its whole prepay credits the arbiter pool
+    event RoundCancelled(bytes32 indexed aggRequestId, uint256 toPool);
     event RevealReceived(bytes32 indexed aggRequestId, uint256 pollIndex, bool late, uint8 qcode);
     event FulfillAIEvaluation(bytes32 indexed aggRequestId, uint256[] aggregated, string justifications);
     event EvaluationFailed(bytes32 indexed aggRequestId, uint8 phase);
     event RoundSettled(bytes32 indexed aggRequestId, bool failed);
     event BasePayment(bytes32 indexed aggRequestId, uint256 pollIndex, address indexed payee, uint256 amount);
     event BonusPayment(bytes32 indexed aggRequestId, uint256 pollIndex, address indexed payee, uint256 amount);
+    /// @notice Unspent prepay credited: to the requester, or to the arbiter pool when `requester` is address(0)
     event RequesterRefunded(bytes32 indexed aggRequestId, address indexed requester, uint256 amount);
     event EthWithdrawn(address indexed payee, uint256 amount);
     /// @dev reason: 1 owner() reverted, 2 commit dispatch reverted, 3 reveal dispatch reverted, 4 keeper call reverted
@@ -284,7 +290,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         uint256 required = maxTotalFee(maxFee, minFee, withBeacons, j.K, j.P);
         if (required > type(uint88).max) revert BadInput();   // so every credited total fits its field
         // credit covers only what msg.value does not; any excess value goes back to credit, so the
-        // escrow is exactly `required` (a treasury path never takes more than the round's prepay)
+        // escrow is exactly `required` (a forfeit to the pool never takes more than the round's prepay)
         uint256 fromCredit = msg.value < required ? required - msg.value : 0;
         uint256 credit = ethOwed[msg.sender];
         if (credit < fromCredit) revert InsufficientPayment();
@@ -370,15 +376,19 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
      *         whoever draws after 30 s (a third party drawing earlier earns nothing). If no arbiter was
      *         eligible at B the round fails and the requester is refunded: no jury could be drawn, so
      *         the refund is no re-roll. After a beacon stage that holds only if the selection walk
-     *         covers the whole class list; otherwise the prepay goes to the treasury.
+     *         covers the whole class list; otherwise the prepay goes to the arbiter pool.
      *
      *         With beacons, the first call only starts the beacon stage (no reward) and the draw needs
      *         a second call once the quorum is in; the 30 s priority then runs from the quorum-th value.
      *         A second call after the beacon deadline without the quorum ends the round: the beacons
-     *         that answered are paid and the rest of the prepay goes to the treasury.
+     *         that answered are paid and the rest of the prepay goes to the arbiter pool.
+     *
+     *         A draw that draws a jury also pays an eighth of the arbiter pool to one registered arbiter's
+     *         payee, picked by the keeper from this draw's seed (PoolPayment); if the keeper finds none
+     *         available in two tries, the pool waits for the next draw.
      *
      *         No draw more than DRAW_GRACE (1 day) after the request: such a round can only be cancelled
-     *         to the treasury (cancelUnsealed). That bounds how old a block a draw reads, which the
+     *         to the arbiter pool (cancelUnsealed). That bounds how old a block a draw reads, which the
      *         keeper's unbonding (at least 2 days) and slot reuse rely on.
      */
     function drawJury(bytes32 aggId) external nonReentrant {
@@ -467,7 +477,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         emit JuryDrawn(aggId, msg.sender, reward);
     }
 
-    /// @notice A round that can never be drawn goes to the treasury, never back to the requester (a
+    /// @notice A round that can never be drawn goes to the arbiter pool, never back to the requester (a
     ///         refund would be a free re-roll): unsealed once blockhash(B+1) left the 8,191-block
     ///         history, or sealed but undrawn for DRAW_GRACE, after which drawJury refuses (a draw that
     ///         cannot fit in a transaction, or a beacon stage nobody concluded; its beacons are then not
@@ -751,7 +761,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
             // M commits were in but the round was never promoted (closed and not promoted, or not
             // closed after T+). No refund, so a requester that dislikes the jury or the promotion draw
             // cannot abort for one: the unspent prepay is shared equally by the slots that committed
-            // (they did the work; anyone could have promoted), and the indivisible rest goes to the treasury
+            // (they did the work; anyone could have promoted), and the indivisible rest goes to the arbiter pool
             if (ph == PH_CLOSING || (ph == PH_COMMIT && r.commits >= r.M)) {
                 share = (uint256(r.ethReceived) - r.baseCredited - r.bonusCredited - r.rewardCredited) / r.commits;
                 r.rewardCredited += uint88(share * r.commits);

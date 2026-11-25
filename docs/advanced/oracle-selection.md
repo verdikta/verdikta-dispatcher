@@ -32,7 +32,7 @@ Only contracts approved with `setApproved(address, true)` can call `selectArbite
 
 Why it is built this way:
 
-- **The requester cannot predict the jury** when it signs: B+1 does not exist yet. It cannot re-roll it either, because the draw reads the keeper's state as of B and the seed fixed by B+1, so who calls `drawJury`, and when, changes nothing. Every abort path that would amount to a free re-roll sends the refund to the treasury (see [Fee Mechanisms](fees.md#refunds-and-the-treasury)).
+- **The requester cannot predict the jury** when it signs: B+1 does not exist yet. It cannot re-roll it either, because the draw reads the keeper's state as of B and the seed fixed by B+1, so who calls `drawJury`, and when, changes nothing. No abort path that would amount to a free re-roll refunds the requester: the unspent prepay goes to the committers of a never-promoted round, or else to the arbiter pool (see [Fee Mechanisms](fees.md#refunds-and-the-arbiter-pool)).
 - **A later state change cannot shift the draw.** Everything selection reads (scores, flags, the block-until time, the fee, the health-call times, the stake flag) is checkpointed by block number, and class lists have checkpointed lengths. A fee change, a top-up, a pause or a new registration after B does not affect a draw at B.
 - **Block hashes stay readable** with `BLOCKHASH` for 256 blocks and from the EIP-2935 history contract up to 8,191 blocks (about 27 minutes at Base's 0.2 s blocks). `drawJury` or `sealSeed(aggId)` stores `blockhash(B+1)`; a round never sealed in that window can only be cancelled. No draw is allowed more than a day after the request (`DrawExpired`), and the keeper refuses a request block more than a day old (`StaleBlock`), a bound that the 2-day unbonding floor and slot reuse rely on.
 - **The arbiter that closes the commit phase cannot predict the promotion**, which is drawn from the block after the close. Answering early therefore earns nothing.
@@ -47,7 +47,7 @@ A request may set `withBeacons`. The bounty program does for its largest class (
 2. Each beacon answers like any health call, with its next hash-chain value. Its beacon value is its **first value revealed after block B+1** (`keeper.revealAfter(key, B+1)`): the preimage of its head as of B+1, so fixed before anyone but the builder of B+1 knew the pick. A beacon can choose only when to reveal, or not to.
 3. Once the first `quorum` values (2 by default) are revealed in completed blocks within `timeout` (120 s) of the start, a second `drawJury` draws the jury with `keccak256(aggId, blockhash(B+1), mix)`, where `mix` chains the used values in beacon-index order. Ties in arrival go to the lower index; arrival decides which values are used, not their order.
 
-The used beacons are paid one fee each, `max(ceiling, floor)`. If the quorum is missed, the second `drawJury` ends the round with no result, pays the beacons that answered, and sends the rest of the prepayment to the treasury. If fewer candidates than the quorum qualify, the round fails with a refund.
+The used beacons are paid one fee each, `max(ceiling, floor)`. If the quorum is missed, the second `drawJury` ends the round with no result, pays the beacons that answered, and sends the rest of the prepayment to the arbiter pool. If fewer candidates than the quorum qualify, the round fails with a refund.
 
 What beacons buy and cost (TODO items 9 and 15): a bribed sequencer is left about 40 seeds instead of 256, which on Jumbo's jury raises the sequencer limit from about $25K to $164K. But a cartel holding beacon seats gets a choice of seeds by timing its reveals, and can force a no-result round by withholding. Withholding is cheap: a beacon that answers just after the deadline is frozen only for about a minute. With 2 of 4 used, forcing a no-result round takes 3 colluding beacons. That is why beacons are on for Jumbo only. The owner's settings are `JuryBeacons.setParams(polled, quorum, timeout)`; keep the keeper's `callDeadline` (60 s) below the beacon `timeout`.
 
@@ -82,7 +82,7 @@ Exits free slots: `completeExit` empties the arbiter's slot in each of its class
 
 `selectArbiters` does not look at the whole class. It visits the class list as of B in a random order derived from the seed (`keccak256(seed, "walk")`): random positions without repeats, tracked in a bitmap. It adds each eligible arbiter to the shortlist and stops once the shortlist holds `shortlistSize` arbiters (60) or it has visited `maxScan` entries (400), freed slots and ineligible arbiters included. After 2 × min(n, `maxScan`) random draws it finishes with a sweep from a random start over the unvisited positions, so it stays bounded and can still reach every entry.
 
-Because the order is a uniform random sample, where an arbiter sits in the list does not matter: a cartel that registers back to back is drawn no more often than any other set. The cost, about 270 gas per entry visited, does not grow with the pool. `scansAll(class)` is true when the class list is no longer than `maxScan`, so the walk covers all of it and whether it finds enough arbiters does not depend on the seed.
+Because the order is a uniform random sample, where an arbiter sits in the list does not matter: a cartel that registers back to back is drawn no more often than any other set. The cost, about 270 gas per entry visited (measured at optimizer runs 200; the build uses 20 since 2026-11-25), does not grow with the pool. `scansAll(class)` is true when the class list is no longer than `maxScan`, so the walk covers all of it and whether it finds enough arbiters does not depend on the seed.
 
 ## Weighted Selection
 
@@ -108,7 +108,7 @@ if ratio > 1e18:  weight = weight × ratio / 1e18
 
 The keeper draws K arbiters from the shortlist of m, without replacement, each draw with `pivot = keccak256(seed, k) % remainingWeight`. Every juror gets a health call, and so do `liveRandom` (3) other shortlisted arbiters, chosen from the seed: these calls are how the keeper learns that an arbiter is down (it freezes if it does not answer within `callDeadline`).
 
-If `m` is 0 the keeper reverts with `NoEligibleArbiters()`. The aggregator catches it: the round fails (phase 8) and the requester is refunded, since no jury could be drawn and the refund is no re-roll. After a beacon stage, the refund goes to the treasury unless `scansAll(class)` holds, because then whether a jury could be found depended on the seed the beacons helped choose.
+If `m` is 0 the keeper reverts with `NoEligibleArbiters()`. The aggregator catches it: the round fails (phase 8) and the requester is refunded, since no jury could be drawn and the refund is no re-roll. After a beacon stage, the refund goes to the arbiter pool unless `scansAll(class)` holds, because then whether a jury could be found depended on the seed the beacons helped choose.
 
 ### A Thin Pool Repeats Arbiters
 

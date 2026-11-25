@@ -97,7 +97,21 @@ event JuryDrawn(bytes32 indexed aggRequestId, address indexed drawer, uint256 re
 | `drawer` | `address` | Yes | The caller of `drawJury` |
 | `reward` | `uint256` | No | `eff × drawRewardFees()` credited to the drawer, or 0: a third party that draws within `requesterDrawPriority()` (30 s) earns nothing |
 
-**When it fires:** Last in the transaction that draws the jury, after the `BasePayment`s. The round is then in phase 3, and its deadline is the draw time plus the jury's timeout.
+**When it fires:** Last in the transaction that draws the jury, after the `BasePayment`s and any `PoolPayment`. The round is then in phase 3, and its deadline is the draw time plus the jury's timeout.
+
+### PoolPayment
+
+```solidity
+event PoolPayment(bytes32 indexed aggRequestId, address indexed payee, uint256 amount);
+```
+
+| Parameter | Type | Indexed | Description |
+|-----------|------|---------|-------------|
+| `aggRequestId` | `bytes32` | Yes | The round whose draw paid it (not the round the forfeit came from) |
+| `payee` | `address` | Yes | The winning arbiter's operator `owner()` |
+| `amount` | `uint256` | No | An eighth of the arbiter pool, `ethOwed(address(0)) / 8`, credited to `ethOwed[payee]` |
+
+**When it fires:** In a `drawJury` that draws a jury, just before `JuryDrawn`, when the pool holds at least 8 wei and the keeper's `poolPayee(seed)` found an available registered arbiter in its two picks. Declared in `AggregatorLib` and emitted in the aggregator's context, so it appears in the aggregator's logs and ABI. No event fires when nobody was picked: the pool waits for the next draw.
 
 ### CommitReceived
 
@@ -153,17 +167,30 @@ event RequesterRefunded(bytes32 indexed aggRequestId, address indexed requester,
 
 | Parameter | Type | Indexed | Description |
 |-----------|------|---------|-------------|
-| `requester` | `address` | Yes | Who was credited: the requester, **or the treasury** for a round whose refund would be a free re-roll |
+| `requester` | `address` | Yes | Who was credited: the requester, **or address(0), the arbiter pool**, for a round whose refund would be a free re-roll |
 | `amount` | `uint256` | No | The unspent prepay: received minus base fees, bonuses and rewards |
 
 **When it fires:** Only when `amount > 0`, at:
 
 - finalization (to the requester);
-- a failed draw: no eligible arbiter or a beacon pool shortage (to the requester), or a failure after a beacon stage when the walk does not cover the class list (to the treasury);
-- a missed beacon quorum (to the treasury);
-- the settlement of a failed round: to the treasury if M commits were in but the round was never promoted, otherwise to the requester.
+- a failed draw: no eligible arbiter or a beacon pool shortage (to the requester), or a failure after a beacon stage when the walk does not cover the class list (to the pool);
+- a missed beacon quorum (to the pool);
+- the settlement of a failed round: to the requester, except when M commits were in but the round was never promoted. Then the committers share the unspent prepay (`CommitPayment`), and only the indivisible remainder, less than one wei per committer, is credited to the pool (and the event fires only if it is not zero).
 
 A cancelled round emits `RoundCancelled` instead.
+
+### CommitPayment
+
+```solidity
+event CommitPayment(bytes32 indexed aggRequestId, address indexed payee, uint256 amount);
+```
+
+| Parameter | Type | Indexed | Description |
+|-----------|------|---------|-------------|
+| `payee` | `address` | Yes | The slot's payee, its operator's `owner()` read at the draw |
+| `amount` | `uint256` | No | The slot's equal share: the unspent prepay divided by the round's commits, credited to `ethOwed[payee]` |
+
+**When it fires:** At the settlement of a round that had at least M commits but was never promoted (phase 4, or phase 3 with at least M commits at the deadline), once per slot that committed, after `EvaluationFailed(3 | 4)`. A repeated arbiter is paid once per committed slot. The shares are counted in the round's `rewards` (`getRoundInfo`).
 
 ### FulfillAIEvaluation
 
@@ -202,10 +229,12 @@ event RoundSettled(bytes32 indexed aggRequestId, bool failed);
 ### RoundCancelled
 
 ```solidity
-event RoundCancelled(bytes32 indexed aggRequestId, uint256 toTreasury);
+event RoundCancelled(bytes32 indexed aggRequestId, uint256 toPool);
 ```
 
-**When it fires:** On `cancelUnsealed` of a round that was never drawn: unsealed once blockhash(B+1) left the 8,191-block history, or sealed but undrawn 1 day after the request. `toTreasury` is the whole prepay. The round is then in phase 9, and `isFailed` stays false.
+The parameter keeps the name it had when v2 drafts had a treasury: the amount now goes to the arbiter pool, `ethOwed(address(0))`, not to a treasury.
+
+**When it fires:** On `cancelUnsealed` of a round that was never drawn: unsealed once blockhash(B+1) left the 8,191-block history, or sealed but undrawn 1 day after the request. `toPool` is the whole prepay, credited to the arbiter pool. The round is then in phase 9, and `isFailed` stays false.
 
 ### SlotSkipped
 
@@ -500,6 +529,7 @@ drawJury, from block B+2:
    With beacons, second call: BeaconPayment (x used values)
 4. keeper HealthCall (x jurors + 3)
 5. BasePayment (x dispatched slots) and SlotSkipped (x undispatched slots)
+   PoolPayment                           an eighth of the arbiter pool, if someone was picked
 6. JuryDrawn                             phase 3, deadline = now + timeout
 
 As the arbiters answer:
@@ -517,14 +547,15 @@ Until the deadline:
     RevealReceived(late = true, qcode)   late reveals, scored only
 
 After the deadline, settle() or a later request:
-14. (failed rounds: RequesterRefunded, EvaluationFailed(3 | 4 | 5))
+14. (failed rounds: RequesterRefunded, EvaluationFailed(3 | 4 | 5); never promoted with M commits:
+    RequesterRefunded(address(0)) for the remainder, if any, EvaluationFailed, CommitPayment (x committed slots))
 15. keeper ScoresUpdated / OutcomeSkippedFrozen / ArbiterBlocked / ArbiterBanned
 16. RoundSettled
 
 Other endings:
     EvaluationFailed(1) (+ RequesterRefunded) at the draw: no eligible arbiter or too few beacons
-    BeaconPayment + RequesterRefunded(treasury) + EvaluationFailed(2): beacon quorum missed
-    RoundCancelled: never drawn
+    BeaconPayment + RequesterRefunded(address(0), the pool) + EvaluationFailed(2): beacon quorum missed
+    RoundCancelled: never drawn (the whole prepay to the pool)
 
 Whenever a payee collects:
     EthWithdrawn
@@ -593,7 +624,7 @@ contract.on(contract.filters.BasePayment(myAggId), (event) => {
     console.log(`Base fee ${ethers.formatEther(amount)} ETH to ${payee} (slot ${pollIndex})`);
 });
 contract.on(contract.filters.RequesterRefunded(myAggId), (event) => {
-    const [, to, amount] = event.args;   // the requester, or the treasury
+    const [, to, amount] = event.args;   // the requester, or address(0): the arbiter pool
     console.log(`Unspent ${ethers.formatEther(amount)} ETH credited to ${to}`);
 });
 ```

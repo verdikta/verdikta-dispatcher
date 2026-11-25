@@ -43,7 +43,7 @@ In a failed round a delivered reveal gets +20 timeliness and no quality points, 
 
 Why these rules (TODO item 14 gives the simulations):
 
-- **Commits never earn points.** A commit can't be checked unless it is promoted and revealed, so credit for committing would reward fake commits. A fake commit doesn't help either: if promoted it must be revealed, or it costs −200 or −500.
+- **Commits never earn points.** A commit can't be checked unless it is promoted and revealed, so credit for committing would reward fake commits. A fake commit doesn't help either: if promoted it must be revealed, or it costs −200 or −500. Commits do earn ETH in one case: a round that had M commits but was never promoted shares its unspent prepay among the slots that committed (see [Fee Mechanisms](fees.md#refunds-and-the-arbiter-pool)). That pays the work done; it gives a committer no reason to block, since anyone may call `closeCommits` and `promote` and the `promote` caller is paid.
 - **The −400 for not committing applies only when the round failed for lack of commits**, the attack where a cartel blocks by never committing. A round that had M commits but died because nobody called `closeCommits` charges nobody.
 - **Rare bad luck can't block a good arbiter.** An arbiter in good standing survives any single event; two failed rounds in quick succession block it.
 - **No round-size terms.** An honest arbiter nets on average about +18 timeliness and +10 quality per round it serves in, whatever the jury.
@@ -90,6 +90,8 @@ Settlement can lag. A new request settles due rounds in queue order until `settl
 | A score reaches 0 while already blocked | restarts at `start`, but adds no offense and burns nothing: several in-flight rounds failing together count as one incident |
 
 A blocked arbiter is not eligible until `blockedUntil`, and it cannot complete an exit while blocked (`Blocked()`). An arbiter whose stake falls below `stakeRequirement` after a burn is not eligible until it tops up (`topUpStake`). Exiting does not help an arbiter escape a block: `requestExit` starts a 2-day unbonding during which blocks and bans still apply.
+
+The arbiter pool's payouts (an eighth of the pool at each jury draw, to one registered arbiter picked from the draw's seed) use the keeper's flags, not the scores: an arbiter that is paused, banned, exiting or understaked is skipped, and one that has completed its exit is no longer in the registry. Blocks and the liveness freeze are not checked, so a blocked or frozen arbiter that is otherwise in good standing can still be paid from the pool.
 
 ## The Liveness Freeze
 

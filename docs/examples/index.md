@@ -51,7 +51,7 @@ Three more points apply to every example:
 | 6 final | result readable | `settle(aggId)` (optional) | after `deadline` |
 | 7 settled, 8 failed, 9 cancelled | closed | none | |
 
-A round that is still in phase 3, 4 or 5 at its `deadline` is dead: `settle(aggId)` closes it as failed and reports the jurors' outcomes to the keeper. A round still in phase 1 or 2 a day after the request can only be closed with `cancelUnsealed(aggId)`, and its whole prepayment then goes to the treasury. See [Fee Mechanisms](../advanced/fees.md#refunds-and-the-treasury) for where the money goes in each case.
+A round that is still in phase 3, 4 or 5 at its `deadline` is dead: `settle(aggId)` closes it as failed and reports the jurors' outcomes to the keeper. A round still in phase 1 or 2 a day after the request can only be closed with `cancelUnsealed(aggId)`, and its whole prepayment then goes to the arbiter pool. See [Fee Mechanisms](../advanced/fees.md#refunds-and-the-arbiter-pool) for where the money goes in each case.
 
 ## The Interface
 
@@ -572,7 +572,7 @@ export async function readStatus(contract, requestId) {
     if (phase === 1 || phase === 2) {
         const sealed = r.sealedHash !== ethers.ZeroHash;
         if (sealed ? now > r.requestTime + DAY : block > r.requestBlock + 1n + HISTORY) {
-            status.next = 'cancelUnsealed';                 // undrawable: prepay goes to the treasury
+            status.next = 'cancelUnsealed';                 // undrawable: prepay goes to the arbiter pool
         } else if (phase === 1 && block >= r.requestBlock + 2n) {
             status.next = 'drawJury';
         } else if (phase === 2) {

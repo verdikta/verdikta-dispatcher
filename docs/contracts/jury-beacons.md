@@ -22,7 +22,7 @@ A beacon round goes like this:
     - while the stage is pending, the call reverts with `TooEarly()`;
     - each used value's operator owner is paid one juror fee, `max(eff, minFee)` (`BeaconPayment`). On expiry the beacons that answered are paid too;
     - if ready, the jury is drawn with the mixed seed. The requester's 30 s draw priority runs from `readyAt`, when the quorum-th value arrived;
-    - if expired, the round ends with no result (phase 8, `EvaluationFailed(aggId, 2)`), and the unspent prepay goes to the treasury, since a refund would be a free re-roll.
+    - if expired, the round ends with no result (phase 8, `EvaluationFailed(aggId, 2)`), and the unspent prepay goes to the arbiter pool (`ethOwed(address(0))`, paid out to random registered arbiters at later draws), since a refund would be a free re-roll.
 
 If the keeper finds fewer candidates than the quorum, `start` returns the count without starting the stage. The aggregator then fails the round at the first call and refunds the requester (`EvaluationFailed(aggId, 1)`).
 
@@ -106,7 +106,7 @@ The aggregator reads `quorum()` when a request is made. The request's prepay cov
 
 - the keeper approves JuryBeacons (`setApproved`), so it can call `pickBeacons`;
 - JuryBeacons approves the aggregator;
-- the aggregator's `setContracts(keeper, beacons, treasury)` sets it. A zero `beacons` address turns beacons off, and a request with `withBeacons = true` then reverts.
+- the aggregator's `setContracts(keeper, beacons)` sets it. A zero `beacons` address turns beacons off, and a request with `withBeacons = true` then reverts.
 
 ## Events
 
@@ -134,7 +134,7 @@ The keeper's `HealthCall(key, sentAt)` is the call the beacon node answers; `Bea
 - The beacon payments are in the prepay: `maxTotalFee(..., withBeacons = true, K, P)` adds `quorum × max(eff, minFee)`.
 - Each used value is paid `max(eff, minFee)`, and only used values are paid: at most the quorum.
 - A beacon whose value arrives after the first `quorum`, or after the deadline, is not paid.
-- Gas: starting the stage costs the requester about 0.39M gas, and a beacon's answer is an ordinary health answer (about 123k), according to the measurements in the aggregator's [`README.md`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/README.md).
+- Gas: starting the stage costs the requester about 0.39M gas, and a beacon's answer is an ordinary health answer (about 123k), according to the measurements in the aggregator's [`README.md`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/README.md) (taken at optimizer runs 200; the contracts now build with 20 runs, which can cost somewhat more).
 
 ## For Arbiter Operators
 

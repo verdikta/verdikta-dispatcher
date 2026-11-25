@@ -3,7 +3,7 @@
 The ReputationAggregator runs Verdikta's multi-arbiter evaluations: it escrows the requester's ETH, draws a jury from the ReputationKeeper, collects commits and reveals from the arbiters, clusters the answers, pays the arbiters and reports every arbiter's outcome back to the keeper. This page describes **v2**, a breaking redeploy of v1.
 
 !!! note "Checked against the code"
-    Revised on 2026-11-25 against v2's [`ReputationAggregator.sol`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/contracts/ReputationAggregator.sol), [`AggregatorLib.sol`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/contracts/AggregatorLib.sol), [`ScoringLib.sol`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/contracts/ScoringLib.sol) and [`MIGRATION.md`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/MIGRATION.md) on the `beacon` branch. v2 is not deployed yet, so no v2 address is given: the addresses are set at the v2 deployment. Fees are paid in ETH: the requester needs no LINK and approves no token. Every number below is a default that the owner can change, and each is given with the function that returns the current value. "Item n" refers to the numbered design notes in [`TODO.md`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/TODO.md).
+    Revised on 2026-11-25 against v2's [`ReputationAggregator.sol`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/contracts/ReputationAggregator.sol), [`AggregatorLib.sol`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/contracts/AggregatorLib.sol), [`ScoringLib.sol`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/contracts/ScoringLib.sol) and [`MIGRATION.md`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/MIGRATION.md) on the `beacon` branch. v2 is not deployed yet, so no v2 address is given: the addresses are set at the v2 deployment. Fees are paid in ETH: the requester needs no LINK and approves no token. Every number below is a default that the owner can change, and each is given with the function that returns the current value. Measured gas figures on this page were taken with optimizer runs 200; since 2026-11-25 the contracts build with 20 runs to fit the size limit, which can cost somewhat more gas per call, so re-measure before relying on a tight figure. The test suite's gas budgets still pass. "Item n" refers to the numbered design notes in [`TODO.md`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/TODO.md).
 
 !!! warning "v1"
     The v1 aggregator (tag `aggregator-v0.1.0`) is the one deployed today, on Base mainnet at `0xd8F38bCBEE43bE3bd31655a563f20c9B3e67142a` and on Base Sepolia at `0xe8a385E473EA710c5a88Cc72681a16a26fe380e4`. Its 7-argument request, `maxTotalFee(maxFee)`, `K()`/`M()`/`N()`/`P()`, `setConfig`, `responseTimeoutSeconds()`, `getAggregationStatus` and `finalizeEvaluationTimeout` do not exist in v2. [`MIGRATION.md`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/MIGRATION.md) maps each v1 call to its v2 replacement.
@@ -46,7 +46,7 @@ A round goes through these steps, each started by a transaction that anyone may 
 | 6 | final | Result available, awaiting settlement | `settle` after the deadline |
 | 7 | settled | Finished and settled | |
 | 8 | failed | Failed, and settled where there was a jury to score | |
-| 9 | cancelled | Never drawable: the whole prepay went to the treasury | |
+| 9 | cancelled | Never drawable: the whole prepay went to the arbiter pool | |
 
 ### Defaults
 
@@ -66,7 +66,8 @@ The constructor sets these values, and [`deploy/03_config.js`](https://github.co
 | Promote reward, in fees | 1 | `promoteRewardFees()` | `setRewards` |
 | Time in which only the requester earns the draw reward | 30 s | `requesterDrawPriority()` | `setRewards` |
 | Reveal time guaranteed after `promote` | 120 s | `revealWindow()` | `setRewards` |
-| Where unrefundable prepay goes | the deployer | `treasury()` | `setContracts` |
+
+There is no treasury setting: v2 has no `treasury()`. Prepay that is not refunded goes to the round's committers or to the [arbiter pool](#the-arbiter-pool), which no address controls.
 
 The keeper's shortlist (`shortlistSize()` on the keeper, 60) also bounds K. Fixed in the code: at most 10 CIDs of at most 100 bytes each, an addendum of at most 1,000 bytes, reveals of 1 to 20 values, each value capped at 1e34, no draw more than 1 day after the request, and a promote grace of 30 s after a late close.
 
@@ -137,7 +138,7 @@ The function keeps its historical name. It is `payable`: the ETH travels with th
 The request reverts with `BadJury()` (from `AggregatorLib.checkJury`) unless all of these hold:
 
 - K ≥ M ≥ N ≥ P ≥ 1;
-- N ≤ 40 (the N-th reveal pays for clustering; at 20 outcomes, 40 reveals cost about 8M gas);
+- N ≤ 40 (the N-th reveal pays for clustering; at 20 outcomes, 40 reveals cost about 8M gas, measured at optimizer runs 200);
 - P ≥ 2, unless N = 1 (a cluster holds at least the closest pair);
 - K ≤ `maxJury()` (50) and K ≤ the keeper's `shortlistSize()` (60);
 - `tPlus()` < timeout ≤ `maxTimeout()` (155 s < timeout ≤ 3,600 s);
@@ -179,7 +180,7 @@ function promote(bytes32 aggId) external
 // Settle a round in phase 3 to 6 once its deadline has passed
 function settle(bytes32 aggId) external
 
-// Send a round that can never be drawn to the treasury: unsealed once blockhash(B+1) has left
+// Send a round that can never be drawn to the arbiter pool: unsealed once blockhash(B+1) has left
 // the 8,191-block history, or sealed but undrawn 1 day after the request
 function cancelUnsealed(bytes32 aggId) external
 ```
@@ -201,12 +202,13 @@ function cancelUnsealed(bytes32 aggId) external
 
     One operator can then hold several slots, or every slot. Each slot is paid, committed, revealed and scored separately, and a Q-of-N rule over `getOutcomeScores` counts slots, not distinct arbiters. Selection fails (`NoEligibleArbiters`) only when it finds none.
 - If the keeper finds no eligible arbiter, the round fails (phase 8, `EvaluationFailed(aggId, 1)`). The prepay is refunded, since no jury could be drawn and so the refund is no re-roll.
-    - After a beacon stage, the refund goes to the requester only if the selection walk covers the whole class list (`keeper.scansAll(cls)`). Otherwise it goes to the treasury, because the failure could depend on the beacon seed.
+    - After a beacon stage, the refund goes to the requester only if the selection walk covers the whole class list (`keeper.scansAll(cls)`). Otherwise it goes to the arbiter pool, because the failure could depend on the beacon seed.
 - If the beacon stage finds fewer beacon candidates than the quorum, the round fails at the first call and is refunded.
+- **Arbiter pool payout:** a call that draws a jury also pays an eighth of the [arbiter pool](#the-arbiter-pool) to one registered arbiter's payee (`PoolPayment`). The first call of a beacon round and a failed draw pay nothing from the pool.
 - **Draw reward:** `eff × drawRewardFees()` (2 fees) is credited to the caller. Within `requesterDrawPriority()` (30 s) of the request, or of the quorum-th beacon value, only the requester earns it; a third party that draws in that time earns nothing. After it, whoever draws earns it. The first call of a beacon round earns no reward.
 - **Second call of a beacon round:**
     - Each used beacon value is paid `max(eff, minFee)` to the beacon's operator owner (`BeaconPayment`).
-    - If the quorum was missed by the beacon deadline, the round ends with no result (phase 8, `EvaluationFailed(aggId, 2)`), and the unspent prepay goes to the treasury.
+    - If the quorum was missed by the beacon deadline, the round ends with no result (phase 8, `EvaluationFailed(aggId, 2)`), and the unspent prepay goes to the arbiter pool.
 
 **Commits** arrive through `fulfill` (below). A commit closes the phase when it is the M+-th, or when it arrives after T+ with at least M commits in. Closing records block C and makes sure the deadline is at least 30 s away, so `promote` still fits.
 
@@ -220,11 +222,11 @@ function cancelUnsealed(bytes32 aggId) external
 - It extends the deadline to at least `now + revealWindow()` (120 s).
 - It credits the caller `eff × promoteRewardFees()` (1 fee). No event records this reward; it is counted in `rewards` of `getRoundInfo`.
 
-**`settle`** reverts with `WrongPhase()` outside phases 3 to 6 and `NotDue()` until the deadline has passed. A round that never finalized is failed here, with `EvaluationFailed(aggId, phase)` for phase 3, 4 or 5. Then one call to the keeper's `applyOutcomes` carries every slot's outcome code (see [Settlement](#settlement)).
+**`settle`** reverts with `WrongPhase()` outside phases 3 to 6 and `NotDue()` until the deadline has passed. A round that never finalized is failed here, with `EvaluationFailed(aggId, phase)` for phase 3, 4 or 5. If such a round had at least M commits but was never promoted (phase 4, or phase 3 with at least M commits), its unspent prepay is shared equally by the slots that committed (`CommitPayment` per slot, to the slot's payee); the indivisible remainder goes to the arbiter pool. Then one call to the keeper's `applyOutcomes` carries every slot's outcome code (see [Settlement](#settlement)).
 
 **The settlement queue.** Every drawn round joins a queue. Each new request walks the queue in order, settling due rounds until `settlePerRequest() × K` slots are spent, where K is the new request's. The last round settled may overshoot the budget by at most its own K, so the first due round is always settled, whatever its size: a big round at the head cannot stall the queue. The walk stops at the first unsettled round whose deadline has not passed. Rounds behind it wait as well, even if they are due, until it is due or anyone calls `settle`, so a long-timeout round at the head holds back shorter ones. The walk takes at most `settlePerRequest() × 8` queue entries per request. `setParams` accepts `settlePerRequest = 0`, which turns settlement by requests off: then only `settle` settles. Until a round settles, its scores and penalties (and a failed round's refund) wait, and an arbiter that completes its exit first escapes them; a result is readable from finalization.
 
-**`cancelUnsealed`** reverts with `WrongPhase()` outside phases 1 and 2 and `TooEarly()` before its time. It credits the whole prepay to the treasury (phase 9, `RoundCancelled`). An undrawn round never times out on its own: only this call ends it.
+**`cancelUnsealed`** reverts with `WrongPhase()` outside phases 1 and 2 and `TooEarly()` before its time. It credits the whole prepay to the arbiter pool (phase 9, `RoundCancelled(aggId, toPool)`). An undrawn round never times out on its own: only this call ends it.
 
 ### Arbiter callback
 
@@ -246,7 +248,7 @@ function fulfill(bytes32 requestId, uint256[] memory response, string memory cid
     - a reveal that does not match the commit.
 - After the deadline every answer is ignored.
 - Reveal values above 1e34 are cut to 1e34. Arbiters answer on a 0..1,000,000 scale.
-- The N-th counted reveal pays for clustering. At Jumbo that is 1.3M gas with one-number answers, 2.6M with two outcomes and 6.9M at 20 outcomes. The arbiter's job gas limit must cover it.
+- The N-th counted reveal pays for clustering. At Jumbo that is 1.3M gas with one-number answers, 2.6M with two outcomes and 6.9M at 20 outcomes (measured at optimizer runs 200; the contracts now build with 20 runs, see the note at the top). The arbiter's job gas limit must cover it.
 
 ### View Functions
 
@@ -271,7 +273,7 @@ function getRoundInfo(bytes32 aggId)
         uint256 received,     // the prepay held for the round (wei)
         uint256 baseFees,     // base fees credited at the draw
         uint256 bonuses,      // bonuses credited at finalization
-        uint256 rewards,      // draw and promote rewards, beacon payments
+        uint256 rewards,      // draw and promote rewards, beacon payments, committers' shares
         uint256 deadline,     // 0 until the draw; settle is due after it
         uint256 windowEnd,    // 0 until the draw, then the draw time + the request's T+
         uint256 commits,      // commits received
@@ -295,7 +297,8 @@ function getSlot(bytes32 aggId, uint256 i) external view returns (Slot memory)
 function maxTotalFee(uint256 maxFee, uint256 minFee, bool withBeacons, uint8 K, uint8 P)
     public view returns (uint256)
 
-// ETH (wei) held for an address: arbiter earnings, rewards, refunds, overpayments
+// ETH (wei) held for an address: arbiter earnings, rewards, refunds, overpayments.
+// ethOwed(address(0)) is the arbiter pool
 function ethOwed(address payee) external view returns (uint256)
 
 // Chainlink request id => roundId << 8 | slot
@@ -316,11 +319,12 @@ The settings in the [Defaults](#defaults) table have getters of the same name.
 // Send the caller's whole ethOwed balance to the caller
 function withdrawEth() external
 
-// Send payee's whole ethOwed balance to payee. Callable by payee or by the contract owner
+// Send payee's whole ethOwed balance to payee. Callable by payee or by the contract owner.
+// Reverts NotAuthorized() for payee = address(0), the arbiter pool
 function withdrawEthFor(address payee) external
 ```
 
-The owner has no function that takes ETH out of the contract. The only code that sends ETH is the internal `_withdrawTo(payee)`, reached through these two functions, and it always pays the address the ETH is credited to. The treasury collects its credit the same way.
+The owner has no function that takes ETH out of the contract. The only code that sends ETH is the internal `_withdrawTo(payee)`, reached through these two functions, and it always pays the address the ETH is credited to. Nobody can withdraw the arbiter pool: `withdrawEthFor(address(0))` reverts, and `msg.sender` is never address(0). The pool leaves the contract only through its payouts to arbiters, who then withdraw like any payee.
 
 ### Configuration Functions (Owner Only)
 
@@ -341,10 +345,10 @@ function setParams(uint8 bonusMult, uint8 settlePerReq, uint32 dispatchGas_,
 // window (s, not 0, else InvalidConfig())
 function setRewards(uint8 drawFees_, uint40 priority, uint8 promoteFees_, uint40 revealWindow_) external onlyOwner
 
-// Keeper, beacon contract (0 = beacons off) and treasury. Keeper and treasury must not be 0.
+// Keeper and beacon contract (0 = beacons off). The keeper must not be 0, else InvalidConfig().
 // Rounds in flight call the new contracts: change the keeper only when no round awaits settlement,
 // and the beacon contract only when no round is in its beacon stage
-function setContracts(address keeper_, address beacons_, address treasury_) external onlyOwner
+function setContracts(address keeper_, address beacons_) external onlyOwner
 
 // Stop and resume new requests. Draws, commits, reveals, settlement, cancellation and
 // withdrawals keep working while paused
@@ -366,6 +370,7 @@ event RequestAIEvaluation(bytes32 indexed aggRequestId, string[] cids);
 event SeedSealed(bytes32 indexed aggRequestId, bytes32 blockHash);
 event BeaconStageStarted(bytes32 indexed aggRequestId, uint256 beacons);
 event BeaconPayment(bytes32 indexed aggRequestId, address indexed payee, uint256 amount);
+event PoolPayment(bytes32 indexed aggRequestId, address indexed payee, uint256 amount);   // emitted by AggregatorLib, in the aggregator's context
 event BasePayment(bytes32 indexed aggRequestId, uint256 pollIndex, address indexed payee, uint256 amount);
 event JuryDrawn(bytes32 indexed aggRequestId, address indexed drawer, uint256 reward);
 event CommitReceived(bytes32 indexed aggRequestId, uint256 pollIndex, bytes32 commitHash);
@@ -373,11 +378,12 @@ event CommitWindowClosed(bytes32 indexed aggRequestId, uint256 closeBlock);
 event CommitPhaseComplete(bytes32 indexed aggRequestId, uint256 promoted);
 event RevealReceived(bytes32 indexed aggRequestId, uint256 pollIndex, bool late, uint8 qcode);
 event BonusPayment(bytes32 indexed aggRequestId, uint256 pollIndex, address indexed payee, uint256 amount);
-event RequesterRefunded(bytes32 indexed aggRequestId, address indexed requester, uint256 amount);
+event RequesterRefunded(bytes32 indexed aggRequestId, address indexed requester, uint256 amount);   // requester 0 = the arbiter pool
+event CommitPayment(bytes32 indexed aggRequestId, address indexed payee, uint256 amount);
 event FulfillAIEvaluation(bytes32 indexed aggRequestId, uint256[] aggregated, string justifications);
 event EvaluationFailed(bytes32 indexed aggRequestId, uint8 phase);
 event RoundSettled(bytes32 indexed aggRequestId, bool failed);
-event RoundCancelled(bytes32 indexed aggRequestId, uint256 toTreasury);
+event RoundCancelled(bytes32 indexed aggRequestId, uint256 toPool);
 event SlotSkipped(bytes32 indexed aggRequestId, uint256 pollIndex, uint8 reason);
 event EthWithdrawn(address indexed payee, uint256 amount);
 ```
@@ -686,11 +692,11 @@ The keeper turns the codes into points and consequences: see [ReputationKeeper](
 ### Draw Integrity
 
 - **Unpredictable seed**: the jury depends only on blockhash(B+1) (and, with beacons, the beacon values) and on the keeper's state as of block B. The result is the same whoever draws and whenever.
-- **No free re-roll**: refunds are given only where the requester could not have chosen the outcome. These rounds send their unspent prepay to the treasury:
+- **No free re-roll**: refunds are given only where the requester could not have chosen the outcome. A round with M commits that was never promoted pays its unspent prepay to the slots that committed. These rounds send it to the arbiter pool:
     - a missed beacon quorum;
-    - a round with M commits that was never promoted;
     - a cancelled round;
     - a draw that fails after a beacon stage when the walk does not cover the class list.
+- **The pool cannot be steered**: each pool payout is picked from the draw's seed, which a block hash fixes after the request and which is the same whoever draws. A forfeiting round never picks its own winner, and paying an eighth per draw makes grinding with many requests cost more than it wins.
 
 ### Economic Security
 
@@ -739,14 +745,23 @@ With the defaults (bonus 3, draw 2, promote 1, quorum 2) that is `juror × (K + 
 |---------------------|------------------------|------|
 | Finalized | the requester | at finalization |
 | No eligible arbiter, or fewer beacon candidates than the quorum | the requester | at the draw |
-| Draw failed after a beacon stage, and `keeper.scansAll(cls)` is false | the treasury | at the draw |
-| Beacon quorum missed | the treasury | at the second `drawJury` |
+| Draw failed after a beacon stage, and `keeper.scansAll(cls)` is false | the arbiter pool | at the draw |
+| Beacon quorum missed | the arbiter pool | at the second `drawJury` |
 | Commit phase with fewer than M commits | the requester | at settlement |
-| M commits but never promoted (closed and not promoted, or not closed after T+) | the treasury | at settlement |
+| M commits but never promoted (closed and not promoted, or not closed after T+) | the slots that committed, in equal shares (`CommitPayment`); the remainder of under one wei per committer to the arbiter pool | at settlement |
 | Reveal phase with fewer than N counted reveals | the requester | at settlement |
-| Cancelled (`cancelUnsealed`) | the treasury: the whole prepay | at cancellation |
+| Cancelled (`cancelUnsealed`) | the arbiter pool: the whole prepay | at cancellation |
 
-Each refund emits `RequesterRefunded(aggId, to, amount)`, where `to` is the requester or the treasury.
+Each credit of the rest emits `RequesterRefunded(aggId, to, amount)` when the amount is not zero, where `to` is the requester or address(0) for the arbiter pool. A cancellation emits `RoundCancelled` instead. The committers' shares are counted in `rewards`.
+
+### The arbiter pool
+
+The pool replaces the treasury of earlier v2 drafts (v1 had neither). It is the ledger entry `ethOwed(address(0))`, and no address can withdraw it. It is paid out at draws:
+
+- every `drawJury` that draws a jury pays `ethOwed(address(0)) / 8` to one registered arbiter (`PoolPayment(aggId, payee, amount)`);
+- the keeper's `poolPayee(seed)` picks the arbiter uniformly from the draw's seed and returns its payee, its operator's `owner()`;
+- it makes at most two picks and skips arbiters that are paused, banned, exiting or understaked; if both miss, nobody is paid and the pool waits for the next draw;
+- the keeper call is capped at 80,000 gas and its failure is caught, so it can never make the draw fail.
 
 A requester that draws its own round within 30 s gets the draw reward back, and one that calls `promote` gets the promote reward back. Both are paid on the ceiling, so none of the floor comes back this way. Network gas comes on top. All credits are entries in `ethOwed`. A requester's credit pays for its next request, or `withdrawEth()` takes it out. Arbiter owners collect their earnings the same way.
 
@@ -768,7 +783,7 @@ await contract.requestAIEvaluationWithApproval(/* ... */, { value });
 
 **`BadInput()`**: check the CID and addendum limits, `estimatedBaseCost < min(maxFee, maxOracleFee())`, `alpha ≤ 1000` and a scaling factor from 1 to 65,535.
 
-**The round stays in phase 1 (draw)**: nobody has called `drawJury`. An undrawn round never times out. Call `drawJury` from block B+2. After a day it can only be cancelled to the treasury.
+**The round stays in phase 1 (draw)**: nobody has called `drawJury`. An undrawn round never times out. Call `drawJury` from block B+2. After a day it can only be cancelled to the arbiter pool.
 
 **`drawJury` reverts with `TooEarly()` in phase 2**: the beacon values are not in yet. Try again; the stage ends at the beacon deadline (`timeout()` on JuryBeacons, 120 s), ready or expired.
 

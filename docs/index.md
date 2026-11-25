@@ -185,7 +185,7 @@ The round needs the calls after the request. A round still open at its deadline 
 ## Advanced Topics
 
 - **[Reputation System](advanced/reputation.md)** - Two scores, the points per round, blocks, bans and the freeze
-- **[Fee Mechanisms](advanced/fees.md)** - The quote, fee ceiling and floor, rewards, refunds and the treasury; LINK fees for the legacy contracts
+- **[Fee Mechanisms](advanced/fees.md)** - The quote, fee ceiling and floor, rewards, refunds, committer shares and the arbiter pool; LINK fees for the legacy contracts
 - **[Security Model](advanced/security.md)** - The v2 threat model: the draw, beacons, commit-reveal binding, collusion and jury size
 - **[Oracle Selection](advanced/oracle-selection.md)** - The two-phase draw, beacons, the shortlist, and K drawn → M promoted → N counted → P clustered
 - **[ETH Payment Implementation (history)](advanced/eth-payment-migration.md)** - The v1 design note on paying arbiters in ETH while keeping the Chainlink request path

@@ -360,7 +360,7 @@ The operator contract is unchanged in v2, but every operator owner and node has 
 
     The callback is still `fulfill(bytes32 requestId, uint256[] response, string cid)`, delivered through `fulfillOracleRequestV`.
 4. **Answer health calls.** The keeper emits `HealthCall(key, sentAt)`. The node answers with `answerHealthCall` or `rotateChain` within 60 s, from an authorized sender of this operator, or the arbiter is frozen. A beacon call is the same health call.
-5. **Raise the job's gas limit.** The N-th counted reveal finalizes the round and pays for clustering: up to 6.9M gas at Jumbo with 20 outcomes. The operator also requires at least 400,000 gas left for the callback.
+5. **Raise the job's gas limit.** The N-th counted reveal finalizes the round and pays for clustering: up to 6.9M gas at Jumbo with 20 outcomes (measured at optimizer runs 200; the aggregator builds with 20 runs since 2026-11-25, which can cost somewhat more). The operator also requires at least 400,000 gas left for the callback.
 
 ## Access Control Mechanism
 
