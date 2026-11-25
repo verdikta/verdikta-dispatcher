@@ -47,8 +47,9 @@ interface IJuryBeacons {
  *     reveals are classified on arrival against the stored median and spread;
  *   - settlement after the deadline: one batched keeper call carrying every slot's outcome code
  *     (Table 1), with failed rounds settled on the same path;
- *   - a settlement queue: every new request settles due rounds (up to settlePerRequest x its K slots), so
- *     settlement never depends on an outside keeper bot (anyone may also call settle());
+ *   - a settlement queue: every new request settles due rounds in queue order until settlePerRequest x
+ *     its K slots are spent (the last may overshoot, so the first due round is always settled); a round not yet due stops the walk, so rounds
+ *     behind a long-timeout round wait for it or for anyone's settle();
  *   - getOutcomeScores (item 11): every counted reveal's score for one outcome, so a consumer can
  *     apply a Q-of-N rule (item 12).
  *   - a requester-set jury (item 15): K/M/N/P and the round timeout come with each request, within the
@@ -138,7 +139,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         uint8 reveals;
         uint96 ethReceived;   // s1
         uint96 baseCredited;
-        uint40 windowEnd;     // draw time + T+
+        uint40 windowEnd;     // T+ of the request until the draw, then draw time + T+
         uint8 bonusMult;
         uint8 mPlus;
         uint8 drawFees;       // draw reward in fees, fixed at request (the escrow was sized on it)
@@ -266,8 +267,8 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         // or the draw would fill the rest of the jury with repeats from a pool that has more arbiters
         AggregatorLib.checkJury(j.K, j.M, j.N, j.P, j.timeout, tPlus, maxJury, maxTimeout, keeper.shortlistSize());
 
-        // settle due rounds first: bounded work, so settlement never waits for an outside caller. The budget
-        // is in slots, settlePerRequest x this request's K, so a small request never pays to settle a big round
+        // settle due rounds first: bounded work. Rounds are settled until settlePerRequest x this request's K
+        // slots are spent; the last may overshoot, so the first due round is settled whatever its size
         _settleDue(uint256(settlePerRequest) * j.K);
 
         uint256 effMaxFee = maxFee < maxOracleFee ? maxFee : maxOracleFee;
@@ -302,6 +303,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         r.cls = requestedClass;
         r.minFee = uint96(minFee);
         r.timeout = j.timeout;
+        r.windowEnd = tPlus;  // the T+ this timeout was checked against; the draw adds its time
         r.payload = payload;
         emit RequestFunded(aggId, msg.sender, fromCredit, msg.value);
         emit RequestAIEvaluation(aggId, cids);
@@ -433,7 +435,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
 
         r.phase = PH_COMMIT;
         r.start = uint40(block.timestamp);
-        r.windowEnd = uint40(block.timestamp) + tPlus;
+        r.windowEnd += uint40(block.timestamp);
         r.mPlus = uint8(uint256(r.M) + (uint256(r.K) - r.M + 1) / 2);
         r.deadline = uint40(block.timestamp) + r.timeout;
         string memory payload = r.payload;
@@ -704,10 +706,12 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         _settle(r, uint256(aggId));
     }
 
-    /// @dev Settles due rounds in queue order while their juries fit `budget` slots. A round that does not
-    ///      fit stops the walk (it is not skipped): it waits for a request with a bigger budget, or for
-    ///      anyone's settle(). Only its scores and a failed round's refund wait; a result is readable
-    ///      from finalization.
+    /// @dev Settles due rounds in queue order until `budget` slots are spent. The last round settled may
+    ///      overshoot the budget (by at most its own K), so the first due round is always settled, whatever
+    ///      its size, and a big round at the head cannot stall the queue behind it. A round not yet past its
+    ///      deadline stops the walk (it is not skipped): rounds behind a long-timeout round wait for it, or
+    ///      for anyone's settle(). Until a round settles, its scores (and penalties) and a failed round's
+    ///      refund wait; a result is readable from finalization.
     function _settleDue(uint256 budget) internal {
         uint256 h = settleHead;
         uint256 len = settleQueue.length;
@@ -717,8 +721,8 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         for (uint256 steps = 0; steps < limit && h < len; steps++) {
             Round storage r = rounds[settleQueue[h]];
             if (r.phase < PH_SETTLED) {
-                if (r.K > budget || block.timestamp <= r.deadline) break;
-                budget -= r.K;
+                if (budget == 0 || block.timestamp <= r.deadline) break;
+                budget = r.K < budget ? budget - r.K : 0;
                 _settle(r, settleQueue[h]);
             }
             h++;
@@ -795,7 +799,8 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
     ///         9 cancelled), draw blocks, and the escrow: received, base fees, bonuses, rewards (draw,
     ///         promote, beacons). Received minus the three credited amounts is refunded at the end.
     ///         Then the timing a consumer's view needs: the round deadline (0 until the draw; settle
-    ///         is due after it), the commit window's end (T+ after the draw), the commits received,
+    ///         is due after it), the commit window's end (0 until the draw, then the draw time plus the T+ of the
+    ///         request), the commits received,
     ///         and the request time (drawJury's 1-day limit and cancelUnsealed run from it).
     function getRoundInfo(bytes32 aggId)
         external
@@ -806,7 +811,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
     {
         Round storage r = rounds[uint256(aggId)];
         return (r.phase, r.requestBlock, r.sealedHash, r.closeBlock, r.ethReceived, r.baseCredited, r.bonusCredited,
-                r.rewardCredited, r.deadline, r.windowEnd, r.commits, r.requestTime);
+                r.rewardCredited, r.deadline, r.deadline == 0 ? 0 : r.windowEnd, r.commits, r.requestTime);
     }
 
     /// @notice The jury a round was requested with (zero for an unknown round)
@@ -841,7 +846,11 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
     // ================================================================== owner configuration
     /// @notice Bounds on the jury a request may ask for: the largest K, the longest timeout, and T+ (seconds,
     ///         from measured honest commit latency: mean + 2 SD), which every timeout must exceed. Each request
-    ///         also checks K against the keeper's shortlist, so a shortlist lowered later still binds.
+    ///         also checks K against the keeper's shortlist (a shortlist lowered after a request makes that
+    ///         round's draw repeat arbiters). Every request's timeout is also capped at one day
+    ///         (AggregatorLib.MAX_TIMEOUT, whatever maxTimeout says): the keeper's unbonding period (at least
+    ///         2 days) assumes a round settles within a day of its draw. A round keeps the T+ of its
+    ///         request, so changing T+ never strands a round in flight.
     function setLimits(uint8 maxJury_, uint40 maxTimeout_, uint40 tPlus_) external onlyOwner {
         if (maxJury_ == 0 || tPlus_ == 0 || maxTimeout_ <= tPlus_) revert InvalidConfig();
         (maxJury, maxTimeout, tPlus) = (maxJury_, maxTimeout_, tPlus_);

@@ -238,11 +238,15 @@ library AggregatorLib {
     ///      least the closest pair, and the escrow covers bonusMultiplier x P bonuses), K at most maxJury and
     ///      the keeper's shortlist (a larger K would fill with repeats from a full pool), and a timeout above
     ///      T+ and at most maxTimeout.
+    /// @dev The longest round timeout any request may have, whatever the owner's maxTimeout: the keeper's
+    ///      unbonding period (at least 2 days) assumes a round settles within a day of its draw.
+    uint40 internal constant MAX_TIMEOUT = 1 days;
+
     function checkJury(uint8 K, uint8 M, uint8 N, uint8 P, uint40 timeout, uint40 tPlus, uint8 maxJury, uint40 maxTimeout,
         uint256 shortlist) public pure
     {
         if (!(K >= M && M >= N && N >= P && N >= 1 && N <= 40 && (P >= 2 || N == 1) && P >= 1) || K > maxJury
-            || K > shortlist || timeout <= tPlus || timeout > maxTimeout) revert BadJury();
+            || K > shortlist || timeout <= tPlus || timeout > maxTimeout || timeout > MAX_TIMEOUT) revert BadJury();
     }
 
     function bytes32ToHexLower(bytes32 data) public pure returns (string memory) {

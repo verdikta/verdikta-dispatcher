@@ -170,18 +170,19 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
         .to.be.revertedWithCustomError(agg, "BadInput");
     });
 
-    it("a request settles due rounds within settlePerRequest x its own K slots; a round too big waits, in order", async () => {
+    it("a request settles due rounds until settlePerRequest x its own K slots are spent; the first due round always", async () => {
       drv.jury = H.jury(12, 9, 8, 5, 300);                                    // 12 slots
       const big = await drv.fullRound({ settle: false });
       drv.jury = H.JURY;                                                       // 6 slots
       const small = await drv.fullRound({ settle: false });
+      const small2 = await drv.fullRound({ settle: false });
       await time.increase(301);
       const settled = (rc) => eventArgs(rc, "RoundSettled").map((a) => a.aggRequestId);
-      // K = 5: a budget of 10 slots, below the big round at the head, which is not skipped
-      expect(settled((await drv.requestOnly({ jury: H.jury(5, 5, 4, 3) })).reqRcpt)).to.deep.equal([]);
-      // K = 6: 12 slots, the big round exactly, then nothing left for the small one
-      expect(settled((await drv.requestOnly()).reqRcpt)).to.deep.equal([big.aggId]);
-      expect(settled((await drv.requestOnly()).reqRcpt)).to.deep.equal([small.aggId]);
+      // K = 3: a budget of 6 slots, below the big round at the head, which is settled anyway (overshoot), so
+      // a big round cannot stall the queue behind it; the budget is then spent
+      expect(settled((await drv.requestOnly({ jury: H.jury(3, 3, 3, 3) })).reqRcpt)).to.deep.equal([big.aggId]);
+      // K = 4: 8 slots, the first small round (6), then the second overshoots the 2 left
+      expect(settled((await drv.requestOnly({ jury: H.jury(4, 4, 4, 3) })).reqRcpt)).to.deep.equal([small.aggId, small2.aggId]);
       // anyone may settle a round the queue is holding back
       drv.jury = H.jury(12, 9, 8, 5, 300);
       const big2 = await drv.fullRound({ settle: false });
@@ -807,6 +808,28 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
       const t = BigInt((await ethers.provider.getBlock(medium.rcpt.blockNumber)).timestamp);
       expect((await agg.getRoundInfo(medium.aggId)).deadline).to.equal(t + 400n);
       expect(await agg.getJury(ethers.zeroPadValue("0x99", 32))).to.deep.equal([0n, 0n, 0n, 0n, 0n]);
+    });
+
+    it("no request may have a timeout above one day, whatever maxTimeout says", async () => {
+      await agg.setLimits(50, 30 * 86400, 155);                                 // accepted, but requests stay capped
+      await expect(ask(H.jury(6, 5, 4, 3, 86401))).to.be.revertedWithCustomError(lib(), "BadJury");
+      await ask(H.jury(6, 5, 4, 3, 86400));
+    });
+
+    it("a round keeps the T+ of its request: raising T+ before the draw cannot push the window past the deadline", async () => {
+      const r = await drv.requestOnly();                                        // timeout 300, checked against T+ 155
+      expect((await agg.getRoundInfo(r.aggId)).windowEnd).to.equal(0n, "no window before the draw");
+      await agg.setLimits(50, 3600, 400);                                       // T+ above this round's timeout
+      await drv.draw(r);
+      const info = await agg.getRoundInfo(r.aggId);
+      const t = BigInt((await ethers.provider.getBlock("latest")).timestamp);
+      expect(info.windowEnd).to.equal(t + 155n);
+      expect(info.windowEnd < info.deadline).to.equal(true);
+      await drv.answerAll(r);
+      await commitAll(r, [0, 1, 2, 3, 4]);                                      // M, below M+
+      await time.increase(156);
+      await drv.closeCommits(r);                                                // closable: the round is not stranded
+      expect((await agg.getRoundInfo(r.aggId)).phase).to.equal(4n);
     });
 
     it("setLimits: a jury of at least 1, T+ above 0 and below the longest timeout", async () => {
