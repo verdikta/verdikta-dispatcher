@@ -85,4 +85,10 @@ function isLocal(network) {
   return LOCAL_NETWORKS.has(network);
 }
 
-module.exports = { verifyContract, isLocal };
+// hardhat-deploy runs every file in deploy/ as a deploy script, this one too, and a module that is
+// not a function made every `hardhat deploy` (and `hardhat node`) fail after the last real step
+// ("deployScript.func is not a function"), so deploy.sh exited non-zero after a good deploy. Exported
+// as a no-op script with no tags that always skips; require("./helpers") is unchanged.
+const noop = async () => {};
+noop.skip = async () => true;
+module.exports = Object.assign(noop, { verifyContract, isLocal });
