@@ -419,6 +419,8 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
             (uint8 st, bytes32 mix, uint256 readyAt, address[] memory payees) = beacons.result(address(this), aggId);
             if (st != 2 && st != 3) revert TooEarly();
             uint256 pay = r.minFee > eff ? r.minFee : eff;    // a beacon is paid as a juror: the floor (item 8)
+            // at most the quorum escrowed: a beacon contract reporting more would be paid from others' funds
+            if (payees.length > r.beaconFees) revert BadSelectionCount();
             for (uint256 i = 0; i < payees.length; i++) {
                 ethOwed[payees[i]] += pay;
                 emit BeaconPayment(aggId, payees[i], pay);
@@ -434,9 +436,10 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
             anchor = readyAt;
         }
         ReputationKeeper.Selected[] memory sel;
+        (uint256 atB, uint256 atT) = (r.requestBlock, r.requestTime);
         uint256 g = gasleft();
         try keeper.selectArbiters(
-            ReputationKeeper.SelectParams(r.K, r.alpha, eff, r.minFee, r.baseCost, r.scaling, r.cls), seed, r.requestBlock, r.requestTime
+            ReputationKeeper.SelectParams(r.K, r.alpha, eff, r.minFee, r.baseCost, r.scaling, r.cls), seed, atB, atT
         ) returns (ReputationKeeper.Selected[] memory s_) {
             sel = s_;
         } catch {
@@ -472,7 +475,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         // a block hash after the request, the same whoever draws). A forfeiting round never picks its own
         // winner, so a forfeit cannot be steered back to its requester. Capped gas: an operator's owner()
         // cannot make the draw fail; no winner, and the pool waits for the next draw
-        AggregatorLib.payPool(ethOwed, address(keeper), seed, aggId);
+        AggregatorLib.payPool(ethOwed, address(keeper), seed, aggId, base, atB, atT);
         settleQueue.push(id);
         emit JuryDrawn(aggId, msg.sender, reward);
     }

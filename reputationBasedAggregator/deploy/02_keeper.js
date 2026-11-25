@@ -3,7 +3,8 @@
 // Deploys ReputationKeeper and JuryBeacons, then wires them to the aggregator from
 // 01_aggregator.js:
 //   keeper.setApproved(aggregator)   the aggregator selects juries and reports outcomes
-//   keeper.setApproved(beacons)      JuryBeacons picks beacons and relays their answers
+//   keeper.setRoles(beacons, 2)      JuryBeacons picks beacons (ROLE_SELECT only: it never scores
+//                                    and never sends operator requests)
 //   beacons.setApproved(aggregator)  the aggregator starts beacon stages
 //   aggregator.setContracts(keeper, beacons)
 // -----------------------------------------------------------------------------
@@ -54,8 +55,9 @@ module.exports = async ({ deployments, getNamedAccounts, ethers, network }) => {
   if (!(await read("ReputationKeeper", "approvedContracts", agg.address))) {
     await execute("ReputationKeeper", tx, "setApproved", agg.address, true);
   }
-  if (!(await read("ReputationKeeper", "approvedContracts", beacons.address))) {
-    await execute("ReputationKeeper", tx, "setApproved", beacons.address, true);
+  const ROLE_SELECT = 2;
+  if (Number(await read("ReputationKeeper", "roles", beacons.address)) !== ROLE_SELECT) {
+    await execute("ReputationKeeper", tx, "setRoles", beacons.address, ROLE_SELECT);
   }
   if (!(await read("JuryBeacons", "approved", agg.address))) {
     await execute("JuryBeacons", tx, "setApproved", agg.address, true);

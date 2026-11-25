@@ -152,6 +152,7 @@ contract ReputationKeeper is Ownable {
     error TransferFailed();
     error FutureBlock();
     error StaleBlock();
+    error StaleAnswer();
 
     // ------------------------------------------------------------------ events
     event ArbiterRegistered(bytes32 indexed key, address indexed oracle, bytes32 jobId, uint256 fee);
@@ -165,6 +166,7 @@ contract ReputationKeeper is Ownable {
     event OutcomeSkippedFrozen(bytes32 indexed key);
     event ExitRequested(bytes32 indexed key, uint256 exitAt);
     event ContractApproval(address indexed aggregator, bool approved);
+    event RolesSet(address indexed account, uint8 roles);
 
     // ------------------------------------------------------------------ storage
     IERC20 public immutable verdiktaToken;
@@ -177,10 +179,23 @@ contract ReputationKeeper is Ownable {
     mapping(uint64 => uint32[]) internal freeSlots;      // freed slot indices per class
     mapping(bytes32 => uint64[]) internal classesOf;
     mapping(bytes32 => mapping(uint64 => uint32)) internal slotOf;   // slot index + 1 (0 = not listed)
-    mapping(address => bool) public approvedContracts;
-    /// @dev every registered arbiter once, dense (swap-and-pop at completeExit): the arbiter pool's draw
+    /// @notice What each contract may do (least privilege): ROLE_GATE answers ArbiterOperator's
+    ///         isContractApproved, ROLE_SELECT draws juries and beacons (and sends their health calls),
+    ///         ROLE_SCORE reports outcomes (rewrites scores, blocks, bans, burns). The aggregator needs all
+    ///         three, JuryBeacons only ROLE_SELECT, a contract that only sends requests to operators only
+    ///         ROLE_GATE.
+    mapping(address => uint8) public roles;
+    uint8 public constant ROLE_GATE = 1;
+    uint8 public constant ROLE_SELECT = 2;
+    uint8 public constant ROLE_SCORE = 4;
+    uint8 private constant ROLE_ALL = 7;
+    /// @dev every registered arbiter once (the arbiter pool's draw), in slots like the class lists: an
+    ///      exit frees its slot (0) for the next registration, and the length is checkpointed, so the pool
+    ///      pick reads the registry as of the request block with the class lists' slot-reuse argument
     bytes32[] internal registry;
     mapping(bytes32 => uint256) internal registryPos;   // index + 1 (0 = not listed)
+    uint32[] internal freeRegSlots;
+    LenCk[] internal registryLen;
 
     Points public points = Points(20, 50, 200, 500, 400, 500, 1000);
     uint256 public stakeRequirement = 100e18;
@@ -206,8 +221,8 @@ contract ReputationKeeper is Ownable {
         verdiktaToken = IERC20(token);
     }
 
-    modifier onlyApproved() {
-        if (!approvedContracts[msg.sender]) revert NotApproved();
+    modifier onlyRole(uint8 r) {
+        if (roles[msg.sender] & r == 0) revert NotApproved();
         _;
     }
 
@@ -232,12 +247,18 @@ contract ReputationKeeper is Ownable {
     }
 
     /// @dev state as of the end of block `b` (latest checkpoint with fromBlock <= b)
+    ///      Searches back from the end in doubling steps, then bisects: the cost grows with the log of the
+    ///      checkpoints written since `b` (a recent request block), not of the whole history, so a key
+    ///      with a long history (many answers, or setFee spam) costs a draw little more than any other.
     function _at(bytes32 key, uint256 b) internal view returns (Ck memory c) {
         Ck[] storage a = cks[key];
         uint256 hi = a.length;
-        if (hi == 0) return c;
-        if (a[hi - 1].fromBlock <= b) return a[hi - 1];
-        uint256 lo = 0;
+        uint256 lo;
+        for (uint256 step = 1; step <= hi; step <<= 1) {
+            uint256 p = hi - step;
+            if (a[p].fromBlock <= b) { lo = p + 1; break; }
+            hi = p;
+        }
         while (lo < hi) {
             uint256 mid = (lo + hi) / 2;
             if (a[mid].fromBlock > b) hi = mid;
@@ -247,7 +268,10 @@ contract ReputationKeeper is Ownable {
     }
 
     function _lenAt(uint64 cls, uint256 b) internal view returns (uint256) {
-        LenCk[] storage a = classLen[cls];
+        return _lenAtOf(classLen[cls], b);
+    }
+
+    function _lenAtOf(LenCk[] storage a, uint256 b) internal view returns (uint256) {
         uint256 hi = a.length;
         if (hi == 0) return 0;
         if (a[hi - 1].fromBlock <= b) return a[hi - 1].len;
@@ -304,8 +328,20 @@ contract ReputationKeeper is Ownable {
         // head 0: the node sets its chain with its first answer (a re-sync); frozen until then
         if (chainHead == bytes32(0)) _resyncFreeze(c);
         _write(key, c);
-        registry.push(key);
-        registryPos[key] = registry.length;
+        {
+            uint256 nf = freeRegSlots.length;
+            uint256 rp;
+            if (nf > 0) {
+                rp = freeRegSlots[nf - 1];
+                freeRegSlots.pop();
+                registry[rp] = key;
+            } else {
+                rp = registry.length;
+                registry.push(key);
+                _pushLen(registryLen, registry.length);
+            }
+            registryPos[key] = rp + 1;
+        }
         // a freed slot first (see the contract notes), else append. A returning arbiter's slots were
         // freed at its exit, so it takes its classes from this registration like a new one
         for (uint256 i = 0; i < classes.length; i++) {
@@ -323,14 +359,17 @@ contract ReputationKeeper is Ownable {
             } else {
                 pos = list.length;
                 list.push(key);
-                LenCk[] storage lc = classLen[cl];
-                uint256 n = lc.length;
-                if (n > 0 && lc[n - 1].fromBlock == block.number) lc[n - 1].len = uint224(list.length);
-                else lc.push(LenCk(uint32(block.number), uint224(list.length)));
+                _pushLen(classLen[cl], list.length);
             }
             slotOf[key][cl] = uint32(pos + 1);
         }
         emit ArbiterRegistered(key, oracle, jobId, fee);
+    }
+
+    function _pushLen(LenCk[] storage lc, uint256 len) internal {
+        uint256 n = lc.length;
+        if (n > 0 && lc[n - 1].fromBlock == block.number) lc[n - 1].len = uint224(len);
+        else lc.push(LenCk(uint32(block.number), uint224(len)));
     }
 
     function setPaused(bytes32 key, bool paused) external {
@@ -353,6 +392,7 @@ contract ReputationKeeper is Ownable {
     function topUpStake(bytes32 key, uint96 amount) external {
         _onlyArbiterOwner(key);
         Ck memory c = _cur(key);
+        if (c.flags & F_BANNED != 0) revert Blocked();   // a banned key's tombstone could never refund it
         if (!verdiktaToken.transferFrom(msg.sender, address(this), amount)) revert TransferFailed();
         uint96 st = metas[key].stake + amount;
         metas[key].stake = st;
@@ -388,6 +428,8 @@ contract ReputationKeeper is Ownable {
         Ck memory c = _cur(key);
         if (c.flags & F_EXITING == 0 || block.timestamp < m.exitAt) revert StillBonded();
         if (c.blockedUntil > block.timestamp) revert Blocked();
+        uint256 rp = registryPos[key];
+        if (rp == 0) revert NotRegistered();         // a banned key's tombstone has exited already
         uint256 refund = m.stake;
         address to = IOracleOwner(m.oracle).owner();
         m.stake = 0;
@@ -402,11 +444,8 @@ contract ReputationKeeper is Ownable {
             delete slotOf[key][cl];
         }
         delete classesOf[key];
-        uint256 rp = registryPos[key];
-        bytes32 last = registry[registry.length - 1];
-        registry[rp - 1] = last;
-        registryPos[last] = rp;
-        registry.pop();
+        registry[rp - 1] = bytes32(0);
+        freeRegSlots.push(uint32(rp - 1));
         delete registryPos[key];
         if (refund > 0 && !verdiktaToken.transfer(to, refund)) revert TransferFailed();
         emit ArbiterRemoved(key, refund);
@@ -468,6 +507,12 @@ contract ReputationKeeper is Ownable {
         _onlyResponder(m.oracle, responder);
         if (keccak256(abi.encodePacked(preimage)) != _headAt(key, block.number)) {
             if (nextHead != preimage) revert BadPreimage();
+            // a value this chain already holds is a stale answer (a re-sent transaction, or a lagging RPC's
+            // head), not a fresh chain: re-syncing onto it would freeze a live arbiter and make its next
+            // values public. Refuse it; the node's next run reads the current head
+            HeadCk[] storage hs = heads[key];
+            uint256 hn = hs.length;
+            for (uint256 j = 0; j < 4 && j < hn; j++) if (hs[hn - 1 - j].head == preimage) revert StaleAnswer();
             _setHead(key, preimage);                     // not a reveal: revealAfter's keccak check skips it
             _resyncFreeze(c);
             _write(key, c);
@@ -499,7 +544,6 @@ contract ReputationKeeper is Ownable {
         c.flags |= F_CALL_PENDING | F_RESYNC;
     }
 
-    /// @notice Owner: send health calls to many arbiters at once (e.g. after a wide outage).
     function _setHead(bytes32 key, bytes32 h) internal {
         heads[key].push(HeadCk(uint32(block.number), uint40(block.timestamp), h));
     }
@@ -507,7 +551,11 @@ contract ReputationKeeper is Ownable {
     /// @dev index of the first head entry after block `b` (the array length if none)
     function _headIdxAfter(HeadCk[] storage a, uint256 b) internal view returns (uint256 lo) {
         uint256 hi = a.length;
-        if (hi == 0 || a[hi - 1].fromBlock <= b) return hi;
+        for (uint256 step = 1; step <= hi; step <<= 1) {    // back from the end, as _at
+            uint256 p = hi - step;
+            if (a[p].fromBlock <= b) { lo = p + 1; break; }
+            hi = p;
+        }
         while (lo < hi) {
             uint256 mid = (lo + hi) / 2;
             if (a[mid].fromBlock > b) hi = mid;
@@ -541,8 +589,11 @@ contract ReputationKeeper is Ownable {
         return (a[i].head, a[i].fromBlock, a[i].at, oracle);
     }
 
+    /// @notice Owner: send health calls to many arbiters at once (e.g. after a wide outage).
     function sendHealthCalls(bytes32[] calldata keys) external onlyOwner {
-        for (uint256 i = 0; i < keys.length; i++) _call(keys[i]);
+        // registered keys only: a checkpoint for a key not yet registered would make its registration a
+        // returning one, with scores 0 instead of `start`
+        for (uint256 i = 0; i < keys.length; i++) if (_cur(keys[i]).flags & F_REGISTERED != 0) _call(keys[i]);
     }
 
     function _call(bytes32 key) internal {
@@ -610,7 +661,7 @@ contract ReputationKeeper is Ownable {
      */
     function selectArbiters(SelectParams calldata sp, bytes32 seed, uint256 atBlock, uint256 atTime)
         external
-        onlyApproved
+        onlyRole(ROLE_SELECT)
         returns (Selected[] memory sel)
     {
         if (sp.alpha > 1000 || sp.count == 0 || sp.estimatedBaseCost >= sp.maxFee || sp.maxFeeBasedScalingFactor < 1)
@@ -690,7 +741,7 @@ contract ReputationKeeper is Ownable {
      */
     function pickBeacons(bytes32 seed, uint64 cls, uint256 atBlock, uint256 atTime, uint256 count)
         external
-        onlyApproved
+        onlyRole(ROLE_SELECT)
         returns (bytes32[] memory keys)
     {
         if (atBlock >= block.number) revert FutureBlock();
@@ -794,7 +845,7 @@ contract ReputationKeeper is Ownable {
     /// @param roundEnd the round's deadline: being frozen is judged then, not at settlement, so an arbiter
     ///        that recovers before settlement is not charged for the outage, and one that stays frozen
     ///        past settlement gains nothing it would not have had at round end
-    function applyOutcomes(bytes32[] calldata keys, uint8[] calldata codes, uint256 roundEnd) external onlyApproved {
+    function applyOutcomes(bytes32[] calldata keys, uint8[] calldata codes, uint256 roundEnd) external onlyRole(ROLE_SCORE) {
         if (keys.length != codes.length) revert BadParams();
         Points memory pt = points;
         uint256 burnTotal;
@@ -954,12 +1005,35 @@ contract ReputationKeeper is Ownable {
 
     /// @notice The arbiter pool's draw (the aggregator's forfeits, paid out a share per draw): a registered
     ///         arbiter picked uniformly from `seed`, returned as its payee (its operator's owner). At most
-    ///         two picks, to keep the draw cheap: if neither is available (paused, banned, exiting or
-    ///         understaked), it returns address(0) and the pool waits for the next draw.
+    ///         two picks, to keep the draw cheap: if neither is available, it returns address(0) and the
+    ///         pool waits for the next draw.
+    ///         Reads the registry and the arbiters' state as of the request block `atBlock` (time `atTime`),
+    ///         like selection: the seed is public from block B+2, so a pick from the live state could be
+    ///         steered after it is known (registering keys or completing exits until the pick lands on
+    ///         one's own key, or pausing and unpausing). Available = registered and not paused, banned,
+    ///         exiting, under-staked, blocked or frozen at B (the beacon pick's rule). A B older than
+    ///         MAX_DRAW_AGE, or not yet complete, gives address(0).
+    function poolPayeeAt(bytes32 seed, uint256 atBlock, uint256 atTime) external view returns (address) {
+        if (atBlock >= block.number || atTime + MAX_DRAW_AGE < block.timestamp) return address(0);
+        uint256 n = _lenAtOf(registryLen, atBlock);
+        for (uint256 t = 0; t < 2 && n != 0; t++) {
+            bytes32 key = registry[uint256(keccak256(abi.encodePacked(seed, t))) % n];
+            if (key == bytes32(0)) continue;          // a freed slot
+            Ck memory c = _at(key, atBlock);
+            if (c.flags & (F_REGISTERED | F_PAUSED | F_BANNED | F_EXITING | F_UNDERSTAKED) == F_REGISTERED
+                && c.blockedUntil <= atTime && !_frozenAt(c, atTime)) return IOracleOwner(metas[key].oracle).owner();
+        }
+        return address(0);
+    }
+
+    /// @notice Deprecated (the current aggregator's call): the pick from the live state, which can be
+    ///         steered once the seed is public. Kept until the aggregator passes the request block to
+    ///         poolPayeeAt(seed, atBlock, atTime).
     function poolPayee(bytes32 seed) external view returns (address) {
         uint256 n = registry.length;
         for (uint256 t = 0; t < 2 && n != 0; t++) {
             bytes32 key = registry[uint256(keccak256(abi.encodePacked(seed, t))) % n];
+            if (key == bytes32(0)) continue;
             if (_cur(key).flags & (F_REGISTERED | F_PAUSED | F_BANNED | F_EXITING | F_UNDERSTAKED) == F_REGISTERED)
                 return IOracleOwner(metas[key].oracle).owner();
         }
@@ -968,6 +1042,11 @@ contract ReputationKeeper is Ownable {
 
     /// @notice Registered arbiters (exited ones are removed; banned ones stay until they complete their exit)
     function registryLength() external view returns (uint256) {
+        return registry.length - freeRegSlots.length;
+    }
+
+    /// @notice Registry slots, freed ones included (what the pool pick draws from)
+    function registrySlots() external view returns (uint256) {
         return registry.length;
     }
 
@@ -976,12 +1055,24 @@ contract ReputationKeeper is Ownable {
     ///         with rk.isContractApproved(requester) for each keeper on its list (and checks the function
     ///         exists when the keeper is added). Without it every dispatch to a real operator reverts.
     function isContractApproved(address c) external view returns (bool) {
-        return approvedContracts[c];
+        return roles[c] & ROLE_GATE != 0;
     }
 
+    /// @notice Whether `c` holds every role (what setApproved grants; the deploy scripts read it)
+    function approvedContracts(address c) external view returns (bool) {
+        return roles[c] == ROLE_ALL;
+    }
+
+    /// @notice Grant or revoke every role (an aggregator). Use setRoles for less.
     function setApproved(address aggregator, bool ok) external onlyOwner {
-        approvedContracts[aggregator] = ok;
+        roles[aggregator] = ok ? ROLE_ALL : 0;
         emit ContractApproval(aggregator, ok);
+    }
+
+    function setRoles(address account, uint8 r) external onlyOwner {
+        if (r > ROLE_ALL) revert BadParams();
+        roles[account] = r;
+        emit RolesSet(account, r);
     }
 
     function setPoints(Points calldata p) external onlyOwner {

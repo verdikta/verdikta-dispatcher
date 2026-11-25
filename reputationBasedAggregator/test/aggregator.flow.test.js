@@ -799,18 +799,22 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
       return agg.ethOwed(POOL);
     }
 
-    it("each draw pays an eighth of the pool to one registered arbiter's payee; nobody can withdraw the pool", async () => {
+    it("each draw pays an eighth of the pool, at most its own base fees, to one registered arbiter's payee; nobody can withdraw the pool", async () => {
       const p0 = await forfeit();
       expect(p0 > 0n).to.equal(true);
+      const min = (a, b) => (a < b ? a : b);
       const owners = new Set(await Promise.all(arbs.map((a) => a.op.owner())));
       const r = await drv.request();
+      const base = (await agg.getRoundInfo(r.aggId)).baseFees;
       const paid = eventArgs(r.rcpt, "PoolPayment");
       expect(paid.length).to.equal(1);
-      expect(paid[0].amount).to.equal(p0 / 8n);
+      const s1 = min(p0 / 8n, base);
+      expect(paid[0].amount).to.equal(s1);
       expect(owners.has(paid[0].payee)).to.equal(true);
-      expect(await agg.ethOwed(POOL)).to.equal(p0 - p0 / 8n);
+      expect(await agg.ethOwed(POOL)).to.equal(p0 - s1);
       const r2 = await drv.request();                                          // the next draw: an eighth of the rest
-      expect(eventArgs(r2.rcpt, "PoolPayment")[0].amount).to.equal((p0 - p0 / 8n) / 8n);
+      const base2 = (await agg.getRoundInfo(r2.aggId)).baseFees;
+      expect(eventArgs(r2.rcpt, "PoolPayment")[0].amount).to.equal(min((p0 - s1) / 8n, base2));
       await expect(agg.withdrawEthFor(POOL)).to.be.revertedWithCustomError(agg, "NotAuthorized");
     });
 

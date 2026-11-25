@@ -213,12 +213,17 @@ timeout), so one deployment serves every class. Local networks get a `MockLinkTo
   missed beacon quorum's rest, a seed-dependent draw failure after beacons, the committers' dust)
   credit `ethOwed(address(0))`. Nobody can withdraw it: `withdrawEthFor(address(0))` reverts
   `NotAuthorized`, and `msg.sender` is never address(0). Each `drawJury` that draws a jury pays an
-  eighth of it to one registered arbiter's payee (`PoolPayment`), picked uniformly by the keeper's
+  eighth of it, at most the drawn round's base fees, to one registered arbiter's payee (`PoolPayment`), picked uniformly by the keeper's
   `poolPayee` from the draw's seed: two picks at most, skipping paused, banned, exiting and
   understaked arbiters; with none, the pool waits for the next draw. The keeper call gets 80k gas and
   its failure is caught, so it cannot make the draw fail. The seed is fixed by a block hash after the
-  request and is the same whoever draws, a forfeiting round never picks its own winner, and an
-  eighth per draw makes grinding with many requests cost more than it wins. The registry is dense:
+  request and is the same whoever draws, and a forfeiting round never picks its own winner. But the
+  winner is public from B+2 and a requester may leave its round undrawn, so without a cap an arbiter
+  could make near-free rounds (its own private class, a 1-wei fee) and draw only those that pay it
+  (security review 2026-11-25: 1 of 13 arbiters took 49% of the pool for 4,200 wei). The cap makes a
+  skipped round cost its whole escrow and a won draw pay at most its base fees, which are less. The
+  winner also depends on the registry at the draw, not as of B, so timing a draw around registry
+  changes gives a grinder a few extra tries. The registry is dense:
   added to at registration, swap-and-pop at `completeExit`; `registryLength()` is its size.
 - **A late close leaves time to promote.** A commit that closes the phase near the deadline extends
   it to at least 30 s after the close.

@@ -12,7 +12,9 @@ pragma solidity ^0.8.23;
  *         (`uint256[][]`) instead of the aggregator's `Response[]`, so the
  *         library has no dependency on the contract's storage types.
  */
-interface IPoolKeeper { function poolPayee(bytes32 seed) external view returns (address); }
+interface IPoolKeeper {
+    function poolPayeeAt(bytes32 seed, uint256 atBlock, uint256 atTime) external view returns (address);
+}
 
 library AggregatorLib {
     /// @notice A share of the arbiter pool, paid at a draw to a random registered arbiter's payee
@@ -28,10 +30,28 @@ library AggregatorLib {
     ///         requester; paying an eighth per draw makes grinding with many requests cost more than it
     ///         wins. The keeper call has capped gas, so an operator's owner() cannot make the draw fail;
     ///         with no winner the pool waits for the next draw.
-    function payPool(mapping(address => uint256) storage owed, address keeper, bytes32 seed, bytes32 aggId) public {
+    ///         The share is capped at `cap`, the drawn round's base fees: a requester sees the winner from
+    ///         B+2 and may leave a losing round undrawn, so without the cap an arbiter could make near-free
+    ///         rounds (a private class, a 1-wei fee) and draw only those that pay itself. With it, a skipped
+    ///         round costs its whole escrow and a won draw pays at most its base fees, which are less.
+    ///         The keeper picks from its registry as of the request block `atBlock` (time `atTime`): the seed
+    ///         is public from B+2, so a pick from the live registry could be steered by registering keys or
+    ///         completing exits until it lands on one's own.
+    function payPool(
+        mapping(address => uint256) storage owed,
+        address keeper,
+        bytes32 seed,
+        bytes32 aggId,
+        uint256 cap,
+        uint256 atBlock,
+        uint256 atTime
+    ) public {
         uint256 share = owed[address(0)] / POOL_SHARE;
+        if (share > cap) share = cap;
         if (share == 0) return;
-        try IPoolKeeper(keeper).poolPayee{gas: POOL_GAS}(keccak256(abi.encodePacked(seed, "pool"))) returns (address w) {
+        try IPoolKeeper(keeper).poolPayeeAt{gas: POOL_GAS}(keccak256(abi.encodePacked(seed, "pool")), atBlock, atTime) returns (
+            address w
+        ) {
             if (w != address(0)) {
                 owed[address(0)] -= share;
                 owed[w] += share;
@@ -237,7 +257,9 @@ library AggregatorLib {
     error BadInput();
 
     /// @notice The commit-request payload "1:<cid>,<cid>...[:<addendum>]". Reverts with BadInput for no
-    ///         CIDs, more than `maxCount`, a CID longer than `maxLen` or an addendum longer than `maxAdd`.
+    ///         CIDs, more than `maxCount`, a CID longer than `maxLen` or an addendum longer than `maxAdd`,
+    ///         and for an empty CID or one holding ',' or ':' (the payload's delimiters): such a "CID"
+    ///         would smuggle extra archives or an addendum into a request built from someone else's CID.
     function buildCommitPayload(string[] memory cids, string memory addendum, uint256 maxCount, uint256 maxLen, uint256 maxAdd)
         public
         pure
@@ -246,7 +268,9 @@ library AggregatorLib {
         if (cids.length == 0 || cids.length > maxCount || bytes(addendum).length > maxAdd) revert BadInput();
         bytes memory cat = "1:";
         for (uint256 i = 0; i < cids.length; i++) {
-            if (bytes(cids[i]).length > maxLen) revert BadInput();
+            bytes memory c = bytes(cids[i]);
+            if (c.length == 0 || c.length > maxLen) revert BadInput();
+            for (uint256 k = 0; k < c.length; k++) if (c[k] == "," || c[k] == ":") revert BadInput();
             cat = abi.encodePacked(cat, cids[i], i + 1 < cids.length ? "," : "");
         }
         if (bytes(addendum).length > 0) cat = abi.encodePacked(cat, ":", addendum);

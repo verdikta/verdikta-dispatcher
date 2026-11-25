@@ -48,7 +48,7 @@ async function deployCore({ withAggregator = true } = {}) {
     await keeper.setApproved(await agg.getAddress(), true);
     // item 9's beacon stage lives in its own contract: the keeper approves it, it approves the aggregator
     beacons = await (await ethers.getContractFactory("JuryBeacons")).deploy(await keeper.getAddress());
-    await keeper.setApproved(await beacons.getAddress(), true);
+    await keeper.setRoles(await beacons.getAddress(), 2);   // ROLE_SELECT: the beacon pick only
     await beacons.setApproved(await agg.getAddress(), true);
     await agg.setContracts(await keeper.getAddress(), await beacons.getAddress());
   }
