@@ -1,7 +1,17 @@
 # Migrating Arbiter Payment from LINK to ETH
 
-**Status:** Implemented (ETH aggregator + unit tests landed).
-**Scope:** `reputationBasedAggregator/contracts/ReputationAggregator.sol` only. `ReputationKeeper.sol` and `ArbiterOperator.sol` are **not** changed.
+!!! warning "History: the v1 design note"
+    This note records how the **v1** aggregator moved arbiter payment from LINK to ETH. It shipped in v1 (deployed; tag `aggregator-v0.1.0`) and is kept for its reasoning. The v2 contracts on the `beacon` branch keep its core decisions (ETH escrow sized for the worst case, the pull-only `ethOwed` ledger, `withdrawEth` and `withdrawEthFor`, the payee as the operator's `owner()` snapshotted at credit time, zero-LINK dispatch, the clamp to `maxOracleFee`, no owner ETH sweep), but much of the surrounding code is different, so the function names, line numbers and file paths below describe v1. What v2 changed:
+
+    - **The request only escrows.** Base fees are credited at the later `drawJury`, to every dispatched juror (not at the request); `maxTotalFee` is `maxTotalFee(maxFee, minFee, withBeacons, K, P)` and also covers a fee floor, beacon payments and the draw and promote rewards. The jury (K, M, N, P, timeout) comes with each request.
+    - **Rounds end with `settle(aggId)`**, not `finalizeEvaluationTimeout`; and some refunds now go to a treasury instead of the requester, where a refund would be a free re-roll of the jury. Credit covers only what `msg.value` does not (`fromCredit = required − msg.value`), rather than credit first.
+    - **The views** are `getRoundInfo(aggId)` and `getJury(aggId)`; `getAggregationStatus`, `getEthAccounting`, `getContractConfig` and `withdrawLink` are gone (v2 holds no LINK). The setters are `setLimits`, `setParams` (which sets `maxOracleFee` and the bonus multiplier), `setRewards` and `setContracts`.
+    - **The keeper changed completely.** v2 is a new keeper (two scores, stake, health calls, selection as of the request block); it has `setFee(key, fee)`, so a fee change no longer needs a re-registration; registration is `registerArbiter`, approval `setApproved`. The dual-aggregator plan of §5 does not apply to v2, which is a redeploy with a new keeper.
+
+    See [Fee Mechanisms](fees.md) for v2 and [MIGRATION.md](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/MIGRATION.md) for every change.
+
+**Status:** Implemented in v1 (ETH aggregator + unit tests landed; tag `aggregator-v0.1.0`). Superseded by v2, which keeps the ETH payment design (see the box above).
+**Scope (v1):** `reputationBasedAggregator/contracts/ReputationAggregator.sol` only. `ReputationKeeper.sol` and `ArbiterOperator.sol` were **not** changed.
 
 This note captures the complete plan, the reasoning behind each decision, and the
 facts that were verified while designing it, so the approach can be reconstructed
@@ -584,6 +594,8 @@ Enforce the invariant in the ETH aggregator on two layers:
 > too) but is intentionally left unchanged here.
 
 ### 5.4 Changing a fee requires an arbiter restart (no `setFee`)
+
+> **v2:** the v2 keeper has `setFee(key, fee)`, which keeps the arbiter's reputation. This section describes v1.
 **Decision: no `setFee` function.** There is no `setFee` in the keeper today, and we
 keep it that way. Changing an arbiter's fee requires `deregisterOracle` +
 `registerOracle` — i.e. an arbiter restart/re-registration, exactly as required now.
@@ -810,7 +822,7 @@ Minor sweep-ups (decisions, with rationale):
 
 ## 10. Resolved decisions
 
-- **No `setFee` in the keeper.** Fee changes require an arbiter restart +
+- **No `setFee` in the keeper** (v1; the v2 keeper has `setFee`). Fee changes require an arbiter restart +
   re-registration, as today; the reputation reset is accepted (§5.4). The keeper is
   not changed.
 - **Send 0 juel** on commit dispatch — no LINK reserve in the aggregator (§3).

@@ -1,67 +1,60 @@
 # Verdikta Dispatcher Smart Contracts
 
-The Verdikta Dispatcher is a comprehensive smart contract system that provides decentralized AI-powered dispute resolution services. It consists of multiple specialized contracts that work together to manage oracle networks, handle requests, aggregate responses, and maintain reputation systems.
+The Verdikta Dispatcher is a smart contract system that provides decentralized AI-powered evaluation and dispute resolution. Its contracts draw a jury of staked arbiters for each request, collect their answers by commit-reveal, aggregate them, pay the arbiters in ETH and keep their reputation.
 
-!!! note "Checked against the code"
-    Revised on 2026-11-22 against the contracts in this repository and the aggregator deployed on Base mainnet. The ReputationAggregator is the production contract and is paid in ETH: a requester needs no LINK and approves no token. ReputationSingleton and SimpleContract are legacy contracts that are still paid in LINK.
+!!! note "Version 2 (not deployed yet)"
+    Revised on 2026-11-25 for the v2 contracts on the `beacon` branch. v2 is a breaking redeploy of the deployed v1 contracts (tag `aggregator-v0.1.0`) and is **not deployed yet**: its addresses are set at the v2 deployment. In v2 one aggregator serves every jury size, because each request carries its jury (K drawn, M promoted, N counted, P clustered, and a timeout); the jury is drawn after the request from a later block hash, optionally mixed with arbiter beacons; and the round needs a few permissionless calls after the request. The ReputationAggregator is paid in ETH: a requester needs no LINK and approves no token. ReputationSingleton and SimpleContract are legacy contracts that are still paid in LINK and were written for the v1 keeper. [MIGRATION.md](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/MIGRATION.md) lists what changes for every consumer.
 
 ## Architecture Overview
 
 ```mermaid
 graph TB
-    A[Client Applications] --> B[Contract Interfaces]
-    B --> C[ReputationAggregator]
-    B --> D[ReputationSingleton] 
-    B --> E[SimpleContract]
-    C --> F[ReputationKeeper]
-    D --> F
-    E --> G[ArbiterOperator]
-    F --> H[Oracle Network]
-    G --> H
-    H --> I[AI Processing]
-    I --> J[Response Aggregation]
-    J --> K[On-chain Settlement]
-    
-    subgraph "Core Contracts"
-        C
-        D
-        E
-        F
-        G
-    end
+    A[Client Applications] --> C[ReputationAggregator]
+    C -->|drawJury: selectArbiters as of block B| F[ReputationKeeper]
+    C -->|withBeacons| BC[JuryBeacons]
+    BC -->|pickBeacons, revealAfter| F
+    C -->|commit and reveal requests| G[ArbiterOperator]
+    G -->|isContractApproved| F
+    G --> H[Arbiter nodes: AI evaluation]
+    H -->|commit, reveal| C
+    H -->|health answers| F
+    C -->|settle: applyOutcomes| F
+    D[ReputationSingleton, legacy] --> F1[v1 ReputationKeeper]
+    E[SimpleContract, legacy] --> G
 ```
 
 ## Contract Components
 
-### Core Aggregation Contracts
+### Core Contracts (v2)
 
-| Contract | Purpose | Use Case | Paid In |
-|----------|---------|----------|---------|
-| **[ReputationAggregator](contracts/reputation-aggregator.md)** | Multi-oracle commit-reveal aggregation | High-stakes disputes requiring maximum security | ETH, sent with the request |
-| **[ReputationSingleton](contracts/reputation-singleton.md)** | Single-oracle fast resolution | Simple disputes needing quick resolution | LINK (legacy) |
-| **[SimpleContract](contracts/simple-contract.md)** | Basic oracle interaction | Development and testing | LINK (legacy) |
+| Contract | Purpose | Paid In |
+|----------|---------|---------|
+| **[ReputationAggregator](contracts/reputation-aggregator.md)** | Escrows a request, draws its jury (`drawJury`), runs commit-reveal with random promotion, clusters the answers, settles every juror's outcome with the keeper | ETH, sent with the request |
+| **[ReputationKeeper](contracts/reputation-keeper.md)** | Arbiter registry and stake, two-score reputation, blocks and bans, hash-chain health calls and the freeze, selection from a shortlist as of the request block | VDKA stake |
+| **[JuryBeacons](contracts/jury-beacons.md)** | Optional per request: picks 4 beacon arbiters and mixes the first 2 hash-chain values into the jury's seed | (beacons are paid by the aggregator) |
+| **[ArbiterOperator](contracts/arbiter-operator.md)** | Each arbiter's Chainlink operator; accepts requests only from contracts a listed keeper approves | |
 
-### Infrastructure Contracts
+### Legacy Contracts (LINK, v1 keeper)
 
-| Contract | Purpose | Use Case |
-|----------|---------|----------|
-| **[ReputationKeeper](contracts/reputation-keeper.md)** | Oracle reputation and selection | Managing oracle quality and availability |
-| **[ArbiterOperator](contracts/arbiter-operator.md)** | Chainlink operator with restrictions | Ensuring only approved contracts can request oracles |
+| Contract | Purpose | Paid In |
+|----------|---------|---------|
+| **[ReputationSingleton](contracts/reputation-singleton.md)** | Single-oracle fast resolution | LINK |
+| **[SimpleContract](contracts/simple-contract.md)** | Basic oracle interaction, development and testing | LINK |
 
 ## Network Deployments
 
-The LINK addresses below are used for the Chainlink request path and by the legacy contracts. A requester of the ReputationAggregator does not need LINK. The full list is in the [Deployment Guide](deployment/index.md).
+The v2 contracts are not deployed: their addresses are set at the v2 deployment. The addresses below are the deployed **v1** contracts, which take the v1 request (7 arguments) and do not work with the v2 examples. The full list is in the [Deployment Guide](deployment/index.md).
 
-### Base (Mainnet)
+### Base (Mainnet), v1
 - **ReputationAggregator (ETH-funded)**: `0xd8F38bCBEE43bE3bd31655a563f20c9B3e67142a`
-- **ReputationKeeper** (the aggregator's `reputationKeeper()`): `0x2D96cc4F6619d08FC14b7ee0eec02d1F3eE1d0b0`
-- **Wrapped Verdikta Token** (the keeper's `verdiktaToken()`): `0x1EA68D018a11236E07D5647175DAA8ca1C3D0280`
+- **ReputationKeeper**: `0x2D96cc4F6619d08FC14b7ee0eec02d1F3eE1d0b0`
+- **Wrapped Verdikta Token**: `0x1EA68D018a11236E07D5647175DAA8ca1C3D0280`
 - **LINK Token**: `0x88Fb150BDc53A65fe94Dea0c9BA0a6dAf8C6e196`
 
-### Base Sepolia (Testnet)
+### Base Sepolia (Testnet), v1
 - **ReputationAggregator (ETH-funded)**: `0xe8a385E473EA710c5a88Cc72681a16a26fe380e4`
-- **ReputationKeeper** (the aggregator's `reputationKeeper()`): `0xE09821277D9af702F7910a57e85EaC6D83e4d794`
-- **Wrapped Verdikta Token** (the keeper's `verdiktaToken()`): `0x94e3c031fe9403c80E14DaFbCb73f191C683c2B1`
+- **ReputationKeeper**: `0xE09821277D9af702F7910a57e85EaC6D83e4d794`
+- **Wrapped Verdikta Token**: `0x94e3c031fe9403c80E14DaFbCb73f191C683c2B1`
 - **LINK Token**: `0xE4aB69C077896252FAFBD49EFD26B5D171A32410`
 - **Verdikta Token**: `0xe46F6b494F111d958CDBB52536AD78c4eEeB0149`
 
@@ -72,47 +65,55 @@ The LINK addresses below are used for the Chainlink request path and by the lega
 ## Quick Start
 
 ### For Developers
-1. **Choose Your Contract**: Start with [ReputationAggregator](contracts/reputation-aggregator.md), the production contract, which is paid in ETH. [ReputationSingleton](contracts/reputation-singleton.md) and [SimpleContract](contracts/simple-contract.md) are legacy contracts paid in LINK
-2. **Review Integration**: See [Integration Examples](examples/index.md) for code samples
-3. **Deploy & Test**: Follow our [Deployment Guide](deployment/index.md)
+1. **Read the round lifecycle**: request, `drawJury`, commits, `closeCommits` if needed, `promote`, reveals, result, `settle`. See [Integration Examples](examples/index.md#the-round-lifecycle)
+2. **Choose a jury and quote it**: `maxTotalFee(maxFee, minFee, withBeacons, K, P)`; see [Fee Mechanisms](advanced/fees.md)
+3. **Integrate**: [Integration Examples](examples/index.md), [Smart Contract Walkthrough](examples/integration.md), [Frontend Guide](examples/frontend.md)
+4. **Deploy and test**: [Deployment Guide](deployment/index.md)
 
-### For Oracle Operators
-1. **Deploy Operator**: Set up an [ArbiterOperator](contracts/arbiter-operator.md) contract
-2. **Register Oracle**: Register with the [ReputationKeeper](contracts/reputation-keeper.md)
-3. **Monitor Performance**: Track reputation scores and earnings
+### For Arbiter Operators
+1. **Add the v2 keeper to your operator**: `addReputationKeeper(<v2 keeper>)` on your [ArbiterOperator](contracts/arbiter-operator.md)
+2. **Register**: `registerArbiter(operator, jobId, fee, classes, chainHead)` with the [ReputationKeeper](contracts/reputation-keeper.md), staking 100 VDKA
+3. **Switch the node to the v2 commit format and run its health job**: see [MIGRATION.md](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/MIGRATION.md#arbiter-node-new-work)
+4. **Monitor**: scores, blocks and freezes with `getArbiter(key)`; earnings with `ethOwed(owner)`
 
 ## Getting Started
 
-### Integration Examples
+### Integration Example
 
 ```solidity
-// Simple integration with the ReputationAggregator. The request is paid in ETH
-// sent with the call: there is no token to approve.
+// A request with its jury. The request only escrows; the round is then drawn,
+// promoted and settled by permissionless calls (see the round lifecycle).
 interface IReputationAggregator {
+    struct Jury { uint8 K; uint8 M; uint8 N; uint8 P; uint40 timeout; }
     function requestAIEvaluationWithApproval(
         string[] calldata cids,
         string calldata addendumText,
         uint256 alpha,
-        uint256 maxOracleFee,
+        uint256 maxFee,
+        uint256 minFee,
         uint256 estimatedBaseCost,
         uint256 maxFeeBasedScalingFactor,
-        uint64 requestedClass
+        uint64 requestedClass,
+        bool withBeacons,
+        Jury calldata jury
     ) external payable returns (bytes32);
-    function maxTotalFee(uint256 requestedMaxOracleFee) external view returns (uint256);
+    function maxTotalFee(uint256 maxFee, uint256 minFee, bool withBeacons, uint8 K, uint8 P)
+        external view returns (uint256);
+    function drawJury(bytes32 aggId) external;
 }
 
 contract MyDApp {
     IReputationAggregator public verdiktaDispatcher;
 
-    uint256 public constant MAX_ORACLE_FEE = 15e13; // 0.00015 ETH per oracle at most
+    uint256 public constant MAX_FEE = 15e13; // 0.00015 ETH per arbiter at most
 
     constructor(address aggregator) {
         verdiktaDispatcher = IReputationAggregator(aggregator);
     }
 
-    // Worst-case ETH to send with requestDispute()
+    // Worst-case ETH to send with requestDispute(): Small jury, no floor, no beacons
     function quote() external view returns (uint256) {
-        return verdiktaDispatcher.maxTotalFee(MAX_ORACLE_FEE);
+        return verdiktaDispatcher.maxTotalFee(MAX_FEE, 0, false, 6, 3);
     }
 
     function requestDispute(string[] calldata evidence) external payable returns (bytes32 requestId) {
@@ -120,15 +121,20 @@ contract MyDApp {
             evidence,
             "Additional context",
             500,            // alpha (reputation weight)
-            MAX_ORACLE_FEE, // max oracle fee, in ETH wei
+            MAX_FEE,        // fee ceiling per arbiter, in ETH wei
+            0,              // fee floor per juror (none)
             8e9,            // estimated base cost, in ETH wei
             5,              // max fee scaling factor
-            128             // requested class
+            128,            // arbiter class
+            false,          // no beacons
+            IReputationAggregator.Jury({K: 6, M: 5, N: 4, P: 3, timeout: 300})
         );
+        // The unspent prepayment is credited to this contract in the aggregator.
+    }
 
-        // Store requestId and wait for fulfillment.
-        // The unspent part of the prepayment is credited to this contract in the
-        // aggregator: see the ReputationAggregator page for how to collect it.
+    // From two blocks after the request; within 30 s it earns this contract the draw reward
+    function draw(bytes32 requestId) external {
+        verdiktaDispatcher.drawJury(requestId);
     }
 }
 ```
@@ -136,50 +142,39 @@ contract MyDApp {
 ### Frontend Integration
 
 ```javascript
-// Connect to deployed contract
-const contract = new ethers.Contract(
-    contractAddress,
-    REPUTATION_AGGREGATOR_ABI,
-    signer
-);
+// Connect to the deployed v2 aggregator
+const contract = new ethers.Contract(contractAddress, REPUTATION_AGGREGATOR_ABI, signer);
 
-// Size the prepayment: the worst case for your fee ceiling,
-// less any credit you already hold in the aggregator
-const maxOracleFee = ethers.parseEther("0.00015");
-const required = await contract.maxTotalFee(maxOracleFee);
+// Size the prepayment for the jury: the worst case, less any credit you hold
+const jury = { K: 6, M: 5, N: 4, P: 3, timeout: 300 };
+const maxFee = ethers.parseEther("0.00015");
+const required = await contract.maxTotalFee(maxFee, 0n, false, jury.K, jury.P);
 const credit = await contract.ethOwed(await signer.getAddress());
 const value = required > credit ? required - credit : 0n;
 
 const args = [
     ["QmHash1", "QmHash2"], // IPFS content hashes
-    "Additional evidence",   // Optional addendum
-    500,          // alpha (reputation weight 0-1000)
-    maxOracleFee, // max oracle fee, in ETH wei
-    8_000_000_000n, // estimated base cost, in ETH wei
-    5,            // max fee scaling factor
-    128           // requested class (oracle type)
+    "Additional evidence",   // optional addendum
+    500,                     // alpha (reputation weight 0-1000)
+    maxFee,                  // fee ceiling per arbiter, in ETH wei
+    0n,                      // fee floor per juror
+    8_000_000_000n,          // estimated base cost, in ETH wei
+    5,                       // max fee scaling factor
+    128,                     // arbiter class
+    false,                   // beacons
+    jury
 ];
+const tx = await contract.requestAIEvaluationWithApproval(...args, { value });
+const receipt = await tx.wait();
 
-// Oracle selection is random, so add headroom to the gas estimate
-const estimate = await contract.requestAIEvaluationWithApproval.estimateGas(...args, { value });
-
-// Submit evaluation request: the ETH travels with the call
-const tx = await contract.requestAIEvaluationWithApproval(...args, {
-    value,
-    gasLimit: (estimate * 150n) / 100n
-});
-
-// Monitor for results
+// Then, from two blocks later: contract.drawJury(aggId), and when due
+// closeCommits(aggId), promote(aggId); settle(aggId) after the deadline if the round died.
 contract.on("FulfillAIEvaluation", (aggRequestId, likelihoods, justifications) => {
-    console.log("Evaluation complete:", {
-        aggRequestId,
-        likelihoods: likelihoods.map(l => l.toString()),
-        justifications
-    });
+    console.log("Evaluation complete:", { aggRequestId, likelihoods: likelihoods.map(String), justifications });
 });
 ```
 
-A round that has not finished within the timeout (`responseTimeoutSeconds()`, 300 seconds on Base mainnet) is not closed automatically: call `finalizeEvaluationTimeout(aggRequestId)` to close it and have the unspent part of your prepayment credited back. See [ReputationAggregator](contracts/reputation-aggregator.md).
+The round needs the calls after the request. A round still open at its deadline is dead: `settle(aggId)` closes it and credits the refund. See the [round lifecycle](examples/index.md#the-round-lifecycle) and the `readStatus`/`advance` helpers in [Integration Examples](examples/index.md#frontend-integration-examples).
 
 ## API Reference
 
@@ -189,11 +184,11 @@ A round that has not finished within the timeout (`responseTimeoutSeconds()`, 30
 
 ## Advanced Topics
 
-- **[Reputation System](advanced/reputation.md)** - How oracle scoring works
-- **[Fee Mechanisms](advanced/fees.md)** - ETH fees, prepayment and refunds for the aggregator; LINK fees for the legacy contracts
-- **[Security Model](advanced/security.md)** - Commit-reveal and other protections
-- **[Oracle Selection](advanced/oracle-selection.md)** - Weighted selection algorithms
-- **[ETH Payment Implementation](advanced/eth-payment-migration.md)** - How and why the aggregator pays arbiters in ETH while keeping the Chainlink request path; read the implementation notes at its top first
+- **[Reputation System](advanced/reputation.md)** - Two scores, the points per round, blocks, bans and the freeze
+- **[Fee Mechanisms](advanced/fees.md)** - The quote, fee ceiling and floor, rewards, refunds and the treasury; LINK fees for the legacy contracts
+- **[Security Model](advanced/security.md)** - The v2 threat model: the draw, beacons, commit-reveal binding, collusion and jury size
+- **[Oracle Selection](advanced/oracle-selection.md)** - The two-phase draw, beacons, the shortlist, and K drawn → M promoted → N counted → P clustered
+- **[ETH Payment Implementation (history)](advanced/eth-payment-migration.md)** - The v1 design note on paying arbiters in ETH while keeping the Chainlink request path
 
 ## Support
 

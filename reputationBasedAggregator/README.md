@@ -151,14 +151,21 @@ timeout), so one deployment serves every class. Local networks get a `MockLinkTo
 - **Fewer than K eligible arbiters at B:** the jury fills with repeats. All m eligible arbiters are
   drawn and slot k holds pick k mod m, so a thin pool (testing, start-up, a niche class) still
   answers. A repeated arbiter answers, is paid and is scored once per slot, and can decide a round
-  alone; with hundreds of arbiters per class it never happens. Only when none is eligible does the draw
-  fail the round and refund (no jury could be drawn, so it is no re-roll). K is capped at the keeper's
-  shortlist per request, so a full pool never fills with repeats.
+  alone. Only when none is eligible does the draw fail the round and refund (no jury could be drawn,
+  so it is no re-roll). K is checked against the keeper's shortlist at request time only, so repeats
+  can also come from a deep pool: if the owner lowers `shortlistSize` below a pending round's K, or if
+  the walk's `maxScan` (400) entries, freed and ineligible ones included, hold fewer than K eligible
+  arbiters. A requester who picks a class or fee ceiling that only its own arbiter fits gets a jury
+  of one operator: P ≥ 2 then does not mean two independent arbiters, and a Q-of-N rule counts
+  slots, not arbiters.
 - **The jury is the request's** (`requestAIEvaluationWithApproval(…, withBeacons, jury)`, with
   `jury = (K, M, N, P, timeout)`; `getJury(aggId)` reads it back). The owner bounds it with
   `setLimits(maxJury, maxTimeout, tPlus)`. Each new request settles due rounds up to
-  `settlePerRequest × its own K` slots, in queue order: a round too big for that budget waits for a
-  bigger request or anyone's `settle()`, so a small request never pays to settle a Jumbo round.
+  `settlePerRequest × its own K` slots, in queue order, so a small request never pays to settle a
+  Jumbo round. The walk stops at the first round that is too big for the remaining budget or not yet
+  past its deadline: a K = 50 round at the head is settled by a request only if that request has
+  K ≥ 25, and a long-timeout round at the head holds back shorter ones behind it. Those rounds wait
+  for such a request or for anyone's `settle()`, so settlement can need an outside caller.
 - **`promote` pays its caller 1 x eff** (`promoteRewardFees`, in the escrow), so third parties call it
   and a requester cannot withhold it. A round that closed but was never promoted sends its unspent
   prepay to the treasury, not back to the requester, so aborting a promotion draw buys no refund.
@@ -212,12 +219,13 @@ timeout), so one deployment serves every class. Local networks get a `MockLinkTo
     the aggregator directly.
 - **The settlement-queue walk is bounded** at 8 steps per round a request may settle, counting rounds
   already settled with `settle()`, so holes in the queue cannot make requests run out of gas.
-- **Only the arbiter's owner can top up its stake** (a top-up re-applies the current requirement).
+- **Only the operator's owner or the keeper owner can top up a stake** (a top-up re-applies the
+  current requirement).
 
 ## Beacons (item 9's flag; Jumbo)
 
 - **Flag and escrow.** The requester sets `withBeacons` in the request. The escrow adds the quorum
-  (2) in fees: `maxTotalFee(maxFee, minFee, true)`. A used beacon is paid as a juror: the ceiling,
+  (2) in fees: `maxTotalFee(maxFee, minFee, true, K, P)`. A used beacon is paid as a juror: the ceiling,
   or the fee floor if that is higher.
 - **The pick.** The first `drawJury` seals `blockhash(B+1)` and asks `JuryBeacons` to start. The keeper
   picks 4 arbiters from the request's class, entirely from its state as of B: registered, and not
@@ -289,5 +297,6 @@ timeout), so one deployment serves every class. Local networks get a `MockLinkTo
   round, so the draw stays one transaction.
 - **`setContracts` does not check that the beacon contract uses the same keeper** (its keeper is
   immutable). `deploy/02_keeper.js` deploys them as a pair.
-- **Integrations.** BountyEscrow, the arbiter node and the operations scripts still speak v1 (see
-  `MIGRATION.md`).
+- **Integrations.** The arbiter node (v2 commit format, health job) and BountyEscrow are ported on
+  their repositories' `beacon` branches but not yet run against v2 on a testnet (TODO item 16). The
+  operations scripts in this folder and `demoClient/` still speak v1 (see `MIGRATION.md`).

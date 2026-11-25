@@ -1,240 +1,144 @@
-> **Warning**
-> Draft — requires author review
-
 # Security Model
 
-Access control patterns, commit-reveal protections, known attack surfaces visible in the code, and reentrancy guards across the Verdikta Dispatcher contracts.
+The v2 threat model: who can do what, how the jury is kept out of anyone's hands, what commit-reveal binds, what collusion can still do at each jury size, what applications must add on top, and how ETH is kept safe.
 
-## Access Control
+!!! note "Checked against the code (v2)"
+    Rewritten on 2026-11-25 for the v2 contracts on the `beacon` branch ([`reputationBasedAggregator/contracts`](https://github.com/verdikta/verdikta-dispatcher/tree/beacon/reputationBasedAggregator/contracts)), their contract notes, and the design record [TODO.md](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/TODO.md) (items cited by number). **The v2 contracts are not audited and not deployed.** The last whole-contract review was on 2026-11-19; the random-order walk, slot reuse, exits while frozen, the fee floor and the commit format have not been reviewed independently since (TODO, "What's left"). The figures for collusion come from the models in items 12 to 15, which assume 300 eligible arbiters, 15% colluding, and honest score noise of SD 3; the measured noise is higher (SD-equivalent 7.1), and v1's pool had 32 arbiters, so treat them as targets to re-measure, not guarantees.
 
-### Owner-Only Functions
+## Trust and Access Control
 
-All core contracts use OpenZeppelin's `Ownable` for administrative functions. The `onlyOwner` modifier restricts the following operations:
+### Owner Powers
 
-**ReputationAggregator** (inherits `Ownable`):
-- `setConfig(K, M, N, P, timeout)` — phase parameters and timeout
-- `setMaxOracleFee(uint256)` — oracle fee ceiling, in wei of ETH
-- `setBonusMultiplier(uint256)` — bonus multiplier (0–20×)
-- `setMaxLikelihoodLength(uint256)` — response array length cap
-- `setResponseTimeout(uint256)` — timeout window
-- `setReputationKeeper(address)` — keeper contract reference
-- `setScoreDeltas(...)` — reputation score delta parameters
-- `pause()` / `unpause()` — stop and resume new requests
-- `withdrawLink(address, uint256)` — recovery of LINK sent to the contract by mistake (the contract holds no LINK in normal operation)
+All v2 contracts use OpenZeppelin's `Ownable`. The owner is trusted not to break rounds; it cannot take anyone's ETH.
 
-The owner has no function that takes ETH out of the ReputationAggregator. The one owner power over ETH is `withdrawEthFor(payee)`, which the owner or the payee can call and which always sends the payee's balance to the payee. See [ETH Escrow and Withdrawals](#eth-escrow-and-withdrawals).
+**ReputationAggregator:**
 
-**ReputationKeeper** (inherits `Ownable`):
-- `approveContract(address)` / `removeContract(address)` — aggregator allowlist
-- `setOracleActive(address, bytes32, bool)` — pause/unpause oracles
-- `manualBlockOracle(address, bytes32, uint256)` — manual oracle blocking
-- `resetAllReputations()` — zero all scores and unblock all oracles
-- `setSlashAmount(uint256)` / `setLockDuration(uint256)` — penalty configuration
-- `setSevereThreshold(int256)` / `setMildThreshold(int256)` — threshold tuning
-- `setMaxScoreHistory(uint256)` / `setShortlistSize(uint256)` — selection configuration
-- `setMaxScoreForSelection(uint256)` / `setMinScoreForSelection(uint256)` — score clamping
-- `setVerdiktaToken(address)` — VDKA token contract address
+- `setLimits(maxJury, maxTimeout, tPlus)`: bounds on a request's jury.
+- `setParams(bonusMult, settlePerReq, dispatchGas, spreadFloor, maxOracleFee)`: bonus multiplier (at most 20), settlement budget, dispatch stipend (100k to 2M), spread floor, fee ceiling.
+- `setRewards(drawFees, priority, promoteFees, revealWindow)`: draw and promote rewards, the requester's draw priority, the reveal window. Applies to new requests only.
+- `setContracts(keeper, beacons, treasury)`: rounds in flight call the new contracts, so swap the keeper only when no round awaits settlement and the beacon contract only when no round is in its beacon stage. It does not check that the beacon contract uses the same keeper.
+- `pause()` / `unpause()`: stops new requests only.
+- `withdrawEthFor(payee)`: the owner can trigger a payee's withdrawal, which always pays the payee.
 
-**ReputationSingleton** (legacy contract paid in LINK, inherits `Ownable`):
-- `setAlpha(uint256)` / `setMaxOracleFee(uint256)` / `setBaseFeePct(uint256)`
-- `setMaxFeeBasedScalingFactor(uint256)` / `setResponseTimeout(uint256)`
-- `setReputationKeeper(address)` / `setChainlinkToken(address)`
-- `withdrawLink(address, uint256)`
+**ReputationKeeper:** `setApproved` (which contracts may select and report outcomes), `setPoints`, `setTiming`, `setPenalties`, `setSelection`, `setStakeRequirement` and `sendHealthCalls`. The keeper owner can also act for any arbiter where its operator's owner can: `registerArbiter`, `setPaused`, `setFee`, `topUpStake`, `requestExit` and `completeExit`. So the keeper owner can pause or exit any arbiter (the stake still goes to the operator's owner).
 
-**ArbiterOperator** (inherits `OperatorMod` which provides `onlyOwner`):
-- `addReputationKeeper(address)` / `removeReputationKeeper(address)`
+**JuryBeacons:** `setApproved(aggregator, ok)` and `setParams(polled, quorum, timeout)`.
 
-### Authorized Sender Pattern (ArbiterOperator)
+v2 has no manual block, no reputation reset and no way to move stake except the burns (to the token's `burn` or the dead address) and the exit refund (to the operator's owner).
 
-The ArbiterOperator inherits Chainlink's `validateAuthorizedSender` modifier, which restricts `fulfillOracleRequestV()` to addresses registered as authorized senders (typically Chainlink node addresses). This is separate from the ReputationKeeper allowlist and is configured via the inherited `setAuthorizedSenders()` function.
+### The Operator Gate
 
-### Approved Contract Pattern (ReputationKeeper)
+Each `ArbiterOperator` keeps a list of keepers (`addReputationKeeper`, operator owner only) and emits a request only if one of them answers `isContractApproved(requester)` with true, both before emitting and again at fulfillment. The v2 keeper keeps that v1 function name. Each operator owner must call `addReputationKeeper(<v2 keeper>)`; an operator whose list is empty accepts every requester, so keep at least one keeper on it. Fulfillment is restricted to the operator's authorized senders (the Chainlink node's keys).
 
-Aggregator contracts must be explicitly approved via `approveContract()` before they can:
-- Call `selectOracles()` — select oracles for an evaluation
-- Call `recordUsedOracles()` — record which oracles were dispatched
-- Call `pushEntropy()` — contribute entropy for selection randomness
+### Arbiter Registration
 
-Score updates via `updateScores()` additionally require that the specific oracle was previously recorded via `recordUsedOracles()` by the calling contract. This two-step authorization prevents arbitrary contracts from manipulating oracle scores.
+`registerArbiter(oracle, jobId, fee, classes, chainHead)` requires the caller to be the keeper's owner or the operator's `owner()`, the operator to have code, a fee above 0, 1 to 5 classes, and the stake (100 VDKA). Unlike v1 it does not check the operator's ERC-165 interface. Health answers come from the operator's owner or one of its authorized senders, so nobody else can answer, or withhold an answer, for an arbiter.
 
-### Oracle Registration Authorization
+## The Jury Cannot Be Chosen
 
-`registerOracle()` and `deregisterOracle()` require the caller to be either:
-- The ReputationKeeper contract owner (`owner()`), OR
-- The owner of the oracle contract (`IOracleOwner(_oracle).owner()`)
+### Two-Phase Draw
 
-Additionally, `registerOracle()` validates:
-- The oracle address contains deployed code (`_oracle.code.length > 0`)
-- The oracle implements `IArbiterOperator` via ERC-165 (`supportsInterface(0xd9f812f9)`)
-- The oracle's ReputationKeeper allowlist either includes this keeper or is empty
+The request is recorded in block B; the jury is drawn from block B+2 with `keccak256(aggId, blockhash(B+1))` and the keeper's state as of B (TODO item 9). See [Oracle Selection](oracle-selection.md#randomness).
 
-## Reentrancy Protection
+- **Nobody can predict the jury when signing the request**, and nobody can re-roll it: the draw depends only on the sealed hash and the state as of B, so who draws and when does not matter. Everything selection reads is checkpointed by block, so a fee change, a top-up, a pause or a registration after B changes nothing.
+- **No refund buys a re-roll.** A requester who dislikes its jury could otherwise abort and try again for the price of the base fees. So every way of abandoning a drawn round sends the unspent prepayment to the treasury: a round that had M commits but was never promoted (closed or not), a missed beacon quorum, a beacon round whose jury could not be drawn when the result depended on the seed, and a round never drawn in time (`cancelUnsealed`). A refund comes back only where no jury existed to dislike (none eligible, or too few beacon candidates) or the jury itself failed to deliver (fewer than M commits, fewer than N reveals).
+- **The promotion is drawn the same way**, from `blockhash(C+1)` after the commit phase closes at block C. The `promote` caller is paid 1 × the ceiling, so third parties call it and a requester cannot withhold it; promoted arbiters always get `revealWindow` (120 s) after `promote`, so a late `promote` (or a colluder sending the M+-th commit late) cannot make honest arbiters miss their reveals.
+- **The draw reward** (2 × the ceiling) goes to the requester only within 30 seconds; after that to anyone, so rounds get drawn.
 
-### Contracts Using ReentrancyGuard
+What is left is the block builder. Whoever builds B+1 (on Base, the sequencer) sees `blockhash(B+1)` first. A sequencer bribed to seat a cartel chooses among the blocks it could build; item 15 models that as a choice of 256 seeds and a $1,000 bribe per attempt, and that is what caps Small and Medium near $1,000 bounties.
 
-Both `ReputationAggregator` and `ReputationSingleton` inherit OpenZeppelin's `ReentrancyGuard`:
+### Beacons
 
-| Function | Contract | Protected |
-|----------|----------|-----------|
-| `requestAIEvaluationWithApproval()` | ReputationAggregator | `nonReentrant` |
-| `fulfill()` | ReputationAggregator | `nonReentrant` |
-| `finalizeEvaluationTimeout()` | ReputationAggregator | `nonReentrant` |
-| `withdrawEth()` | ReputationAggregator | `nonReentrant` |
-| `withdrawEthFor()` | ReputationAggregator | `nonReentrant` |
-| `requestAIEvaluationWithApproval()` | ReputationSingleton | `nonReentrant` |
-| `finalizeEvaluationTimeout()` | ReputationSingleton | `nonReentrant` |
+With `withBeacons`, the jury's seed also mixes in hash-chain values revealed by 4 beacon arbiters (the first 2 used). See [Oracle Selection](oracle-selection.md#beacons) for the mechanics. Why they resist steering ([JuryBeacons](../contracts/jury-beacons.md)):
 
-The aggregator's `dispatchOracleRequest()` is deliberately not marked `nonReentrant`: only the aggregator itself can call it (`OnlySelf()` otherwise), and it runs inside the guard of the function that called it.
+- The beacons are picked from `blockhash(B+1)` and the state as of B, and each beacon's value is the next one after its head at the end of B+1, so the values were fixed before anyone but the builder of B+1 knew the pick. No rotation can change them; a beacon can choose only when to reveal, or not to.
+- Anchoring at B+1 rather than B means an honest answer included in B+1 does not hand its value to that block's builder.
+- The result reads only completed blocks, so transaction order within a block cannot change it, and a ready result is final. Values are mixed in beacon-index order, so arrival decides only which are used.
 
-Note: ReputationSingleton's `fulfill()` is **not** marked `nonReentrant` — it relies on Chainlink's `recordChainlinkFulfillment` modifier (which deletes the pending request, preventing replay) and the `done` flag check.
+The cost: colluding beacons choose among a few seeds by timing their reveals (1, 2, 4 or 6 seeds with 0 to 4 cartel beacons), and can force a no-result round by withholding. **Withholding is cheap**: a beacon that answers just after the 120 s deadline is frozen only from its 60 s call deadline until it answers, with no score change. With 2 of 4 used, forcing no result takes 3 cartel beacons; with all 4 required, it takes 1. A −400 for a withholding beacon is deferred (TODO, open decisions). Beacons raise Jumbo's sequencer limit from about $25K to $164K but lower the share of good work passing while a cartel blocks from 86% to 80% per round, which is why only Jumbo uses them.
 
-### Contracts Without ReentrancyGuard
+### Hash Chains and the Re-Sync
 
-- **SimpleContract**: No reentrancy guard. Uses `recordChainlinkFulfillment` modifier which prevents duplicate fulfillments but is not a general reentrancy guard. The `done` flag provides additional protection.
-- **ReputationKeeper**: No reentrancy guard. State changes (score updates, slashing) complete before any external calls (VDKA token transfers).
-- **ArbiterOperator**: Uses Chainlink's built-in request validation modifiers (`validateRequestId`, `validateAuthorizedSender`, `validateCallbackAddress`, `validateMultiWordResponseId`).
+Beacon values and health answers are hash-chain preimages: the node commits to `H^n(seed)` at registration and reveals one preimage per answer. The keeper records every head entry with its block and time and never overwrites them.
 
-## Commit-Reveal Security
+A node whose chain does not match the keeper's head (registered with head 0 from a browser, or its chain files lost) can **re-sync**: an answer whose value does not hash to the head becomes the new head, and the arbiter is frozen until it answers a call sent after the re-sync. Why this is safe:
 
-The ReputationAggregator implements a two-phase commit-reveal protocol to prevent oracle response manipulation.
+- **A re-synced value is never a beacon value.** `revealAfter` takes only a value that hashes to the head before it, so a beacon that re-syncs after B+1 counts as having withheld.
+- **It gives no choice of value.** The next value was fixed at the re-sync, as at a rotation.
+- **It gives no dodge the arbiter does not already have.** The freeze is one it could get by not answering, and it starts at the re-sync, not before: a round that ended earlier is judged as it was. A rotation to a different head still needs a valid preimage (`BadPreimage`).
+- The node must re-sync onto a **fresh** chain. Reusing a chain whose values were already revealed would make its beacon values predictable.
 
-### How It Works
+## Commit-Reveal Binding
 
-1. **Commit phase (Mode 1):** Each oracle computes `sha256(abi.encode(oracleAddress, likelihoods[], salt))`, truncates to 128 bits (`bytes16`), and returns this hash as `response[0]`. The CID field is empty. The actual evaluation results are hidden.
+TODO items 4 and 5. The commit is
 
-2. **Reveal phase (Mode 2):** Once M commits are received, the contract sends reveal requests containing `"2:<commitHashHex>"`. Oracles respond with their actual likelihood scores and `"justificationCID:20hexSalt"`. The contract recomputes `bytes16(sha256(abi.encode(msg.sender, response, saltUint)))` and verifies it matches the stored commit.
+```
+keccak256(abi.encode(aggId, operator, response, salt))      all 32 bytes, salt 128 bits
+```
 
-### Protections Provided
+sent as the commit word, and the reveal carries `response` with the CID field `cid:<32 hex salt>`. The aggregator recomputes the hash with `msg.sender` (the operator that fulfils) and the round's `aggId`.
 
-- **Front-running prevention:** Oracles cannot see other responses during the commit phase because only hashes are visible on-chain.
-- **Hash binding:** The commit hash includes `msg.sender` (the oracle's address), preventing oracles from copying another oracle's commit hash.
-- **Salt uniqueness:** Each oracle uses its own random 80-bit salt, which is later mixed into the system entropy via `_updateEntropy()`.
-- **Response locking:** After committing, an oracle cannot change its answer — any modification changes the hash and the reveal will be rejected (`RevealHashMismatch` event).
+- **An arbiter chooses its own salt, so only the hash stops it opening one commit two ways.** v1's commit was the first 16 bytes of a SHA-256 without the round: a collision found once offline (about 2^64 hashes) could be reused in every round to reveal whichever answer suited after seeing the others. Including `aggId` makes a collision useful for one round only, and the full 32 bytes put one out of reach (about 2^128).
+- **The operator address** in the hash stops an arbiter copying another's commit.
+- **Commits are hidden** until promotion, and promoted arbiters are drawn at random from all commits, so committing first wins nothing.
+- **A bad reveal is ignored silently**: wrong hash, malformed `cid:salt`, more than 20 values, a CID longer than 133 bytes, or a second reveal. It uses up that juror's single reveal request: there is no retry. Only `RevealReceived` is emitted, for accepted reveals.
+- **Scores are capped** at 1e34 per value, and at most 20 values per reveal, so aggregation cannot overflow.
 
-### Non-Reverting Reveal Rejection
+## Collusion and Jury Size
 
-Invalid reveals emit diagnostic events but do **not** revert the transaction. This allows the evaluation round to continue with other oracles rather than failing entirely. The following conditions cause silent rejection:
+Collusion is limited by the jury's size and shape, not removed. The rules that matter, and what TODO items 10, 12, 13, 14 and 15 found:
 
-| Condition | Event Emitted |
-|-----------|--------------|
-| Hash mismatch | `RevealHashMismatch` |
-| Malformed CID:salt format | `InvalidRevealFormat` |
-| Too many scores (> `maxLikelihoodLength`) | `RevealTooManyScores` |
-| CID:salt string longer than `MAX_REVEAL_CID_LENGTH` (121 bytes) | `RevealCidTooLong` |
-| Duplicate reveal for same slot | Silently ignored (no event) |
+- **Random seats.** The keeper walks the class list in random order, so a cartel's share of seats follows its share of the eligible pool (reputation can at most double an arbiter's weight). A 15% cartel gets 34 of Jumbo's 50 seats with probability about 3 × 10⁻¹⁹ per round.
+- **Random promotion.** M+ / T+ with a draw from all commits means colluders can't win promotion by committing first. Item 15 calls this a launch requirement for Medium and Large.
+- **The cluster.** For one-number answers the cluster is exact; for vectors it is the nearest-neighbour group, which stops identical colluders from seeding the cluster and pulling its mean (4 colluders at Jumbo: about 6 points under v1's greedy rule, about 1 now). But **with 2 colluders among Small's or Medium's 4 counted reveals no cluster rule helps**, and a cartel that copies the expected consensus takes more than its share of the bonus under any rule that rewards the tightest group (23.5% of Jumbo bonus slots against a fair 14.8%; an open decision).
+- **Reputation** blocks arbiters that fail rounds or answer far from the median, but it never touches a cartel voting plausibly close to the threshold. So the bounty limits come from the jury configuration.
 
-Rejected oracles are treated as non-responders during finalization and penalized accordingly.
+The bounty program's presets were sized for this (item 15): Small (6/5/4/3) and Bondless Small for bounties up to about $100 and $25, limited by repeated submissions; Medium (8/5/4/3) up to about $1,000, limited by the sequencer; Large (21/16/13/10) up to $10,000; Jumbo (50/38/27/17 with beacons) up to $100,000. Beyond about $1,000 a class must be Large: with 6 to 8 jurors a bribed sequencer nearly always finds a seed that seats enough colluders. These figures are break-evens with no safety margin, and they depend on the application-level rules below.
 
-A reveal whose number of scores differs from the other reveals is not rejected at this point. Any length from 2 to `maxLikelihoodLength` is stored, and when the round is finalized every reveal is brought to the most common length (`AggregatorLib.normalizeToModal`: longer ones are cut, shorter ones filled with zeros). A reveal of an unusual length then falls outside the cluster because of its distance from the others. The events `RevealWrongScoreCount` and `RevealTooFewScores` are still declared, but the current code does not emit them: a response with fewer than 2 scores and a non-empty CID reverts with `MalformedPayload()`.
+### Thin Pools and Self-Chosen Juries
 
-## Request Validation
+If fewer arbiters are eligible than K, the draw repeats them (slot k holds pick k mod m) instead of failing; it refuses only at zero eligible. Repeats also happen in a deep pool if the owner lowers `shortlistSize` below a pending round's K (K is checked against it only at request time), or if the walk's `maxScan` entries (400, freed and ineligible ones included) hold fewer than K eligible arbiters.
 
-### Pre-emission Gating (ArbiterOperator)
+A repeated arbiter is paid and scored per slot, and **one arbiter can decide a round alone**. A requester who picks a class, or a fee ceiling, that only its own arbiter fits gets a jury of one operator: P ≥ 2 then does not mean two independent arbiters, and a Q-of-N count on `getOutcomeScores` counts slots, not arbiters. Applications must not let the party who benefits from a result choose the class or the ceiling freely, and should check the keeper's `eligibleCount(class, maxFee)` before trusting a round.
 
-The ArbiterOperator's `_beforeOracleRequest()` hook calls `_approved(requester)` before the standard Chainlink `OracleRequest` event is emitted by `OperatorMod`. This prevents unauthorized requests from ever reaching oracle nodes — the event that triggers oracle job execution is never emitted for unapproved requesters.
+## What Applications Must Add
 
-### Double Validation
+The aggregator returns a result and every counted juror's score; what a result is worth is the application's business. The bounty program's rules (TODO items 8 and 12) are the model:
 
-During `fulfillOracleRequestV()`, the ArbiterOperator re-checks `_approved(callbackAddress)`. This guards against the edge case where a contract is de-approved between request submission and fulfillment, preventing responses from being delivered to contracts that have lost authorization.
+- **Bonds.** The protocol has no bonds. The bounty program has the hunter post a bond, forfeited to the creator only on a hard fail (fewer than R of N scores at the threshold) and returned on a pass, a soft fail or no result. A bond roughly sized `V × (bad-work pass rate) ÷ (bad-work hard-fail rate)` makes forcing uneconomic; R below the pass quota Q keeps a blocking cartel from costing an honest hunter the bond.
+- **Q-of-N, not the mean.** Read `getOutcomeScores(aggId, outcome)` and pass at Q of N scores at the threshold. With re-runs on a soft fail or no result (up to 6 rounds), a blocking cartel only costs re-runs.
+- **A fee floor the requester cannot choose.** `minFee` makes each attempt cost at least K × floor, which deters re-submitting until a favourable jury appears, but only if the party submitting cannot lower it. In the bounty program the creator sets it.
+- **Who picks the jury and class.** The same reasoning: the creator, not the hunter.
+- **Drive the round.** Nothing guarantees a third party sends `drawJury`, `closeCommits`, `promote` or `settle`. An application should send them; a round never drawn within a day loses its whole prepayment to the treasury.
 
-### Input Validation
+## Settlement and Exits
 
-All request entry points validate:
-- CID array: non-empty, max 10 items (`MAX_CID_COUNT`), each max 100 characters (`MAX_CID_LENGTH`)
-- Addendum text: max 1000 characters (`MAX_ADDENDUM_LENGTH`)
-- Oracle response arrays: each score clamped to `MAX_ARBITER_RETURN_SCORE` (1e34) to prevent overflow during aggregation arithmetic
+Scores are applied at settlement, after the deadline, in one keeper call per round. Anyone may call `settle(aggId)`; each new request also settles due rounds, in queue order, within `settlePerRequest()` × its own K slots, and stops at the first round too big for what is left or not yet past its deadline. A K = 50 round at the head is settled by a request only if that request has K ≥ 25, and a long-timeout round at the head holds back shorter ones behind it, so settlement can need an outside caller. The result itself is readable from finalization and does not wait.
 
-### Response Completeness Checks
+Exits are bounded so penalties land: `requestExit` makes an arbiter ineligible at once and `completeExit` refunds the stake only after the unbonding period (at least 2 days: a day for the latest draw that can read a B from before the exit, and a day for that round to finish and settle). Blocks and bans still apply during unbonding, and a blocked arbiter cannot complete its exit. But an arbiter that completes its exit before a round it served in is settled escapes that round's points, because `applyOutcomes` skips unregistered keys. Settle rounds promptly.
 
-During fulfillment, the contract validates:
-- Payload shape distinguishes commit from reveal (1 element + empty CID vs. 2+ elements + non-empty CID)
-- Each reveal has between 2 and `maxLikelihoodLength` scores; differing lengths are reconciled at finalization (see above)
-- CID:salt format validation via `AggregatorLib.isValidCidSalt()` before parsing
-
-## Gas Safety
-
-### Minimum Consumer Gas
-
-ArbiterOperator enforces `gasleft() >= 400,000` before making the callback to the consumer contract. This matches the Chainlink node's expected gas provision of approximately 500,000. Without this check, callbacks could silently fail due to gas exhaustion while appearing to succeed at the operator level.
-
-### Response Length Limits
-
-The `maxLikelihoodLength` parameter (default: 20) caps the number of scores an oracle can return, preventing gas exhaustion from excessively large arrays during aggregation.
-
-### Score Value Clamping
-
-Individual likelihood scores are clamped to `MAX_ARBITER_RETURN_SCORE` (1e34) to prevent overflow when scores are summed during aggregation.
+The freeze is judged at the deadline, and a frozen arbiter that did not commit is not scored. A cartel member that never commits and ignores its health call therefore escapes the −400 (the abstain dodge, TODO item 14; open).
 
 ## ETH Escrow and Withdrawals
 
-The ReputationAggregator is paid in ETH. The LINK allowance problem described in earlier versions of this page (a requester's LINK approval running out before the bonus was pulled, `BonusTransferFailed()`) does not exist in the current contract, because nothing is pulled from the requester after the request.
+- **Prepayment.** The requester sends the worst case, `maxTotalFee(maxFee, minFee, withBeacons, K, P)`. Credit covers only what `msg.value` does not and any excess returns to credit, so the escrow is exactly the quote and a treasury path never takes more than the round's prepay. A quote that does not fit in 88 bits reverts `BadInput()`.
+- **Ledger, not transfers.** Fees, bonuses, rewards, beacon payments and refunds are entries in `ethOwed`. No round step sends ETH, so a payee cannot block a round.
+- **One way out.** ETH leaves only in `_withdrawTo(payee)`, through `withdrawEth()` and `withdrawEthFor(payee)`: balance zeroed before the send, `nonReentrant`, always to the credited address. A payee that cannot receive ETH (`EthTransferFailed()`) only blocks its own withdrawal.
+- **Fixed rates per round.** The bonus multiplier, the reward counts and the beacon quorum are stored at request, and each juror's paid fee at the draw, so `received ≥ baseFees + bonuses + rewards` always holds (the tests check solvency on every path).
+- **Payee fixed at the draw.** Each slot's payee is the operator's `owner()` read at the draw with a 30k-gas stipend, copying one word. A malformed or gas-burning `owner()` skips that slot (`SlotSkipped`, reason 1) instead of reverting the draw.
+- **Pause** stops new requests only. Draws, commits, reveals, settlement and withdrawals keep working.
 
-- **Prepayment.** The requester sends the worst case for the round, `maxTotalFee(_maxOracleFee)`, with the request (`msg.value` plus any credit the requester already has). Too little reverts with `InsufficientPayment()`.
-- **Ledger, not transfers.** Base fees, bonuses and refunds are entries in the `ethOwed` mapping. Settling a round sends no ETH and makes no call to a payee, so a payee cannot block a round from settling.
-- **One way out.** ETH leaves the contract only in `_withdrawTo(payee)`, reached through `withdrawEth()` and `withdrawEthFor(payee)`. The balance is set to zero before the ETH is sent, both functions are `nonReentrant`, and the destination is always the credited address.
-- **Fixed payee and bonus rate.** The owner of each oracle's operator contract is read once, when the request is made, and both the base fee and the bonus go to that address. The bonus multiplier is also recorded at request time (`bonusMultiplierSnap`), so a later `setBonusMultiplier()` cannot make a bonus larger than the round's reserve.
-- **Count check.** The request reverts with `BadSelectionCount()` if the keeper returns a number of oracles other than K, because the prepayment is sized for exactly K base fees.
-- **Pause.** `pause()` stops new requests only. Rounds in progress, timeout finalization and withdrawals keep working, so pausing cannot hold back ETH that is already in the contract.
+## Gas Safety
 
-The contract comments state the invariant the design is built on: the contract's balance equals the sum of all `ethOwed` entries plus the ETH still reserved in open rounds (`getEthAccounting(aggId)` returns the reserve of one round).
+- **Fixed stipends.** Each oracle request is dispatched through a self-call with `dispatchGas` (250k; an honest request needs about 125k, 175k at the largest payload). Every tolerated call first checks that its stipend is really available (`OutOfGas()` otherwise), and settlement reverts rather than skipping the keeper call when starved, so neither a gas-burning operator nor a caller's tight gas limit can drop a slot or the scores.
+- **Bounded walks.** Selection visits at most `maxScan` entries; the settlement queue at most `settlePerRequest × 8` entries per request, already-settled ones included.
+- **The finalizing reveal pays for clustering.** At Jumbo it costs 1.3M gas with one-number answers, about 2.6M with two outcomes and 6.9M at 20 outcomes. An arbiter node's job gas limit must cover the largest answer its classes allow, or that reveal reverts and is lost, and so is every later one.
+- **Jumbo's draw** uses 12.3 to 13.2M of the 16.8M per-transaction cap. Each juror whose operator burns its whole stipend adds about 98k; with beacons 33 such jurors of 50 still fit (measured with the test operator, to be re-measured with a real operator). A draw that cannot fit can only be cancelled to the treasury after a day.
 
-## Known Attack Surfaces
+## Legacy Contracts
 
-### Oracle Collusion
-
-If multiple oracles collude, they can dominate the consensus cluster and influence evaluation results. Mitigated by:
-- **Random oracle selection** with entropy mixing from multiple sources
-- **Commit-reveal** preventing pre-coordination on specific values (oracles cannot see each other's commits)
-- **Reputation scoring** that penalizes outlier behavior over time, making sustained collusion costly
-- **Cluster detection** that selects the closest P responses — colluding oracles must independently arrive at similar answers
-
-### Block-Level Entropy Manipulation
-
-Oracle selection uses `block.prevrandao` and `block.timestamp` which are partially predictable by validators. Mitigated by:
-- **Aggregator-provided entropy** from oracle salts (not known to validators at block production time)
-- **Two-slot entropy buffer** in ReputationKeeper preventing same-block manipulation
-- **Selection counter** incremented per call provides additional mixing
-
-### Prepayment Reserved Until a Timed-Out Round Is Finalized
-
-Nothing closes a round automatically. If the oracles do not deliver enough answers within `responseTimeoutSeconds()`, the round stays open, and the unspent part of the requester's prepayment stays reserved in it, until someone calls `finalizeEvaluationTimeout(aggId)`. Anyone may call it. A requester, or the application acting for the requester, has to make that call to get the credit back. The base fees credited to the polled oracles when the request was made stay with them.
-
-### A Payee That Cannot Receive ETH
-
-If the address credited in `ethOwed` cannot accept ETH (for example a contract without a `receive()` function), its withdrawal reverts with `EthTransferFailed()` and the credit stays in the ledger. Only that payee is affected. A client contract that requests evaluations is itself the requester, so refunds are credited to the contract: it needs a way to call `withdrawEth()` and to receive and pass on the ETH, or its refunds can only be used to pay for its own later requests.
-
-### Oracle Registration Spam
-
-Anyone who owns an ArbiterOperator and has 100 VDKA can register oracles. Mitigated by:
-- **Stake requirement** (100 VDKA) creates economic cost per registration
-- **IArbiterOperator interface check** ensures proper contract type
-- **Class-based filtering** limits which oracles serve which evaluation types
-- **Owner can manually block** problematic oracles via `manualBlockOracle()`
-
-### Stale Oracle Data
-
-If an oracle becomes inactive between selection and dispatch, the `InactiveOracle()` error reverts the entire request. There is no retry mechanism — the requester must submit a new request. During finalization, inactive oracles are skipped with an `OracleScoreUpdateSkipped` event rather than reverting.
-
-## SimpleContract Security Limitations
-
-The SimpleContract is intended for development/testing and has intentionally relaxed security:
-
-- `setResponseTimeout()` has no `onlyOwner` modifier (commented as "stub")
-- `withdrawLink()` has no `onlyOwner` modifier (commented as "stub")
-- No `ReentrancyGuard` on any function
-- Single oracle with no redundancy or consensus mechanism
-- No commit-reveal — oracle responses are visible immediately
-
-**Do not use SimpleContract for production deployments handling significant value.**
+ReputationSingleton and SimpleContract are legacy, LINK-paid and written for the v1 keeper. SimpleContract is for development only: `setResponseTimeout()` and `withdrawLink()` have no access control, it has no reentrancy guard and no commit-reveal, and it uses a single fixed oracle. **Do not use SimpleContract for anything of value.** See their pages under [Contracts](../contracts/reputation-singleton.md).
 
 ## Upgrade Considerations
 
-None of the contracts use proxy patterns or upgradeable storage. Upgrades require deploying new contracts and re-wiring references:
-
-- **Replace aggregator/singleton**: Deploy new contract, call `setReputationKeeper()` on it, call `approveContract(newAddress)` + `removeContract(oldAddress)` on the keeper
-- **Replace keeper**: Deploy new keeper, call `approveContract()` for each aggregator, call `setReputationKeeper()` on each aggregator, re-register all oracles and re-approve all contracts
-- **Replace operator**: Deploy new ArbiterOperator, call `addReputationKeeper()` on it, register new oracle identity with keeper
-
-ETH credits live in the aggregator contract that received the prepayment. Replacing the aggregator does not move them: payees and requesters withdraw what they are owed from the old contract with `withdrawEth()`.
-
-Oracle registrations and reputation scores live in the ReputationKeeper. Replacing the keeper requires re-registering all oracles (scores start at 0). The owner can use `resetAllReputations()` to zero scores on the existing keeper without re-registering.
+None of the contracts use proxies. v2 is a redeploy of v1, not an upgrade: a new keeper, aggregator and `JuryBeacons`, every arbiter registering again, and every operator owner adding the v2 keeper. ETH credits stay in the aggregator that holds them: payees and requesters withdraw from the old contract with `withdrawEth()`. See [MIGRATION.md](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/MIGRATION.md) and the [Deployment Guide](../deployment/index.md).

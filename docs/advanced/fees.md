@@ -1,95 +1,157 @@
 # Fee Mechanisms
 
-Every fee, who pays it, when it is charged, and how payment flows through the Verdikta Dispatcher system end to end.
+Every fee, who pays it, when it is credited, and how payment flows through the Verdikta Dispatcher system end to end.
 
-!!! note "Checked against the code"
-    Revised on 2026-11-22 against the contracts in [`reputationBasedAggregator/contracts`](https://github.com/verdikta/verdikta-dispatcher/tree/master/reputationBasedAggregator/contracts) and against the aggregator deployed on Base mainnet at [`0xd8F38bCBEE43bE3bd31655a563f20c9B3e67142a`](https://basescan.org/address/0xd8F38bCBEE43bE3bd31655a563f20c9B3e67142a). The ReputationAggregator is paid in ETH. ReputationSingleton and SimpleContract are legacy contracts that are still paid in LINK. Values that the contracts' owner can change are given with the function that returns the current value.
+!!! note "Checked against the code (v2)"
+    Rewritten on 2026-11-25 for the v2 contracts on the `beacon` branch, in [`reputationBasedAggregator/contracts`](https://github.com/verdikta/verdikta-dispatcher/tree/beacon/reputationBasedAggregator/contracts). v2 is not deployed yet; its addresses are set at the v2 deployment. The quotes in the worked examples were checked by calling `maxTotalFee` on the v2 contracts, and the Small round's accounting by running one on Hardhat's in-process network. The ReputationAggregator is paid in ETH. ReputationSingleton and SimpleContract are legacy contracts, still paid in LINK and written for the v1 keeper. Values that the owner can change are given with the function that returns the current value. For the v1 aggregator (`maxTotalFee(fee) = fee × (K + B × P)`, all base fees credited at the request, `finalizeEvaluationTimeout`) see the `aggregator-v0.1.0` tag and the [ETH payment history](eth-payment-migration.md).
 
 ## Token Overview
 
 | Token | Purpose | Held By |
 |-------|---------|---------|
-| **ETH** | Pays oracles for evaluations made through the ReputationAggregator: base fees and bonus rewards | Requesters, the aggregator contract (escrow and `ethOwed` ledger), oracle owners |
-| **LINK** (Chainlink) | Pays oracles for evaluations made through the legacy ReputationSingleton and SimpleContract. The aggregator still sends its requests over the Chainlink request path, with a LINK amount of zero | Requesters of the legacy contracts, those contracts, oracle operators |
-| **VDKA** (Verdikta / Wrapped Verdikta) | Staked by oracle operators as collateral | Oracle operators, ReputationKeeper contract |
+| **ETH** | Pays for evaluations made through the ReputationAggregator: base fees, bonuses, beacon payments and the draw and promote rewards | Requesters, the aggregator (escrow and the `ethOwed` ledger), arbiter owners, the treasury |
+| **LINK** (Chainlink) | Pays arbiters of the legacy ReputationSingleton and SimpleContract. The aggregator still sends its requests over the Chainlink request path, with a LINK amount of zero, and holds no LINK | Requesters of the legacy contracts, those contracts, operators |
+| **VDKA** (Wrapped Verdikta) | Staked by arbiter operators in the ReputationKeeper | Arbiter operators, the ReputationKeeper |
 
 ## Fee Flows by Contract
 
 ### ReputationAggregator
 
-The ReputationAggregator has the most complex fee structure due to its multi-oracle commit-reveal design. For the reasoning behind it see the [ETH payment implementation notes](eth-payment-migration.md).
-
 #### Who Pays
 
-The **requester** (the `msg.sender` of `requestAIEvaluationWithApproval`) pays all fees, in ETH. The function is `payable`: the ETH travels with the call. There is no token to approve and the requester needs no LINK.
+The **requester** (the `msg.sender` of `requestAIEvaluationWithApproval`) pays everything, in ETH. The function is `payable`: the ETH travels with the call. There is no token to approve.
 
-The requester prepays a worst-case budget, `maxTotalFee(_maxOracleFee)`. The contract takes it first from any credit the requester already holds in the contract (`ethOwed(requester)`) and requires the rest as `msg.value`; if the two together are too little the call reverts with `InsufficientPayment()`.
+The requester prepays a worst-case budget, `maxTotalFee(maxFee, minFee, withBeacons, K, P)`, for the jury the request asks for. The contract takes from the requester's existing credit (`ethOwed(requester)`) only what `msg.value` does not cover, and returns any excess `msg.value` to credit, so the round's escrow is exactly the quote. If the two together are too little the call reverts with `InsufficientPayment()`. A quote above 2^88 − 1 wei reverts with `BadInput()`.
 
-#### Fee Breakdown
+#### The Request's Fee Parameters
 
-| Fee Component | Amount | When Credited | Recipient |
-|---------------|--------|---------------|-----------|
-| **Commit-phase base fees** | Each polled oracle's registered `fee` (K credits) | At request creation, in the request transaction (`BasePayment` event) | The owner of each polled oracle's operator contract (`owner()`), as a credit in `ethOwed` |
-| **Reveal-phase fees** | 0 (there is no fee for the reveal phase) | N/A | N/A |
-| **Bonus payments** | `pollFees[slot] × bonusMultiplier` per clustered oracle. The multiplier is the one in force when the request was made | At finalization (`BonusPayment` event) | The same owner address that received that oracle's base fee, as a credit in `ethOwed` |
-| **Refund** | `ethReceived − baseCredited − bonusCredited` | When the round ends: at finalization, or when `finalizeEvaluationTimeout()` closes a timed-out round (`RequesterRefunded` event) | The requester, as a credit in `ethOwed` |
-
-A polled oracle keeps its base fee whether or not it answers. An oracle whose request could not be dispatched is not credited, and its fee stays in the requester's refund.
+| Parameter | Meaning |
+|-----------|---------|
+| `maxFee` | The fee **ceiling**. `eff = min(maxFee, maxOracleFee())`. An arbiter is eligible only if its posted fee is at most `eff`. The draw and promote rewards are counted in `eff` |
+| `minFee` | The fee **floor** (TODO item 8). Each juror is paid `max(posted fee, minFee)`; 0 means none. It may exceed the ceiling: the ceiling decides who is eligible, the floor what each is paid |
+| `withBeacons` | Adds the beacon quorum (`JuryBeacons.quorum()`, 2 by default) to the budget. Reverts if the aggregator has no beacon contract |
+| `K`, `P` | From the request's jury: K jurors are paid a base fee, up to P earn the bonus |
 
 #### Maximum Total Fee Calculation
 
+From [`ReputationAggregator.sol`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/contracts/ReputationAggregator.sol):
+
 ```solidity
-function maxTotalFee(uint256 requestedMaxOracleFee) public view returns (uint256) {
-    uint256 eff = requestedMaxOracleFee < maxOracleFee ? requestedMaxOracleFee : maxOracleFee;
-    return eff * (commitOraclesToPoll + bonusMultiplier * clusterSize);
-    //     eff * (        K           +       B       *      P      )
+function maxTotalFee(uint256 maxFee, uint256 minFee, bool withBeacons, uint8 K, uint8 P) public view returns (uint256) {
+    uint256 eff = maxFee < maxOracleFee ? maxFee : maxOracleFee;
+    uint256 juror = minFee > eff ? minFee : eff;
+    uint256 n = uint256(K) + uint256(bonusMultiplier) * P;
+    if (withBeacons) n += beacons.quorum();
+    return juror * n + eff * (uint256(drawRewardFees) + promoteRewardFees);
 }
 ```
 
-With the current settings (K=6, B=3, P=2):
+That is
 
 ```
-maxTotalFee = eff × (6 + 3 × 2) = eff × 12
+eff         = min(maxFee, maxOracleFee())        0.0004 ETH by default
+juror       = max(eff, minFee)
+maxTotalFee = juror × (K + B × P [+ quorum]) + eff × (drawRewardFees + promoteRewardFees)
 ```
 
-**Example:** On Base mainnet `maxOracleFee()` is 0.0004 ETH, so the largest possible prepayment is `0.0004 × 12 = 0.0048 ETH` (`maxTotalFee(0.0004 ETH)` returned that value on 2026-11-22). A request with a ceiling of 0.00015 ETH prepays `0.00015 × 12 = 0.0018 ETH`.
+with the defaults B = `bonusMultiplier()` = 3, `drawRewardFees()` = 2, `promoteRewardFees()` = 1 and a quorum of 2. Each round stores the multiplier, the two reward counts and the quorum at request time, so an owner change later cannot break its escrow.
 
-**Important:** The prepayment is a budget, not the price. The actual cost is lower because:
-- Individual oracle fees may be less than the ceiling
-- Only P oracles (those in the best cluster) receive bonuses
-- Bonuses use each oracle's actual registered fee, not the ceiling
+#### What a Round Pays
 
-On 2026-11-22 all 40 oracles registered on Base mainnet charged 0.00002 ETH (the ReputationKeeper's `registeredOracles(i)` and `getOracleInfo(operator, jobId)` list every oracle with its fee). At that fee:
+| Component | Amount | When credited | To |
+|-----------|--------|---------------|----|
+| **Base fee** | `max(posted fee as of block B, minFee)` per jury slot (`BasePayment`) | At the draw, for every slot whose request was dispatched | The owner (`owner()`) of the slot's operator contract, read at the draw |
+| **Bonus** | that slot's paid fee × B, per member of the cluster (`BonusPayment`) | At finalization (the N-th counted reveal) | The same owner as the slot's base fee |
+| **Draw reward** | `eff × drawRewardFees` (2 × eff) (`JuryDrawn`) | At the draw | The caller of the drawing `drawJury`: the requester within `requesterDrawPriority()` (30 s) of the request, anyone after that. A third party drawing earlier gets nothing, and the amount stays in the refund |
+| **Promote reward** | `eff × promoteRewardFees` (1 × eff) | At `promote` | Its caller, whoever it is |
+| **Beacon payment** | `max(eff, minFee)` per used beacon value (`BeaconPayment`) | At the second `drawJury`, also when the quorum was missed | The operator owner of each beacon whose value was used |
+| **Refund** | `received − baseFees − bonuses − rewards` (`RequesterRefunded`) | When the round ends; see [Refunds and the Treasury](#refunds-and-the-treasury) | The requester, or the treasury |
 
-| Outcome | Cost in oracle fees | Credited back from a 0.0018 ETH prepayment |
-|---------|---------------------|---------------------------------------------|
-| Round completes | 6 × 0.00002 + 2 × 3 × 0.00002 = 0.00024 ETH | 0.00156 ETH |
-| Round times out | 6 × 0.00002 = 0.00012 ETH | 0.00168 ETH |
+A juror keeps its base fee whether or not it answers: a fee conditional on committing would reward fake commits, and silence is handled by the [reputation rules](reputation.md). A slot whose request could not be dispatched (its operator's `owner()` unreadable, or the dispatch reverted; `SlotSkipped`) is not credited, and its fee stays in the refund. In a thin pool one arbiter can hold several slots; it is paid per slot.
 
-Network gas for the request transaction comes on top.
+Beacons are paid the round's **ceiling** (or the floor, if higher), not their posted fee. The bonus is paid to exactly P reveals (the cluster), on each one's paid fee, so it is at most `B × P × juror`. `getRoundInfo(aggId)` returns `received`, `baseFees`, `bonuses` and `rewards` (draw and promote rewards and beacon payments together); `getSlot(aggId, i).fee` is the fee a slot was paid.
+
+#### Worked Example: Small
+
+A Small jury (K 6, M 5, N 4, P 3, timeout 300 s), a ceiling of 0.00015 ETH, no floor, no beacons, default settings. Assume every juror posts 0.00002 ETH, the fee every v1 arbiter on Base mainnet posted in November 2026.
+
+```
+eff         = min(0.00015, 0.0004) = 0.00015 ETH
+juror       = max(0.00015, 0)      = 0.00015 ETH
+maxTotalFee = 0.00015 × (6 + 3 × 3) + 0.00015 × (2 + 1) = 0.00015 × 18 = 0.0027 ETH
+```
+
+| Outcome | Credited to others | Refund to the requester |
+|---------|--------------------|-------------------------|
+| Round completes | base 6 × 0.00002 = 0.00012; bonus 3 × 3 × 0.00002 = 0.00018; draw reward 0.0003; promote reward 0.00015 | 0.0027 − 0.00075 = **0.00195 ETH** |
+| Round dies in the commit phase with fewer than 5 commits (settled) | base 0.00012; draw reward 0.0003 | 0.0027 − 0.00042 = 0.00228 ETH |
+
+If the requester draws its own round within 30 seconds, the draw reward (0.0003 ETH) is credited to it as well: a completed round then costs it 0.00045 ETH, or 0.0003 ETH if it also sends `promote`. The bounty program's Small class sets no floor, so its cost per round follows the arbiters' posted fees. Network gas comes on top.
+
+#### Worked Example: Jumbo
+
+A Jumbo jury (K 50, M 38, N 27, P 17, timeout 600 s) with beacons, the default ceiling of 0.0004 ETH, and a floor of 0.00011 ETH (about $0.25 at $2,287 per ETH, the bounty program's floor for the larger classes). Assume every juror posts 0.00002 ETH, below the floor.
+
+```
+eff         = min(0.0004, 0.0004)  = 0.0004 ETH
+juror       = max(0.0004, 0.00011) = 0.0004 ETH
+maxTotalFee = 0.0004 × (50 + 3 × 17 + 2) + 0.0004 × (2 + 1) = 0.0004 × 106 = 0.0424 ETH
+```
+
+Each juror is paid the floor, 0.00011 ETH, since its posted fee is lower. If the round completes:
+
+| Component | Amount |
+|-----------|--------|
+| Base fees | 50 × 0.00011 = 0.0055 ETH |
+| Bonuses | 17 × 3 × 0.00011 = 0.00561 ETH |
+| Beacon payments | 2 × max(0.0004, 0.00011) = 0.0008 ETH |
+| Draw reward | 2 × 0.0004 = 0.0008 ETH |
+| Promote reward | 0.0004 ETH |
+| **Refund** | 0.0424 − 0.01311 = **0.02929 ETH** |
+
+The requester's priority for the draw runs from the second beacon value (`readyAt`), not from the request. If it draws and promotes itself, the round costs it 0.01191 ETH. Every attempt costs at least K × floor plus the beacons, here 0.0055 + 0.0008 ETH, whatever the arbiters post: that is what the floor is for.
+
+#### The Fee Floor
+
+The floor (item 8) makes repeated attempts expensive: a requester who re-submits until it gets a jury it likes pays at least `K × minFee` per attempt. Selection also scores the fee the requester pays, so below the floor every arbiter weighs the same, and a near-zero posted fee wins no extra weight. The floor deters only a requester who cannot choose it. In the bounty program that is the bounty creator's setting, passed into every request for the bounty; it protects nothing when a submitter calls the aggregator directly with its own floor.
+
+#### Refunds and the Treasury
+
+The refund, `received − baseFees − bonuses − rewards`, is credited once, when the round ends. Where it goes depends on how the round ended. Whenever a refund would let a requester throw away a jury it dislikes and draw again for the price of the base fees (a free re-roll), the refund goes to the treasury instead.
+
+| How the round ended | When | Refund to |
+|---------------------|------|-----------|
+| Result (phase 6) | at finalization | requester |
+| Draw found no eligible arbiter (phase 8) | at the draw | requester (no jury could be drawn) |
+| Beacon stage: fewer candidates than the quorum (phase 8) | at the first `drawJury` | requester |
+| Beacon quorum missed by the deadline (phase 8) | at the second `drawJury`; the beacons that answered are paid | **treasury** |
+| No jury after the beacon stage (phase 8) | at the second `drawJury`; the beacons are paid | requester if the keeper's walk covers the whole class list (`scansAll(class)`), else **treasury** |
+| Dead in the commit phase with fewer than M commits (phase 8) | at `settle` | requester |
+| Dead with at least M commits but never promoted, closed or not (phase 8) | at `settle` | **treasury** |
+| Dead in the reveal phase: fewer than N reveals (phase 8) | at `settle` | requester |
+| Never drawable: unsealed for 8,191 blocks, or undrawn a day after the request (phase 9) | `cancelUnsealed`: the whole prepayment | **treasury** |
+
+The `RequesterRefunded(aggId, to, amount)` event names the address credited. A dead round's refund waits until someone calls `settle(aggId)` after the deadline. New requests also settle due rounds, but in queue order and only within a budget of `settlePerRequest()` (2) × their own K slots: the walk stops at the first round that is too big for what is left of the budget, or not yet past its deadline. A K = 50 round at the head of the queue is settled by a new request only if that request has K ≥ 25, and a long-timeout round at the head holds back shorter ones behind it. Call `settle` yourself.
 
 #### ETH Flow Diagram
 
 ```
 Requester Wallet
     │
-    └─── msg.value (plus existing ethOwed credit) ──→ Aggregator escrow for this round
-                                                          │
-            (In the request transaction, for each of the K polled oracles:)
-                                                          ├─── fee ──→ ethOwed[owner of oracle 1]
-                                                          ├─── ...
-                                                          ├─── fee ──→ ethOwed[owner of oracle K]
-                                                          │
-            (At finalization, for each of the P clustered oracles:)
-                                                          ├─── fee × B ──→ ethOwed[owner of clustered oracle]
-                                                          │
-            (When the round ends:)
-                                                          └─── the rest ──→ ethOwed[requester]
+    └── msg.value (plus existing ethOwed credit) ──→ escrow for this round (exactly maxTotalFee)
+                                                         │
+          (at the draw, for each of the K dispatched slots:)
+                                                         ├── max(fee, floor) ──→ ethOwed[operator owner]
+          (at the draw:)                                 ├── 2 × eff ──→ ethOwed[drawer]
+          (at the second draw, with beacons:)            ├── max(eff, floor) ──→ ethOwed[beacon owner] × used values
+          (at promote:)                                  ├── 1 × eff ──→ ethOwed[promote caller]
+          (at finalization, for each of the P clustered:)├── paid fee × B ──→ ethOwed[operator owner]
+          (when the round ends:)                         └── the rest ──→ ethOwed[requester] or ethOwed[treasury]
 
 ethOwed[address] ──→ withdrawEth() ──→ that address's wallet
 ```
 
-The Chainlink request that carries the work to each oracle is sent with a LINK amount of zero. The aggregator holds no LINK in normal operation.
+The Chainlink request that carries the work to each arbiter is sent with a LINK amount of zero.
 
 #### Credits and Withdrawals
 
@@ -97,11 +159,9 @@ Every payment above is an entry in the contract's `ethOwed` ledger, not a transf
 
 - `withdrawEth()` sends the caller's whole balance to the caller.
 - `withdrawEthFor(payee)` sends `payee`'s whole balance to `payee`. Only `payee` or the contract owner can call it, and the ETH always goes to `payee`.
-- A requester's credit is used automatically for that requester's next request, before any new ETH is asked for.
+- A requester's credit is used automatically for that requester's next request, for whatever `msg.value` does not cover.
 
-#### When a Round Times Out
-
-A round is not closed automatically. Once `responseTimeoutSeconds()` has passed since the request (300 seconds on Base mainnet, one window for the commit and reveal phases together), anyone can call `finalizeEvaluationTimeout(aggId)`. That call closes the round as failed, pays no bonus and credits the requester the prepayment less the base fees. Until someone makes the call, the prepayment stays reserved in the round.
+The owner cannot take ETH out of the aggregator any other way; the treasury is credited like any other payee.
 
 ### ReputationSingleton (legacy, LINK)
 
@@ -182,57 +242,61 @@ Requester Wallet
 
 ## VDKA Staking
 
-Oracle operators must stake VDKA tokens to register with the ReputationKeeper.
+Arbiter operators stake Wrapped Verdikta (VDKA) in the v2 ReputationKeeper to register. See [Reputation System](reputation.md) for the burns.
 
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| **Stake requirement** | 100 VDKA (`STAKE_REQUIREMENT = 100 × 10¹⁸`) | Fixed amount required to register each oracle/jobId |
-| **Slash amount** | Configurable via `setSlashAmount()` (default: 0 VDKA) | Amount deducted per slash event |
+| Parameter | Default | Setter | Description |
+|-----------|---------|--------|-------------|
+| `stakeRequirement` | 100 VDKA (`100e18`) | `setStakeRequirement(uint256)` | Pulled at registration. An arbiter whose stake is below it is not eligible (flag `F_UNDERSTAKED`); a new requirement applies to an arbiter at its next stake change |
+| `burnPerBlock` | 0 | `setPenalties(maxOffenses, burnPerBlock, burnOnBan)` | VDKA burned on each block, doubled per earlier offense |
+| `burnOnBan` | off | `setPenalties(...)` | Burn the whole remaining stake on a ban |
+| `unbondingPeriod` | 2 days | `setTiming(lock, decay, callDeadline, unbonding)` | Delay between `requestExit` and `completeExit`; never below `MIN_UNBONDING` (2 days) |
 
 ### Staking Flow
 
 ```
-Oracle Owner Wallet
+Operator Owner Wallet
     │
-    └─── approve(keeper, 100 VDKA)
-    └─── registerOracle(oracle, jobId, fee, classes)
-              └──→ transferFrom(caller, keeper, 100 VDKA)
+    └─── approve(keeper, stakeRequirement)
+    └─── registerArbiter(oracle, jobId, fee, classes, chainHead)
+              └──→ transferFrom(caller, keeper, stakeRequirement)
 ```
 
-The staker must be either the oracle contract owner (`IOracleOwner(oracle).owner()`) or the ReputationKeeper contract owner.
+The caller must be the operator contract's `owner()` or the keeper's owner. `topUpStake(key, amount)` adds stake (the operator owner or the keeper owner).
 
 ### Unstaking Flow
 
 ```
-deregisterOracle(oracle, jobId)
-    │
-    └──→ transfer(oracleOwner, remainingStake)
+requestExit(key)                      the arbiter is no longer selected; blocks and bans still apply
+    │   (unbondingPeriod, 2 days by default)
+completeExit(key)
+    └──→ transfer(operator owner, remaining stake)
 ```
 
-Stake is returned to `IOracleOwner(_oracle).owner()`, not necessarily to the original staker. The oracle must not be locked (`block.timestamp >= lockedUntil`).
+Either the operator's owner or the keeper owner can run both steps, also for a frozen arbiter. `completeExit` reverts with `StillBonded()` before the period ends and with `Blocked()` while the arbiter is blocked. The stake goes to the operator's `owner()`, not necessarily to whoever staked.
 
-### Slashing
+### Burns
 
-When an oracle crosses a penalty threshold (see [Reputation System](reputation.md)):
-- `stakeAmount -= slashAmountConfig`
-- If `stakeAmount < slashAmountConfig`, stake is set to 0
-- Slashed tokens remain in the ReputationKeeper contract (not burned). The keeper has no function that moves them out: the only token transfers in the contract are the stake taken in `registerOracle()` and the stake returned in `deregisterOracle()`
-
-On Base mainnet `slashAmountConfig()` returned 0 on 2026-11-22, so a slash event locks the oracle but takes no tokens today.
+Burned VDKA is burned with the token's `burn`, or sent to `0x…dEaD` if the token has none. Slashed stake never goes to a requester, a reporter or the treasury: paying anyone from slashing would reward making other arbiters fail. Both burns are off by default.
 
 ## Fee Configuration
 
 ### ReputationAggregator Settings
 
-The defaults are set in the constructor; `deploy/03_config.js` sets K, M, N, P, the timeout and `maxOracleFee` again after deployment. The aggregator on Base mainnet returned these same values on 2026-11-22.
+The constructor sets the defaults; `deploy/03_config.js` sets the request bounds with `setLimits(50, 3600, 155)` and the shared parameters with `setParams(3, 2, 250000, 30000, 0.0004 ETH)`.
 
 | Parameter | Default | Setter | Description |
 |-----------|---------|--------|-------------|
-| `maxOracleFee` | 0.0004 ETH (`4e14` wei) | `setMaxOracleFee(uint256)` | Ceiling on per-oracle fee, in ETH wei. A request's `_maxOracleFee` above it is lowered to it, both in `maxTotalFee()` and in oracle selection |
-| `bonusMultiplier` | 3 | `setBonusMultiplier(uint256)` | Bonus multiplier for clustered oracles (0–20×) |
-| `commitOraclesToPoll` (K) | 6 | `setConfig(K,M,N,P,timeout)` | Oracles polled in commit phase (affects base fee count) |
-| `clusterSize` (P) | 2 | `setConfig(K,M,N,P,timeout)` | Cluster size (affects number of bonus payments; must be at least 2) |
-| `responseTimeoutSeconds` | 300 | `setConfig(K,M,N,P,timeout)` or `setResponseTimeout(uint256)` | Time after which a round can be closed as failed and the requester refunded |
+| `maxOracleFee` | 0.0004 ETH (`4e14` wei) | `setParams(..., maxOracleFee)` | Global fee ceiling. A request's `maxFee` above it is lowered to it, in the quote and in selection |
+| `bonusMultiplier` | 3 | `setParams(bonusMult, ...)` | B, at most 20. Stored per round at request |
+| `settlePerRequest` | 2 | `setParams(..., settlePerReq, ...)` | A request settles due rounds up to this × its own K slots |
+| `drawRewardFees` | 2 | `setRewards(drawFees, priority, promoteFees, revealWindow)` | Draw reward, in multiples of eff. Stored per round |
+| `requesterDrawPriority` | 30 s | `setRewards(...)` | Seconds in which only the requester earns the draw reward |
+| `promoteRewardFees` | 1 | `setRewards(...)` | Promote reward, in multiples of eff. Stored per round |
+| `maxJury`, `maxTimeout`, `tPlus` | 50, 3,600 s, 155 s | `setLimits(maxJury, maxTimeout, tPlus)` | Bounds on the request's jury |
+| `treasury` | the deployer | `setContracts(keeper, beacons, treasury)` | Receives the refunds that would be re-rolls |
+
+The beacon quorum is `JuryBeacons.quorum()` (2 by default), set with `JuryBeacons.setParams(polled, quorum, timeout)`; each round stores it at request.
+
 
 ### ReputationSingleton Settings (legacy, LINK)
 
@@ -247,25 +311,22 @@ The defaults are set in the constructor; `deploy/03_config.js` sets K, M, N, P, 
 
 The SimpleContract's `fee` is set at deployment and is not dynamically configurable (no `onlyOwner` setter pattern).
 
-### Oracle Fee Registration
+### Arbiter Fee Registration
 
-Each oracle registers with a specific fee via `registerOracle(..., fee, ...)`. This fee is what the oracle charges per request. Oracles with fees above a request's `maxFee` parameter are excluded from selection. The fee must be greater than 0.
+Each arbiter posts a fee with `registerArbiter(oracle, jobId, fee, classes, chainHead)` (`fee` is a `uint64`, greater than 0) and can change it with `setFee(key, fee)` without losing its reputation. Selection reads the fee as of the request block B, so a change after B does not affect that round. An arbiter whose fee is above a request's ceiling is not eligible for it.
 
-The ReputationKeeper stores the fee as a plain number. The contract that selects the oracle decides what it means: the ReputationAggregator reads it as ETH wei, and the legacy ReputationSingleton reads it as LINK. Because the aggregator never accepts a fee above its `maxOracleFee()` (0.0004 ETH, or `4e14`), an oracle registered with a larger number is never selected by it.
-
-There is no function that changes a registered fee. An oracle that wants another fee has to call `deregisterOracle()` and register again, which starts its reputation from zero.
+The keeper stores the fee as a plain number; the v2 aggregator reads it as ETH wei. Because the aggregator never accepts a ceiling above `maxOracleFee()` (0.0004 ETH), an arbiter posting more is never selected.
 
 ## Emergency LINK Withdrawal
 
-All aggregation contracts provide a `withdrawLink(address payable to, uint256 amount)` function for recovering LINK tokens that are in the contract. In the legacy contracts that can be LINK from failed evaluations or unused bonus pools. The ReputationAggregator holds no LINK in normal operation, so there the function only recovers LINK sent to it by mistake.
+The legacy contracts provide `withdrawLink(address payable to, uint256 amount)` for recovering LINK in the contract.
 
 | Contract | Access Control | Error on Failure |
 |----------|---------------|-----------------|
-| ReputationAggregator | `onlyOwner` | `LinkTransferFailed()` (custom error) |
 | ReputationSingleton | `onlyOwner` | Standard ERC-20 revert |
 | SimpleContract | **No access control** (test contract) | Standard ERC-20 revert |
 
-The ReputationAggregator has no matching function for ETH. The owner cannot take ETH out of the contract: ETH leaves only through `withdrawEth()` and `withdrawEthFor(payee)`, and always to the address it is credited to.
+The v2 ReputationAggregator has no `withdrawLink`: it holds no LINK. It has no ETH sweep either: ETH leaves only through `withdrawEth()` and `withdrawEthFor(payee)`, always to the credited address.
 
 ## Practical Fee Guidance
 
@@ -273,25 +334,23 @@ The ReputationAggregator has no matching function for ETH. The owner cannot take
 
 **ReputationAggregator (ETH):**
 
-1. **Calculate the prepayment** before submitting: call `maxTotalFee(yourMaxFee)` on the contract
-2. **Send it with the request**: subtract your existing `ethOwed` credit and attach the rest as `msg.value`. No approval is needed
-3. **Set `maxFee` conservatively**: Lower values filter out expensive oracles but may reduce oracle availability. Check that oracles are registered with fees below your limit
-4. **Close timed-out rounds**: call `finalizeEvaluationTimeout(aggId)` after the timeout, or your prepayment stays reserved
-5. **Collect or reuse your credit**: call `withdrawEth()`, or leave the credit to pay for your next request
+1. **Choose the jury, ceiling and floor**, then call `maxTotalFee(maxFee, minFee, withBeacons, K, P)`.
+2. **Send it with the request**: subtract your existing `ethOwed` credit and attach the rest as `msg.value`. No approval is needed.
+3. **Set the ceiling with the pool in mind.** A low ceiling filters out expensive arbiters and can thin the pool; the keeper's `eligibleCount(class, maxFee)` shows how many are eligible now. A thin pool repeats arbiters rather than failing.
+4. **Draw your own round within 30 seconds** to get the draw reward back, and send `promote` yourself to keep the promote reward.
+5. **Settle dead rounds**: call `settle(aggId)` after the deadline, or the refund stays in the round.
+6. **Collect or reuse your credit**: `withdrawEth()`, or leave it to pay for your next request.
 
 **ReputationSingleton and SimpleContract (legacy, LINK):**
 
 1. **Calculate max cost** before submitting: call `maxTotalFee(yourMaxFee)` on the contract
 2. **Approve sufficient LINK**: `link.approve(contractAddress, maxTotalFee)`. For SimpleContract the approval must persist through fulfillment
 
-### For Oracle Operators
+### For Arbiter Operators
 
-1. **Set competitive fees**: Lower fees increase selection probability via [fee weighting](oracle-selection.md)
-2. **Fee earnings per request**:
-   - ReputationAggregator: `fee` for every request the oracle is polled for + `fee × bonusMultiplier` if clustered, in ETH
-   - ReputationSingleton: `fee` as base + `fee` as bonus on fulfillment, in LINK
-   - SimpleContract: `fee` as base + `fee` as bonus on fulfillment, in LINK
-3. **Collect ReputationAggregator earnings**: they are credited to the address that `owner()` of the operator contract returned when the request was made. That address calls `withdrawEth()` on the aggregator; `ethOwed(address)` shows the balance
+1. **Set competitive fees**: a lower fee raises the selection weight (see [fee weighting](oracle-selection.md#weight)), but only down to the round's floor: below it every arbiter costs the requester the same.
+2. **Earnings per round**, in ETH: `max(fee, floor)` for every slot the arbiter is drawn for, `B × max(fee, floor)` more if its reveal is in the cluster, and `max(ceiling, floor)` for a used beacon value.
+3. **Collect them**: they are credited to the address that the operator contract's `owner()` returned at the draw (or at the beacon payment). That address calls `withdrawEth()` on the aggregator; `ethOwed(address)` shows the balance.
 
 ### Cost Comparison
 
@@ -299,4 +358,4 @@ The ReputationAggregator has no matching function for ETH. The owner cannot take
 |----------|---------|----------|----------|---------|
 | SimpleContract (legacy) | LINK | `2 × fee` | `2 × fee` | Fixed: base + bonus |
 | ReputationSingleton (legacy) | LINK | `2 × oracleFee` | `2 × maxOracleFee` | 2 × selected oracle's fee |
-| ReputationAggregator | ETH | `sum(K fees)` (round times out) | `sum(K fees) + B × sum(fees of the P clustered oracles)` | Base fees + bonuses; the prepayment `ceiling × (K + B × P)` covers the worst case and the rest is credited back |
+| ReputationAggregator (v2) | ETH | nothing if no arbiter is eligible; otherwise at least the K base fees, less the rewards the requester earns back | the quote, `maxTotalFee` (a cancelled round sends all of it to the treasury) | Base fees + bonuses + beacons + rewards; the rest is refunded unless the round ended in a way that would be a re-roll |

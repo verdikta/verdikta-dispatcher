@@ -1,207 +1,126 @@
 # Reputation System
 
-Full explanation of how oracle reputation scoring works in the Verdikta Dispatcher, including initial values, score updates, penalty mechanics, and how scores affect oracle selection.
+How arbiter reputation works in the v2 contracts: the two scores, the points each round's outcome is worth, how the aggregator reports outcomes to the keeper, the blocks, bans, decay and burns, and the liveness freeze.
+
+!!! note "Checked against the code (v2)"
+    Rewritten on 2026-11-25 for the v2 [`ReputationKeeper.sol`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/contracts/ReputationKeeper.sol) (`applyOutcomes`, `_block`, the health calls) and [`ReputationAggregator.sol`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/contracts/ReputationAggregator.sol) (`_settle`) on the `beacon` branch. The design and its simulation are TODO.md item 14 ("Reputation v2") and item 7 (the freeze). v1's rules (unbounded scores starting at 0, ±60/−20 deltas set on the aggregator, mild and severe thresholds, the 25-entry worsening check, `manualBlockOracle`, `resetAllReputations`) are gone.
 
 ## Overview
 
-The reputation system tracks oracle performance across two dimensions — **quality** and **timeliness** — using additive integer scores. These scores directly influence the probability that an oracle is selected for future evaluations via the [oracle selection algorithm](oracle-selection.md).
+Each arbiter has two integer scores, **timeliness** and **quality**, from 0 to 1000. They change by fixed points per event, the same for every jury size, using only what the contracts see: whether a promoted arbiter delivered its reveal, whether a round failed, and how far each reveal was from the round's median. The scores set the arbiter's [selection weight](oracle-selection.md#weight); a score that reaches 0 blocks the arbiter for a while.
 
-Reputation data is stored in the [ReputationKeeper](../contracts/reputation-keeper.md) contract and updated by approved aggregator contracts after each evaluation round.
+Being down is not scored at all: it is handled by the **freeze**, which makes an arbiter unselectable until it answers a health call.
 
-## Score Dimensions
+Reputation lives in the [ReputationKeeper](../contracts/reputation-keeper.md). Only approved contracts (the aggregator) can report outcomes, with `applyOutcomes`, once per round at settlement.
 
-Each oracle maintains two independent scores, both stored as `int256`:
+## Starting Values and Range
 
-| Score | Measures | Positive signal | Negative signal |
-|-------|----------|-----------------|-----------------|
-| **qualityScore** | Response accuracy and consensus participation | Clustered with other oracles | Outlier response or no response |
-| **timelinessScore** | Response speed and availability | Timely commit and reveal | Late or missing response |
+| | Default | Setter |
+|---|---|---|
+| Start (a new arbiter, and a score after a block) | 500 | `setPoints(Points)` (`start`) |
+| Maximum (scores are clamped) | 1000 | `setPoints` (`cap`) |
 
-## Initial Values
+A returning arbiter (the same operator and job ID registering again after `completeExit`) keeps its scores and offenses; only a new key starts at 500.
 
-When an oracle is registered via `registerOracle()`, both scores start at **0**:
+## Table 1: Points per Round
 
-```
-qualityScore    = 0
-timelinessScore = 0
-```
+Only the round's jurors are scored, once per jury slot. At settlement the aggregator reports one code per slot; the keeper maps it to points.
 
-Scores are unbounded `int256` values that accumulate over the oracle's lifetime. They can go negative. The only reset mechanism is `resetAllReputations()` (owner-only), which zeroes all scores, call counts, and block/lock states across all registered oracles.
+| Event in a round | Timeliness | Quality |
+|---|---|---|
+| Promoted, and its reveal arrived (even late, until the deadline) | **+20** (`gain`) | by distance from the median, below |
+| … the reveal is **close** (within 1.5 spreads) | | **+20** (`gain`) |
+| … **off** (1.5 to 3 spreads) | | **−50** (`minor`) |
+| … **far** (more than 3 spreads) | | **−200** (`major`) |
+| Promoted, no reveal, round still finished | **−200** (`major`) | |
+| Promoted, no reveal, **round failed** | **−500** (`fail`) | |
+| No commit, and the **round failed for lack of commits** | **−400** (`nocommit`) | |
+| Anything else: committing, speed, not being promoted | 0 | 0 |
 
-## Score Update Formula
+The **spread** is `max(1.4826 × MAD, spreadFloor)`, where MAD is the median of each counted reveal's distance from the coordinate-wise median (for a vector, its largest coordinate deviation), and `spreadFloor` is 30,000 on the 0 to 1,000,000 scale (3 points). The median and spread are stored at finalization, so a late reveal is classed on arrival against the same median.
 
-Scores are updated by calling `updateScores(oracle, jobId, qualityChange, timelinessChange)` where both change values are `int8` (range: −128 to +127).
+In a failed round a delivered reveal gets +20 timeliness and no quality points, since there is no median to judge it by.
 
-The update is purely additive:
+Why these rules (TODO item 14 gives the simulations):
 
-```
-qualityScore    = qualityScore    + qualityChange
-timelinessScore = timelinessScore + timelinessChange
-callCount       = callCount       + 1
-```
+- **Commits never earn points.** A commit can't be checked unless it is promoted and revealed, so credit for committing would reward fake commits. A fake commit doesn't help either: if promoted it must be revealed, or it costs −200 or −500.
+- **The −400 for not committing applies only when the round failed for lack of commits**, the attack where a cartel blocks by never committing. A round that had M commits but died because nobody called `closeCommits` charges nobody.
+- **Rare bad luck can't block a good arbiter.** An arbiter in good standing survives any single event; two failed rounds in quick succession block it.
+- **No round-size terms.** An honest arbiter nets on average about +18 timeliness and +10 quality per round it serves in, whatever the jury.
 
-There is no decay function — scores persist indefinitely. Each `updateScores()` call also increments the oracle's `callCount` and appends a `ScoreRecord` to the oracle's history.
+## Settlement Codes
 
-### Who Can Call `updateScores()`
+`settle(aggId)` (or a new request settling due rounds) sends the keeper one byte per jury slot, `applyOutcomes(keys, codes, roundEnd)`:
 
-Only contracts that are:
-1. Approved via `approveContract()`, AND
-2. Have previously called `recordUsedOracles()` with this oracle's identity
+| Bits | Meaning | Values |
+|------|---------|--------|
+| 0–3 | timeliness event | 0 none, 1 `T_DELIVERED`, 2 `T_MISS_FINISHED`, 3 `T_MISS_FAILED`, 4 `T_NOCOMMIT_FAILED` |
+| 4–5 | quality class | 0 none, 1 close, 2 off, 3 far |
+| 7 | `C_COMMITTED` (0x80): the arbiter committed in this round | |
 
-This ensures only aggregator contracts that actually dispatched work to an oracle can update its scores.
+How the aggregator assigns them:
 
-## Score Deltas by Outcome Tier
+| Round ended in phase | Slot | Code |
+|---|---|---|
+| 3 commit (failed) | no commit, and fewer than M commits arrived | 4 |
+| 3 commit (failed) | otherwise | 0 |
+| 4 closing (failed: never promoted) | any | 0 |
+| 5 reveal (failed) | promoted, revealed | 1 |
+| 5 reveal (failed) | promoted, no reveal | 3 |
+| 6 final (finished) | promoted, revealed | 1 + its quality class |
+| 6 final (finished) | promoted, no reveal | 2 |
+| any | not promoted | 0 |
 
-The ReputationAggregator assigns different score deltas depending on how an oracle performed in a given evaluation round. These values are configurable via `setScoreDeltas()` (owner-only).
+Every non-zero code of a slot that committed carries 0x80. Code 0 means no change. A repeated arbiter (in a thin pool) is scored once per slot.
 
-### Default Score Deltas
+The keeper skips a code when the arbiter is no longer registered or is banned, and when it was **frozen at the round's deadline** and the code lacks 0x80 (`OutcomeSkippedFrozen`). A commit proves the arbiter was up, so freezing itself cannot dodge the −500 for going silent after committing. The keeper judges the freeze at `roundEnd`, the deadline, not at settlement: an arbiter that recovers before settlement is not charged for the outage, and one that stays frozen gains nothing it would not have had at the deadline.
 
-| Outcome Tier | Quality Delta | Timeliness Delta | Description |
-|-------------|---------------|------------------|-------------|
-| **Clustered** | **+60** | **+60** | Oracle's response was in the best consensus cluster |
-| **Selected but not clustered** | **−60** | **0** | Oracle was selected for aggregation but was an outlier |
-| **Revealed but not selected** | **0** | **−20** | Oracle revealed but wasn't among the first N responses |
-| **Committed but not revealed** | **0** | **−20** | Oracle committed but did not reveal (or reveal was rejected) |
+Settlement can lag. A new request settles due rounds in queue order within a budget of `settlePerRequest()` × its own K slots, and the walk stops at the first round too big for what is left or not yet past its deadline; anyone may call `settle(aggId)`. An arbiter that finishes `completeExit` before its round is settled escapes that round's points, because `applyOutcomes` skips unregistered keys. Unbonding takes at least 2 days, which covers a round drawn up to a day after its request with its timeout, but not a round left unsettled longer than that.
 
-### Outcome Tier Assignment
+## Table 2: What the Scores Do
 
-During a ReputationAggregator evaluation with K=6, M=4, N=3, P=2:
+| Score state | Effect |
+|---|---|
+| Any | selection weight = `1000 + rep × 1000 / cap`, with `rep = ((1000 − alpha) × quality + alpha × timeliness) / 1000`, so 1000 to 2000 (before the fee factor) |
+| Either score reaches **0** | **blocked** for `lockDuration` × 2^offenses (24 h, 48 h, 96 h, …); the score that reached 0 restarts at `start`; offenses + 1 |
+| The `maxOffenses`-th block (3rd by default) | **banned** for good. The key keeps its record, so it can never register again |
+| A block | burns `burnPerBlock` × 2^offenses VDKA from the stake (default 0) |
+| A ban | burns the whole remaining stake if `burnOnBan` (default off) |
+| `decayPeriod` (90 days) without a block, counted from the end of the last one | one earlier offense is forgiven, again every 90 clean days (applied lazily at the next block) |
+| A score reaches 0 while already blocked | restarts at `start`, but adds no offense and burns nothing: several in-flight rounds failing together count as one incident |
 
-1. **K=6 oracles** are polled in the commit phase
-2. The **first M=4** to commit are sent reveal requests
-3. The **first N=3** valid reveals are marked as "selected" for aggregation
-4. Among those N=3 selected, the **closest P=2** (by Euclidean distance) form the consensus cluster
+A blocked arbiter is not eligible until `blockedUntil`, and it cannot complete an exit while blocked (`Blocked()`). An arbiter whose stake falls below `stakeRequirement` after a burn is not eligible until it tops up (`topUpStake`). Exiting does not help an arbiter escape a block: `requestExit` starts a 2-day unbonding during which blocks and bans still apply.
 
-The tier assignment during `_finalizeAggregation()`:
+## The Liveness Freeze
 
-```
-For each of the K polled oracles:
-  if oracle is inactive at finalization:
-    → Skipped (OracleScoreUpdateSkipped event)
-  else if oracle revealed AND was selected AND is in the cluster:
-    → Clustered tier (+60 quality, +60 timeliness)
-  else if oracle revealed AND was selected AND is NOT in the cluster:
-    → Selected-not-clustered tier (−60 quality, 0 timeliness)
-  else if oracle revealed but was NOT selected:
-    → Revealed-not-selected tier (0 quality, −20 timeliness)
-  else (oracle did not reveal — either didn't commit or commit-only):
-    → Committed-not-revealed tier (0 quality, −20 timeliness)
-```
+The keeper checks liveness with hash-chain health calls (TODO items 6 and 7). Each arbiter registers the head `H^n(seed)` of a hash chain (`registerArbiter(..., chainHead)`). A health call (`HealthCall(key, sentAt)`) is answered by revealing the next preimage, `answerHealthCall(key, preimage)` or `rotateChain(key, preimage, newHead)`, from the operator's owner or an authorized sender of the operator.
 
-### Timeout Penalties
+- **Who calls.** Every juror gets a call at the draw, and so do 3 random other shortlisted arbiters (`liveRandom`), and every beacon. The owner can call many at once (`sendHealthCalls`), and an arbiter's owner or node can ask for one itself (`requestHealthCall`).
+- **Freeze.** A call unanswered for more than `callDeadline` (60 s) freezes the arbiter: it is not eligible, and it is not scored (unless it committed). Answering at any time unfreezes it. `isFrozen(key)` reports it, and `healthState(key)` returns what the node needs: whether a call is pending, when it was sent, and the current head.
+- **No points either way.** Being down is not misbehaviour, so nothing is burned or deducted for a freeze.
+- **Re-sync.** An answer whose value does not hash to the head re-syncs the chain instead of reverting: the value becomes the new head, `ChainResynced(key)` is emitted, and the arbiter is frozen until it answers a call sent after the re-sync. The node's health job recovers by itself: re-sync, answer (which sends that call), answer (which unfreezes). A head of 0 at registration starts the arbiter in this state. See [Security Model](security.md#hash-chains-and-the-re-sync) for why this cannot be used to pick a beacon value.
 
-When `finalizeEvaluationTimeout()` is called:
-
-- **Commit timeout** (fewer than M commits received): Oracles that did not submit a commit (slot has `bytes16(0)`) receive the committed-not-revealed penalty (default: 0 quality, −20 timeliness)
-- **Reveal timeout** (fewer than N reveals received): Oracles that did not submit a valid reveal receive the same penalty
-
-Oracles that did commit or reveal before the timeout are not penalized during timeout processing.
-
-## Score History and Trend Detection
-
-The ReputationKeeper maintains a rolling history of recent scores for each oracle:
-
-- **Window size**: `maxScoreHistory` (default: **25** score snapshots)
-- After each `updateScores()` call, a `ScoreRecord{qualityScore, timelinessScore}` is appended
-- When the history reaches `maxScoreHistory`, the oldest entry is shifted out (FIFO)
-
-### Consistent Degradation Detection
-
-When the score history buffer is full (25 entries), the system checks for consistent worsening:
-
-```
-worsening = true
-for i in 1..maxScoreHistory:
-  if scores[i].quality >= scores[i-1].quality AND
-     scores[i].timeliness >= scores[i-1].timeliness:
-    worsening = false
-    break
-```
-
-If `worsening` remains `true` (every single consecutive entry is strictly worse than the previous on at least one dimension), the oracle receives:
-- **Slash**: `stakeAmount -= slashAmountConfig`
-- **Block**: `blocked = true` (excluded from selection)
-- **Lock**: `lockedUntil = block.timestamp + lockDurationConfig`
-- **History cleared**: `delete info.recentScores`
-
-This is an independent check from threshold-based penalties — it can trigger even if scores are above both thresholds, as long as the trend is consistently downward.
-
-## Penalty Thresholds and Slashing
-
-Penalties are evaluated after each score update, but **only** if the oracle's current lock period has expired (`block.timestamp >= lockedUntil`).
-
-### Auto-Unblock
-
-When `block.timestamp >= lockedUntil` and the oracle was blocked, it is automatically unblocked (`blocked = false`) before threshold checks proceed. This allows previously penalized oracles to recover.
-
-### Severe Threshold
-
-```
-Default: severeThreshold = −900
-```
-
-If `qualityScore < −900` **OR** `timelinessScore < −900`:
-- **Slash**: `stakeAmount -= slashAmountConfig` (default: 0 VDKA, configurable)
-- **Block**: `blocked = true` (excluded from selection)
-- **Lock**: `lockedUntil = block.timestamp + lockDurationConfig` (default: 24 hours)
-- **Score reset**: The offending score(s) are raised to `mildThreshold` (−300) to prevent repeated immediate slashing on the next update
-
-### Mild Threshold
-
-```
-Default: mildThreshold = −300
-```
-
-If `qualityScore < −300` **OR** `timelinessScore < −300` (and severe threshold was not triggered):
-- **No slash**: Stake is not reduced
-- **No block**: `blocked = false` (oracle remains selectable after lock expires)
-- **Lock**: `lockedUntil = block.timestamp + lockDurationConfig` (default: 24 hours)
-
-### Manual Blocking
-
-The owner can block any oracle directly via `manualBlockOracle(oracle, jobId, duration)`:
-- Sets `blocked = true` and `lockedUntil = block.timestamp + duration`
-- If `duration == 0`, uses `lockDurationConfig` as default
-- Does not slash stake
-
-### Summary of Penalty Actions
-
-| Trigger | Slashing | Blocked | Lock Duration | Score Adjustment |
-|---------|----------|---------|---------------|-----------------|
-| Severe threshold (< −900) | `slashAmountConfig` VDKA | Yes | `lockDurationConfig` | Offending score → −300 |
-| Mild threshold (< −300) | None | No | `lockDurationConfig` | None |
-| Consistent degradation (25 entries) | `slashAmountConfig` VDKA | Yes | `lockDurationConfig` | History cleared |
-| Manual block | None | Yes | Specified duration | None |
+A known gap (TODO item 14, "the abstain dodge"): a cartel member that blocks by never committing and also ignores its health call is frozen at the deadline, so it escapes the −400; being frozen costs it only being unselectable until it answers.
 
 ## Configurable Parameters
 
+All are owner-only on the keeper.
+
 | Parameter | Default | Setter | Description |
 |-----------|---------|--------|-------------|
-| `slashAmountConfig` | 0 VDKA | `setSlashAmount(uint256)` | Tokens deducted per slash event |
-| `lockDurationConfig` | 24 hours | `setLockDuration(uint256)` | Duration oracles are locked after penalty |
-| `severeThreshold` | −900 | `setSevereThreshold(int256)` | Score below which severe penalty applies |
-| `mildThreshold` | −300 | `setMildThreshold(int256)` | Score below which mild penalty applies |
-| `maxScoreHistory` | 25 | `setMaxScoreHistory(uint256)` | Rolling window size for trend detection |
-| `maxScoreForSelection` | 6000 | `setMaxScoreForSelection(uint256)` | Score cap for selection weighting |
-| `minScoreForSelection` | 60 | `setMinScoreForSelection(uint256)` | Score floor for selection weighting |
+| `points` | gain 20, minor 50, major 200, fail 500, nocommit 400, start 500, cap 1000 | `setPoints(Points)` | Table 1 and the range (`start ≤ cap`, both non-zero) |
+| `lockDuration` | 24 h | `setTiming(lock, decay, callDeadline, unbonding)` | Base block length, doubled per offense |
+| `decayPeriod` | 90 days | `setTiming(...)` | Clean time that forgives one offense |
+| `callDeadline` | 60 s | `setTiming(...)` | Time to answer a health call |
+| `unbondingPeriod` | 2 days | `setTiming(...)` | At least `MIN_UNBONDING` (2 days) |
+| `maxOffenses` | 3 | `setPenalties(maxOffenses, burnPerBlock, burnOnBan)` | Blocks before a ban (1 to 16) |
+| `burnPerBlock` | 0 | `setPenalties(...)` | VDKA burned per block, doubled per offense |
+| `burnOnBan` | false | `setPenalties(...)` | Burn the whole stake on a ban |
 
-All setters are `onlyOwner`. Score deltas are configured on the ReputationAggregator via `setScoreDeltas()`.
+`spreadFloor` (30,000) is the aggregator's, set with `setParams`.
 
-## How Scores Affect Selection
+## Reading an Arbiter's Reputation
 
-Reputation scores feed into the [oracle selection algorithm](oracle-selection.md). The key formula:
+`getArbiter(key)` returns the oracle, `quality`, `timeliness`, `offenses`, `flags` (1 registered, 2 paused, 4 banned, 8 exiting, 16 call pending, 32 under-staked, 64 re-syncing), `blockedUntil`, `fee`, `callSentAt`, `callAnsweredAt`, `stake`, the number of checkpoints and `exitAt`. The key is `keyOf(operator, jobId)`. `ScoresUpdated(key, quality, timeliness)`, `ArbiterBlocked`, `ArbiterBanned` and `OutcomeSkippedFrozen` record every change; see the [Events Reference](../api/events.md).
 
-```
-weightedScore = ((1000 − alpha) × qualityScore + alpha × timelinessScore) / 1000
-```
-
-Where `alpha` (0–1000) is provided by the requester:
-- `alpha = 0`: Selection based entirely on quality
-- `alpha = 500`: Equal weight (default in DemoClient)
-- `alpha = 1000`: Selection based entirely on timeliness
-
-The weighted score is clamped to `[minScoreForSelection, maxScoreForSelection]` → `[60, 6000]`, then multiplied by a fee weighting factor to produce the final selection weight.
-
-**Key implication**: Even oracles with negative scores receive the floor weight (`minScoreForSelection = 60`), ensuring they always have some probability of being selected. This prevents permanent exclusion and allows recovery.
-
-For the complete selection algorithm, see [Oracle Selection](oracle-selection.md). For the fee mechanics that interact with scoring, see [Fee Mechanisms](fees.md).
+For the selection algorithm see [Oracle Selection](oracle-selection.md); for the fee mechanics, [Fee Mechanisms](fees.md).

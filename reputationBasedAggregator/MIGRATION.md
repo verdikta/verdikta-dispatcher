@@ -102,7 +102,7 @@ comparing the two ABIs and the code that calls them.
 | `maxTotalFee(maxFee)` | `maxTotalFee(maxFee, minFee, withBeacons, K, P)`: `max(eff, minFee) × (K + B×P [+ 2]) + eff × (2 + 1)`, for the jury the request will ask for |
 | `K()`, `M()`, `N()`, `P()`, `setConfig` | none: the jury is the request's. `getJury(aggId)` returns a round's `(K, M, N, P, timeout)`; the owner bounds requests with `setLimits(maxJury, maxTimeout, tPlus)` (`maxJury()`, `maxTimeout()`, `tPlus()`) |
 | (none) | `drawJury(aggId)` from block B+2: a passthrough on the wallet, like `startEvaluation`, so the draw reward reaches the hunter. With beacons, call it twice: once to start the stage, then again once 2 beacon values are in |
-| `finalizeEvaluationTimeout(aggId)` | `settle(aggId)` after the round's deadline. Anyone may call it, and new requests settle due rounds too |
+| `finalizeEvaluationTimeout(aggId)` | `settle(aggId)` after the round's deadline. Anyone may call it. New requests also settle due rounds, but only within a budget of `settlePerRequest` × their own K slots and in queue order, so a big or long round can need an explicit `settle` |
 | `getAggregationStatus(aggId)` → `isComplete, failed, …` | `getRoundInfo(aggId)` → `phase, …`. Settled = phase 7 (settled) or 8 (failed); `isFailed(aggId)`. After the escrow fields it also returns `deadline` (0 until the draw; `settle` is due after it), `windowEnd` (T+ after the draw), `commits` and `requestTime` (added 2026-11-23, for consumers' on-chain views) |
 | `getEvaluation(aggId)` | same; valid from finalization (phase 6), before settlement |
 | `responseTimeoutSeconds()` | none: the jury's `timeout`, run from the draw, not the request |
@@ -126,7 +126,7 @@ Behaviour BountyEscrow must allow for:
 - **Refunds land in `ethOwed[wallet]`:**
   - at finalization for a successful round;
   - at settlement for a failed round;
-  - at the draw for a pool shortage (fewer than K eligible, or fewer beacon candidates than the
+  - at the draw for a pool shortage (no eligible arbiter, or fewer beacon candidates than the
     quorum).
 - **Credit covers only what `msg.value` does not.** Sending exactly `maxTotalFee` leaves the wallet's
   credit untouched, and an overpayment returns to credit.
@@ -136,7 +136,10 @@ Behaviour BountyEscrow must allow for:
   P >= 2 unless N = 1, K <= `maxJury()` and the keeper's `shortlistSize()`, and T+ < timeout <=
   `maxTimeout()`.
 - **A thin pool repeats arbiters.** With fewer than K eligible, the jury fills with repeats (slot k
-  holds pick k mod m); the draw fails (refunded) only when none is eligible.
+  holds pick k mod m); the draw fails (refunded) only when none is eligible. Repeats can also happen
+  in a deep pool, if `shortlistSize` is lowered after the request or the walk's `maxScan` entries hold
+  fewer than K eligible. A repeated arbiter can decide a round alone, and a Q-of-N rule counts slots,
+  not arbiters: check `keeper.eligibleCount(cls, maxFee)` before relying on a round.
 - **The fee floor (item 8).** It is the bounty creator's setting: add `minOracleFee` to the bounty's
   oracle parameters and pass it into every request for that bounty, never the hunter's choice. It
   may exceed `maxOracleFee()`. The UI should ask for a target cost per attempt and divide by K,

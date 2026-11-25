@@ -1,79 +1,74 @@
 # Smart Contract Integration Walkthrough
 
-A complete integration walkthrough based on the [DemoClient](https://github.com/verdikta/verdikta-dispatcher/tree/master/demoClient) contract, showing how a client contract calls the ReputationAggregator and pays for the evaluation in ETH.
+A complete walkthrough of a client contract that calls the v2 ReputationAggregator, pays for the evaluation in ETH, and moves its round from the request to the result.
 
-!!! note "Checked against the code"
-    Rewritten on 2026-11-22 against [`demoClient/contracts/DemoClient.sol`](https://github.com/verdikta/verdikta-dispatcher/blob/master/demoClient/contracts/DemoClient.sol), [`demoClient/scripts/query-demo.js`](https://github.com/verdikta/verdikta-dispatcher/blob/master/demoClient/scripts/query-demo.js) and [`ReputationAggregator.sol`](https://github.com/verdikta/verdikta-dispatcher/blob/master/reputationBasedAggregator/contracts/ReputationAggregator.sol). The DemoClient and the patterns below were deployed and run on a local fork of Base mainnet. The earlier version of this page described a DemoClient that held LINK and approved it for the aggregator. That contract is no longer in the repository: the DemoClient is funded with ETH, and nothing on this page needs LINK.
+!!! note "Checked against the code (v2)"
+    Rewritten on 2026-11-25 for the v2 contracts on the `beacon` branch ([`ReputationAggregator.sol`](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/contracts/ReputationAggregator.sol)). v2 is not deployed yet: use the aggregator address set at the v2 deployment. The contracts on this page were compiled with solc 0.8.30, and the client contract and the Node script were run together against the v2 contracts on Hardhat's in-process network, with the repository's `TestOperator` standing in for the arbiters. The repository's [DemoClient](https://github.com/verdikta/verdikta-dispatcher/tree/beacon/demoClient) still speaks v1 (a 7-argument request and `maxTotalFee(fee)`) and has not been ported, so this page no longer walks through it; the `VerdiktaClient` below takes its place.
 
 ## Architecture
 
-A client contract interacts with the Verdikta system through the aggregator. The client never talks to oracles directly — the aggregator handles oracle selection, request dispatch, result aggregation and payment.
+A client contract talks to the Verdikta system through the aggregator. The client never talks to arbiters directly: the aggregator draws the jury through the ReputationKeeper, dispatches the requests, aggregates the answers and pays everyone.
 
 ```
 Your Client Contract
     │
-    ├── reads maxTotalFee(...) to size the prepayment
-    ├── calls requestAIEvaluationWithApproval{value: ...}(...)
-    ├── reads getEvaluation(requestId)
-    ├── reads isFailed(requestId)
-    └── calls withdrawEth() to collect its refunds
+    ├── reads maxTotalFee(maxFee, minFee, withBeacons, K, P) to size the prepayment
+    ├── calls requestAIEvaluationWithApproval{value: ...}(..., withBeacons, jury)
+    ├── calls drawJury(aggId) from block B+2 (it is the requester, so it earns the draw reward)
+    ├── reads getRoundInfo(aggId), getJury(aggId), getEvaluation(aggId)
+    ├── calls settle(aggId) on a dead round
+    └── calls withdrawEth() to collect its credit
         │
         ▼
 ReputationAggregator
     │
     ├── holds the prepayment for the round
-    ├── selects oracles via ReputationKeeper
+    ├── draws the jury via ReputationKeeper (and JuryBeacons, if asked)
     ├── dispatches Chainlink requests (which carry no LINK)
-    ├── collects and aggregates responses
-    └── credits oracle fees, bonuses and the requester's refund
+    ├── closes the commit phase, promotes M commits, aggregates N reveals
+    ├── reports every juror's outcome to the keeper at settlement
+    └── credits fees, bonuses, rewards and the requester's refund
         in its ethOwed ledger
 ```
 
-The function is still called `requestAIEvaluationWithApproval`, but there is no approval: the ETH that funds the round travels with the call.
+Anyone may call `drawJury`, `closeCommits`, `promote` and `settle`. In practice your application sends them, from the client contract or from an account it runs, because nothing else is guaranteed to.
 
-## The DemoClient Contract
+## The Client Contract
 
-The DemoClient (`demoClient/contracts/DemoClient.sol`) demonstrates the minimal integration pattern.
-
-### Contract Source
-
-The contract as it is in the repository, with its comments shortened:
+`VerdiktaClient` tracks one request at a time, as the v1 DemoClient did. Put the [interface from Integration Examples](index.md#the-interface) above it in the same file.
 
 ```solidity
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.21;
-
-interface IReputationAggregator {
-    function requestAIEvaluationWithApproval(
-        string[] calldata cids,
-        string calldata addendum,
-        uint256 alpha,
-        uint256 maxOracleFee,
-        uint256 estimatedBaseFee,
-        uint256 maxFeeScaling,
-        uint64 jobClass
-    ) external payable returns (bytes32);
-    function getEvaluation(bytes32)
-       external view returns (uint256[] memory, string memory, bool);
-    function isFailed(bytes32) external view returns (bool);
-    function maxTotalFee(uint256) external view returns (uint256);
-    function withdrawEth() external;
-}
-
-contract DemoClient {
+contract VerdiktaClient {
     IReputationAggregator public immutable agg;
+    address public immutable owner;
     string[] private cids;
     bytes32 public currentAggId;
 
+    uint256 public constant MAX_FEE = 15e13;     // fee ceiling: 0.00015 ETH per arbiter
+    uint256 public constant BASE_COST = 8e9;     // below the ceiling
+    uint64 public constant CLASS = 128;
+
     event Requested(bytes32 id);
     event Result(bytes32 id, uint256[] scores, string justif);
+    event Failed(bytes32 id, uint8 phase);
 
-    constructor(address aggregator) {
+    constructor(address aggregator, string memory cid) {
         agg = IReputationAggregator(aggregator);
-        cids.push("QmSnynnZVufbeb9GVNLBjxBJ45FyHgjPYUHTvMK5VmQZcS");
+        owner = msg.sender;
+        cids.push(cid);
     }
 
-    // Start an evaluation, funded with the ETH sent with this call and with
+    // Small: 6 drawn, 5 promoted, 4 counted, a cluster of 3, 300 s from the draw
+    function jury() public pure returns (IReputationAggregator.Jury memory) {
+        return IReputationAggregator.Jury({K: 6, M: 5, N: 4, P: 3, timeout: 300});
+    }
+
+    // Worst-case ETH to send with request()
+    function quote() external view returns (uint256) {
+        return agg.maxTotalFee(MAX_FEE, 0, false, 6, 3);
+    }
+
+    // Escrow only: funded with the ETH sent with this call and with
     // any credit this contract already holds in the aggregator
     function request() external payable {
         require(currentAggId == bytes32(0), "already pending");
@@ -81,312 +76,252 @@ contract DemoClient {
             cids,       // IPFS CIDs of the query package
             "",         // no addendum text
             500,        // alpha: equal weight on quality and timeliness
-            15e13,      // maxOracleFee: 0.00015 ETH per oracle at most
-            8e9,        // estimatedBaseCost, in wei, below the fee ceiling
+            MAX_FEE,
+            0,          // no fee floor
+            BASE_COST,
             5,          // maxFeeBasedScalingFactor
-            128         // requestedClass
+            CLASS,
+            false,      // no beacons
+            jury()
         );
         emit Requested(currentAggId);
     }
 
-    // Worst-case ETH to send with request()
-    function quote() external view returns (uint256) {
-        return agg.maxTotalFee(15e13);
+    // From block B+2. Anyone may call it; this contract is the requester, so a
+    // draw through it within 30 s credits it the draw reward (2 x MAX_FEE)
+    function draw(bytes32 aggId) external {
+        agg.drawJury(aggId);
     }
 
+    // Publish the result, or clear a round that failed. A round that is still
+    // open at its deadline is dead: settle it first, which credits the refund
     function publish() external {
-        (uint256[] memory s, string memory j, bool has) =
-            agg.getEvaluation(currentAggId);
-        if (has) {
-            emit Result(currentAggId, s, j);
+        bytes32 id = currentAggId;
+        require(id != bytes32(0), "nothing pending");
+        (uint256[] memory s, string memory j, bool valid) = agg.getEvaluation(id);
+        if (valid) {
+            emit Result(id, s, j);
             currentAggId = bytes32(0);
-        } else if (agg.isFailed(currentAggId)) {
-            currentAggId = bytes32(0);
-        } else {
-            revert("not ready");
+            return;
         }
+        (uint8 phase, , , , , , , , uint256 deadline, , , ) = agg.getRoundInfo(id);
+        if (phase >= 3 && phase <= 5 && block.timestamp > deadline) {
+            agg.settle(id);
+            phase = 8;
+        }
+        if (phase == 8 || phase == 9) {
+            emit Failed(id, phase);
+            currentAggId = bytes32(0);
+            return;
+        }
+        revert("not ready");
     }
 
-    // Pull this contract's credit out of the aggregator, into this contract
+    // Pull this contract's credit out of the aggregator and pay it to the owner
     function reclaim() external {
+        require(msg.sender == owner, "not owner");
         agg.withdrawEth();
+        (bool ok, ) = owner.call{value: address(this).balance}("");
+        require(ok, "transfer failed");
     }
 
-    // The reclaimed ETH arrives here
     receive() external payable {}
 }
 ```
 
 ## Step-by-Step Integration Guide
 
-### Step 1: Define the Aggregator Interface
+### Step 1: Choose the Jury
 
-Your contract needs an interface for the functions it calls. The request function must be declared `payable`:
+Every request carries its own jury, `Jury {K, M, N, P, timeout}`:
 
-```solidity
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.21;
+| Field | Meaning | Small |
+|-------|---------|-------|
+| `K` | arbiters drawn, each paid its fee at the draw | 6 |
+| `M` | commits promoted to reveal, drawn at random from all commits | 5 |
+| `N` | reveals counted; the N-th finalizes the round | 4 |
+| `P` | cluster size; the cluster's mean is the result and its members earn the bonus | 3 |
+| `timeout` | seconds from the draw to the round's deadline | 300 |
 
-interface IReputationAggregator {
-    function requestAIEvaluationWithApproval(
-        string[] calldata cids,
-        string calldata addendum,
-        uint256 alpha,
-        uint256 maxOracleFee,
-        uint256 estimatedBaseFee,
-        uint256 maxFeeScaling,
-        uint64 jobClass
-    ) external payable returns (bytes32);
+The aggregator checks it on every request and reverts with `BadJury()` unless `K ≥ M ≥ N ≥ P ≥ 1`, `N ≤ 40`, `P ≥ 2` unless `N = 1`, `K ≤ maxJury()` and `K ≤` the keeper's `shortlistSize()`, and `tPlus() < timeout ≤ maxTimeout()`. The bounty program's presets (Small 6/5/4/3/300 s, Medium 8/5/4/3/300 s, Large 21/16/13/10/300 s, Jumbo 50/38/27/17/600 s with beacons) are sized against collusion in [TODO.md item 15](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/TODO.md); a larger jury costs more and is harder to steer. See [Security Model](../advanced/security.md#collusion-and-jury-size).
 
-    function getEvaluation(bytes32)
-        external view returns (uint256[] memory, string memory, bool);
-
-    function isFailed(bytes32) external view returns (bool);
-
-    function maxTotalFee(uint256 requestedMaxOracleFee)
-        external view returns (uint256);
-
-    function ethOwed(address payee) external view returns (uint256);
-
-    function getEthAccounting(bytes32 aggId)
-        external view returns (
-            uint256 ethReceived,
-            uint256 baseCredited,
-            uint256 bonusCredited,
-            uint256 bonusMultiplierSnap,
-            uint256 reserved
-        );
-
-    function responseTimeoutSeconds() external view returns (uint256);
-
-    function finalizeEvaluationTimeout(bytes32 aggId) external;
-
-    function withdrawEth() external;
-}
-```
-
-This interface is for the ReputationAggregator. The legacy [ReputationSingleton](../contracts/reputation-singleton.md) has a request function of the same name that is not payable and is paid in LINK, so a client written for one does not work with the other.
+If fewer than K arbiters are eligible, the draw does not fail: it repeats the eligible ones (slot k holds pick k mod m). A repeated arbiter is paid and scored once per slot and can decide a thin round alone, so check the pool before relying on a round: the keeper's `eligibleCount(class, maxFee)` counts the arbiters eligible now.
 
 ### Step 2: Fund the Request
 
-Every request must be funded with `maxTotalFee(maxOracleFee)`, the worst case for one round:
+Every request is funded with `maxTotalFee(maxFee, minFee, withBeacons, K, P)`, the worst case for one round:
 
 ```
-ceiling    = min(maxOracleFee, the contract's maxOracleFee())
-prepayment = ceiling × (K + B × P)
+eff        = min(maxFee, maxOracleFee())          the fee ceiling
+juror      = max(eff, minFee)                     the most a juror (or a beacon) can be paid
+prepayment = juror × (K + B × P [+ beacon quorum]) + eff × (drawRewardFees + promoteRewardFees)
 ```
 
-With the settings of 2026-11-22 (K = 6 oracles polled, bonus multiplier B = 3, cluster size P = 2) the prepayment is 12 × the ceiling. The DemoClient's ceiling of 0.00015 ETH gives 0.0018 ETH, which is what `quote()` returns.
+With the default settings (bonus multiplier B = 3, draw reward 2, promote reward 1) and the client's Small jury at a ceiling of 0.00015 ETH, that is `0.00015 × (6 + 9) + 0.00015 × 3` = 0.0027 ETH, which is what `quote()` returns. [Fee Mechanisms](../advanced/fees.md) works through the arithmetic and what comes back.
 
-The aggregator takes the amount first from the credit the caller already holds (`ethOwed(caller)`) and requires the rest as the ETH sent with the call. If the two together are too little, the request reverts with `InsufficientPayment()`.
+The aggregator takes from the caller's existing credit (`ethOwed(caller)`) only what the ETH sent does not cover, and returns any excess to credit. If the two together are too little, the request reverts with `InsufficientPayment()`.
 
-**Option A: pass on what the caller sends (DemoClient pattern)**
+**Option A: pass on what the caller sends (the pattern above).** The caller reads `quote()` and sends that amount.
+
+**Option B: pay from the contract's own balance.**
 
 ```solidity
-function request() external payable {
-    currentAggId = agg.requestAIEvaluationWithApproval{value: msg.value}(/* ... */);
-}
-```
-
-The caller reads `quote()` and sends that amount. Simple, and the contract needs no ETH of its own.
-
-**Option B: pay from the contract's own balance**
-
-```solidity
-uint256 required = agg.maxTotalFee(maxOracleFee);
+uint256 required = agg.maxTotalFee(MAX_FEE, 0, false, 6, 3);
 uint256 credit = agg.ethOwed(address(this));
 uint256 value = required > credit ? required - credit : 0;
-requestId = agg.requestAIEvaluationWithApproval{value: value}(/* ... */);
+aggId = agg.requestAIEvaluationWithApproval{value: value}(/* ... */);
 ```
 
-The contract is funded in advance and sends only what its credit does not cover. See `FeeManagedIntegration` in the [Integration Examples](index.md#2-fee-management).
+See `FeeManagedIntegration` in the [Integration Examples](index.md#2-fee-management).
 
 In both cases **the client contract is the requester**. Whatever the round does not spend is credited to the client contract in the aggregator, not to the user who called it.
 
-### Step 3: Submit a Request
+### Step 3: Submit the Request
 
 ```solidity
-bytes32 requestId = agg.requestAIEvaluationWithApproval{value: value}(
+bytes32 aggId = agg.requestAIEvaluationWithApproval{value: value}(
     cids,               // string[] - IPFS CIDs of the query package(s)
     addendumText,       // string   - optional additional context
     alpha,              // uint256  - reputation weight (0-1000)
-    maxOracleFee,       // uint256  - highest fee per oracle, in ETH wei
+    maxFee,             // uint256  - fee ceiling per arbiter, in ETH wei
+    minFee,             // uint256  - fee floor per juror, in ETH wei (0 = none)
     estimatedBaseCost,  // uint256  - base cost for fee weighting, in ETH wei
-    maxFeeScaling,      // uint256  - max fee advantage for cheap oracles
-    requestedClass      // uint64   - oracle class to use
+    maxFeeScaling,      // uint256  - max fee advantage for cheap arbiters
+    requestedClass,     // uint64   - arbiter class to use
+    withBeacons,        // bool     - draw the jury with beacon values too
+    jury                // Jury     - K, M, N, P, timeout
 );
 ```
 
-**Parameter guidance:**
-
-| Parameter | DemoClient value | Notes |
-|-----------|------------------|-------|
-| `cids` | one CID | 1 to 10 CIDs, each at most 100 bytes. They must point to query packages the oracles can read; see the comment above `CID` in [`scripts/single-query.js`](https://github.com/verdikta/verdikta-dispatcher/blob/master/reputationBasedAggregator/scripts/single-query.js) |
+| Parameter | VerdiktaClient value | Notes |
+|-----------|----------------------|-------|
+| `cids` | one CID | 1 to 10 CIDs, each at most 100 bytes, pointing to query packages the arbiters can read |
 | `alpha` | 500 | 0 to 1000. Higher values give timeliness more weight, lower values give quality more weight |
-| `maxOracleFee` | 0.00015 ETH (`15e13`) | Must be at least the fee the oracles charge: 0.00002 ETH for every oracle on Base mainnet and Base Sepolia on 2026-11-22 (the ReputationKeeper's `getOracleInfo(operator, jobId)`). A value above the contract's `maxOracleFee()` (0.0004 ETH) is lowered to it. It sets the size of the prepayment, not the price |
-| `estimatedBaseCost` | `8e9` wei | Used for fee weighting. Must be lower than the fee ceiling in effect |
-| `maxFeeScaling` | 5 | How much to prefer cheaper oracles. Must be at least 1 |
-| `requestedClass` | 128 | Must be a class that registered oracles list. On 2026-11-22 all 40 oracles on Base mainnet listed class 128 |
+| `maxFee` | 0.00015 ETH (`15e13`) | Arbiters posting more are not eligible. A value above `maxOracleFee()` (0.0004 ETH by default) is lowered to it. It sizes the prepayment, not the price |
+| `minFee` | 0 | Each juror is paid `max(posted fee, minFee)`, and its bonus scales off that. It may exceed the ceiling |
+| `estimatedBaseCost` | `8e9` wei | Must be below the ceiling in effect, or `BadInput()` |
+| `maxFeeScaling` | 5 | How much to prefer cheaper arbiters, 1 to 65,535 |
+| `requestedClass` | 128 | A class that registered arbiters list |
+| `withBeacons` | false | Reverts if set while the aggregator has no beacon contract. See [Oracle Selection](../advanced/oracle-selection.md#beacons) |
+| `jury` | Small | Step 1 |
 
-The request selects oracles at random, so the gas it uses differs from what was estimated beforehand. Send it with a gas limit above the estimate: the repository's `single-query.js` adds 50%. On forks of the two networks on 2026-11-22, `DemoClient.request()` used about 3.3 million gas on Base mainnet and was estimated at about 3.1 million on Base Sepolia.
+The request only escrows and records the query in its block, B. It also settles rounds that are due, within a budget of `settlePerRequest()` (2) × its own K jury slots, so its gas varies: estimate it and add headroom.
 
-### Step 4: Poll for Results
+### Step 4: Draw the Jury
 
-Results are available on-chain after enough oracles have responded and the aggregation has completed.
+From block B+2, `drawJury(aggId)` draws the jury from `keccak256(aggId, blockhash(B+1))` and the keeper's state as of block B, and sends the K commit requests. The result does not depend on who calls it or when. It pays a draw reward of 2 × the ceiling: to the requester if it draws within 30 seconds (`requesterDrawPriority()`), otherwise to whoever draws after 30 seconds; a third party drawing earlier earns nothing, and the reward then stays in the requester's refund. Since the client contract is the requester, draw through its `draw()` passthrough.
+
+Two limits apply:
+
+- **Seal the seed in time.** `blockhash(B+1)` stays readable for 8,191 blocks (about 27 minutes on Base). `drawJury` stores it, and so does `sealSeed(aggId)`.
+- **Draw within a day.** After that `drawJury` reverts with `DrawExpired()`.
+
+A round that misses either can only be closed with `cancelUnsealed(aggId)`, and its whole prepayment goes to the treasury: a refund would be a free re-roll of the jury.
+
+With `withBeacons`, the first `drawJury` starts the beacon stage and the jury is drawn by a second call once the beacon values are in (or the 120-second beacon deadline has passed, which ends the round with no result).
+
+### Step 5: Move the Round On
+
+After the draw the jurors commit. The commit phase closes by itself at the M+-th commit (M+ = M + ⌈(K − M)/2⌉, 6 for Small), or with any commit that brings the count to at least M once T+ (`tPlus()`, 155 seconds) has passed since the draw. If no commit arrives after T+, someone has to call `closeCommits(aggId)`. From two blocks after the close, someone calls `promote(aggId)`, which draws M of the commits at random and asks them to reveal; its caller earns 1 × the ceiling. Promoted jurors get at least `revealWindow()` (120 seconds) to reveal, and the N-th counted reveal finalizes the round.
+
+`getRoundInfo(aggId)` returns everything a driver needs: the phase, `requestBlock`, `sealedHash`, `closeBlock`, the escrow amounts, `deadline`, `windowEnd`, `commits` and `requestTime`. The [round lifecycle table](index.md#the-round-lifecycle) gives the call due in each phase. This Node script drives a `VerdiktaClient` round with the `readStatus` helper from [Integration Examples](index.md#frontend-integration-examples) (saved as `verdikta.js`):
+
+```javascript
+// drive.mjs: node drive.mjs <clientAddress> <aggId>   (RPC_URL and PRIVATE_KEY in the environment)
+import { ethers } from 'ethers';
+import { AGGREGATOR_ABI, readStatus } from './verdikta.js';
+
+const CLIENT_ABI = [
+    'function agg() view returns (address)',
+    'function draw(bytes32 aggId)'
+];
+
+// Sends each call when it is due, until the round has a result or is closed
+export async function driveRound(signer, clientAddress, aggId, { intervalMs = 5000, log = console.log } = {}) {
+    const client = new ethers.Contract(clientAddress, CLIENT_ABI, signer);
+    const agg = new ethers.Contract(await client.agg(), AGGREGATOR_ABI, signer);
+    for (;;) {
+        const st = await readStatus(agg, aggId);
+        if (st.next) {
+            try {
+                // the draw goes through the client, which is the requester and earns the reward
+                const tx = st.next === 'drawJury' ? await client.draw(aggId) : await agg[st.next](aggId);
+                await tx.wait();
+                log(`${st.status}: sent ${st.next}`);
+            } catch (e) {
+                log(`${st.status}: ${st.next} failed (${e.shortMessage ?? e.message}); retrying`);
+            }
+            continue;
+        }
+        if (['final', 'settled', 'failed', 'cancelled'].includes(st.status)) return st;
+        await new Promise(resolve => setTimeout(resolve, intervalMs));
+    }
+}
+
+if (process.argv[1] && import.meta.url.endsWith(process.argv[1].split('/').pop())) {
+    const [clientAddress, aggId] = process.argv.slice(2);
+    const signer = new ethers.Wallet(process.env.PRIVATE_KEY, new ethers.JsonRpcProvider(process.env.RPC_URL));
+    const st = await driveRound(signer, clientAddress, aggId);
+    console.log(st.status, st.likelihoods ?? '');
+}
+```
+
+A call can fail because another account sent the same step first (it then reverts with `WrongPhase()`); the script reads the phase again and carries on.
+
+### Step 6: Read the Result
+
+The result is readable from finalization (phase 6), before settlement:
 
 ```solidity
-(uint256[] memory likelihoods, string memory justificationCIDs, bool exists) =
-    agg.getEvaluation(requestId);
+(uint256[] memory likelihoods, string memory justificationCIDs, bool valid) =
+    agg.getEvaluation(aggId);
 
-if (exists) {
-    // likelihoods: one score per outcome of the query package
-    // justificationCIDs: comma-separated IPFS CIDs, one per clustered oracle
+if (valid) {
+    // likelihoods: the cluster's mean, one value per outcome of the query package
+    // justificationCIDs: comma-separated IPFS CIDs, one per clustered arbiter
     processResult(likelihoods, justificationCIDs);
-} else if (agg.isFailed(requestId)) {
-    handleFailure();
-} else {
-    // Still open: either in progress, or past its timeout and not yet
-    // finalized (see Step 5)
 }
+
+// Every counted juror's own score for one outcome, in reveal order, for a Q-of-N rule
+(uint256[] memory scores, bool ok) = agg.getOutcomeScores(aggId, 0);
+
+// The jury the round was requested with
+(uint8 K, uint8 M, uint8 N, uint8 P, uint40 timeout) = agg.getJury(aggId);
 ```
 
-### Step 5: Handle Timeouts
+Scores are on the arbiters' 0 to 1,000,000 scale. A reveal may hold a single value; when that is the most common length, the round is clustered in one dimension.
 
-A round that has not completed within `responseTimeoutSeconds()` (300 seconds on Base mainnet and 900 on Base Sepolia on 2026-11-22) is not closed automatically. It stays open, with `isFailed()` false and the unspent part of the prepayment reserved, until someone calls:
+### Step 7: Close a Dead Round
+
+A round that is still in the commit, closing or reveal phase at its `deadline` has no result and never will. It stays open until someone calls:
 
 ```solidity
-agg.finalizeEvaluationTimeout(requestId);
+agg.settle(aggId);
 ```
 
-Anyone can make this call once the timeout has passed; before that it reverts with `NotTimedOut()`. It closes the round as failed (`isFailed(requestId)` returns `true`), applies reputation penalties to the oracles that did not respond and credits the unspent prepayment back to the requester. The base fees credited to the polled oracles when the request was made stay with them. Nothing is retried: send a new request if you still need the evaluation.
+Before the deadline `settle` reverts with `NotDue()`. It marks the round failed (`isFailed(aggId)` returns true), reports every juror's outcome to the keeper, and credits the unspent prepayment back, either to the requester or, when M commits arrived but the round was never promoted, to the treasury. The base fees credited at the draw stay with the jurors. New requests also settle due rounds, but only in queue order and within a budget of `settlePerRequest()` × their own K slots, so a round may wait a long time for one that fits: call `settle` yourself rather than rely on that. The refund waits until the round is settled. Nothing is retried: send a new request if you still need the evaluation. `VerdiktaClient.publish()` makes the call itself.
 
-The DemoClient shows why this matters. Its `publish()` reverts with "not ready" for as long as the round is open, so after a timeout the DemoClient can neither publish nor start a new request until someone has called `finalizeEvaluationTimeout()` on the aggregator.
+### Step 8: Collect the Credit
 
-### Step 6: Collect Refunds
+Refunds and the draw reward are credits in the aggregator's `ethOwed` ledger, in the name of the client contract. Either leave a credit, which pays for the contract's next request before new ETH is asked for, or withdraw it: `withdrawEth()` sends the caller's whole credit to the caller, so the client contract must make the call and must be able to receive and pass on ETH (`reclaim()` above).
 
-Refunds are credits in the aggregator's `ethOwed` ledger, in the name of the client contract. There are two things to do with a credit:
-
-- **Leave it.** It pays for the contract's next request before new ETH is asked for. After a completed round at the DemoClient's settings the credit was 0.00156 ETH, so the next request needed 0.00024 ETH; after a timed-out round the credit was 0.00168 ETH and the next request needed 0.00012 ETH.
-- **Withdraw it.** `agg.withdrawEth()` sends the caller's whole credit to the caller, so the client contract must make the call and must be able to receive ETH.
-
-!!! warning "The DemoClient's `reclaim()` keeps the ETH in the DemoClient"
-    `reclaim()` calls `withdrawEth()`, and the ETH arrives in the DemoClient contract. The DemoClient has no function that sends ETH out, and `request()` forwards only the ETH sent with that call, not the contract's own balance. ETH reclaimed this way stays in the DemoClient contract. With the DemoClient as it is, leave the credit in the aggregator. In your own client, add a way to pay the ETH out, as in the example below.
-
-A client that can pay its refunds out:
-
-```solidity
-contract RefundingClient {
-    IReputationAggregator public immutable agg;
-    address public immutable owner;
-
-    constructor(address aggregator) {
-        agg = IReputationAggregator(aggregator);
-        owner = msg.sender;
-    }
-
-    function request(string[] calldata cids) external payable returns (bytes32) {
-        return agg.requestAIEvaluationWithApproval{value: msg.value}(
-            cids, "", 500, 15e13, 8e9, 5, 128
-        );
-    }
-
-    function reclaim() external {
-        require(msg.sender == owner, "Not owner");
-        agg.withdrawEth();                                   // credit -> this contract
-        (bool ok, ) = owner.call{value: address(this).balance}("");
-        require(ok, "Transfer failed");                      // this contract -> owner
-    }
-
-    receive() external payable {}
-}
-```
+At the Small settings above, with every juror posting 0.00002 ETH and the client drawing its own round, a completed round credits the client 0.00195 ETH of refund and 0.0003 ETH of draw reward, so it cost 0.00045 ETH, of which 0.00015 ETH was the promote reward of whoever promoted.
 
 ## Deployment
 
-The DemoClient is deployed using `hardhat-deploy`:
-
 ```bash
-cd demoClient
-npm install
-
-# Edit deploy/01_demo_client.js:
-# - Set AGGREGATOR to the ETH-funded aggregator of your network:
-#   0xe8a385E473EA710c5a88Cc72681a16a26fe380e4 on Base Sepolia,
-#   0xd8F38bCBEE43bE3bd31655a563f20c9B3e67142a on Base
-
-npx hardhat deploy --network base_sepolia
+npx hardhat compile
 ```
 
-The constructor takes one argument, the aggregator address. There is no LINK token address to set.
-
-## Running a Demo Query
-
-After deploying the DemoClient:
-
-```bash
-# Run a query (submits a request, polls for results, publishes)
-HARDHAT_NETWORK=base_sepolia node scripts/query-demo.js <demoClientAddress>
-```
-
-The DemoClient is not funded in advance. The account that runs the script pays the prepayment with the request and needs ETH for it and for gas.
-
-The `query-demo.js` script:
-
-1. Checks for a pending request (`currentAggId != 0`)
-2. If one is pending: publishes it if it has a result, clears it if it failed, otherwise polls `getEvaluation()` every 20 seconds
-3. If none is pending: reads `quote()`, calls `request()` with that amount of ETH, then polls for results
-4. On completion: calls `publish()` to emit the `Result` event and clear the state
-
-Two things to know before running it:
-
-- The script does not call `finalizeEvaluationTimeout()`. If the round times out, the script keeps polling until someone closes the round, for example with the aggregator project's [`scripts/refund.js`](https://github.com/verdikta/verdikta-dispatcher/blob/master/reputationBasedAggregator/scripts/refund.js) (`AGG_ID=<id>`).
-- `request()` needs the gas headroom described in [Step 3](#step-3-submit-a-request). If your copy of the script sends a fixed gas limit of 3,000,000, raise it: on forks of both networks on 2026-11-22 the request ran out of gas with that limit.
+Deploy `VerdiktaClient(aggregator, cid)` with your usual tool. Its constructor takes the aggregator address, set at the v2 deployment, and the CID of the query package. There is no LINK token address to set.
 
 ## Common Integration Patterns
 
-The patterns below use the interface from Step 1.
-
-### One-Request-at-a-Time (DemoClient Pattern)
-
-Track a single active request. Simple state management.
-
-```solidity
-contract SingleRequestClient {
-    IReputationAggregator public immutable agg;
-    bytes32 public currentRequestId;
-
-    uint256 public constant MAX_ORACLE_FEE = 15e13;
-    uint256 public constant BASE_COST = 8e9;
-
-    event Collected(bytes32 indexed requestId, bool failed, uint256[] scores);
-
-    constructor(address aggregator) {
-        agg = IReputationAggregator(aggregator);
-    }
-
-    function submit(string[] calldata cids) external payable {
-        require(currentRequestId == bytes32(0), "already pending");
-        currentRequestId = agg.requestAIEvaluationWithApproval{value: msg.value}(
-            cids, "", 500, MAX_ORACLE_FEE, BASE_COST, 5, 128
-        );
-    }
-
-    function collect() external {
-        bytes32 id = currentRequestId;
-        require(id != bytes32(0), "no pending request");
-        (uint256[] memory scores, , bool exists) = agg.getEvaluation(id);
-        bool failed = agg.isFailed(id);
-        require(exists || failed, "not ready");
-        // process...
-        currentRequestId = bytes32(0);
-        emit Collected(id, failed, scores);
-    }
-}
-```
+The patterns below use the interface from [Integration Examples](index.md#the-interface).
 
 ### Multiple Concurrent Requests
 
-Track requests by ID in a mapping.
+Track requests by ID in a mapping. Each draw goes through the contract so that it keeps the draw rewards.
 
 ```solidity
 contract ConcurrentClient {
@@ -399,98 +334,110 @@ contract ConcurrentClient {
 
     mapping(bytes32 => RequestData) public requests;
 
-    uint256 public constant MAX_ORACLE_FEE = 15e13;
+    uint256 public constant MAX_FEE = 15e13;
     uint256 public constant BASE_COST = 8e9;
 
     constructor(address aggregator) {
         agg = IReputationAggregator(aggregator);
     }
 
-    function submit(string[] calldata cids) external payable returns (bytes32 id) {
+    function submit(string[] calldata cids, IReputationAggregator.Jury calldata jury)
+        external payable returns (bytes32 id)
+    {
         id = agg.requestAIEvaluationWithApproval{value: msg.value}(
-            cids, "", 500, MAX_ORACLE_FEE, BASE_COST, 5, 128
+            cids, "", 500, MAX_FEE, 0, BASE_COST, 5, 128, false, jury
         );
         requests[id] = RequestData({requester: msg.sender, submittedAt: block.timestamp});
     }
+
+    function draw(bytes32 id) external {
+        require(requests[id].requester != address(0), "unknown request");
+        agg.drawJury(id);
+    }
 }
 ```
 
-### User-Funded Requests with Refunds
+### User-Funded Requests with Exact Refunds
 
-The user pays for the request. Because the refund is credited to the client contract, the contract has to pass it on. This client ends up charging each user exactly what that user's round cost: it reads the round's accounting from the aggregator with `getEthAccounting()` and pays the unspent part back.
+When users pay for their own requests, each user's refund should go back to that user. A client contract that makes every request itself cannot tell from the aggregator where a failed round's refund went: it may have gone to the treasury, and a refund may land inside somebody else's request (which settles due rounds). The simple exact way is one small wallet contract per request: the wallet is the requester, so its credit is exactly what its round returned. This is the bounty program's `EvaluationWallet` pattern. (A refund beneficiary set in the request, TODO item 3, is not built.)
 
 ```solidity
+contract RequestWallet {
+    IReputationAggregator public immutable agg;
+    address public immutable payer;
+    address public immutable factory;
+    bytes32 public aggId;
+
+    constructor(IReputationAggregator agg_, address payer_) {
+        agg = agg_;
+        payer = payer_;
+        factory = msg.sender;
+    }
+
+    function request(string[] calldata cids, IReputationAggregator.Jury calldata jury) external payable {
+        require(msg.sender == factory && aggId == bytes32(0), "once, by the factory");
+        aggId = agg.requestAIEvaluationWithApproval{value: msg.value}(
+            cids, "", 500, 15e13, 0, 8e9, 5, 128, false, jury
+        );
+    }
+
+    // anyone; within 30 s of the request this earns the draw reward for the payer
+    function draw() external {
+        agg.drawJury(aggId);
+    }
+
+    // after the round has closed: the refund (and the draw reward) go to the payer
+    function reclaim() external {
+        (uint8 phase, , , , , , , , , , , ) = agg.getRoundInfo(aggId);
+        require(phase >= 6, "round open");
+        if (agg.ethOwed(address(this)) > 0) agg.withdrawEth();
+        (bool ok, ) = payer.call{value: address(this).balance}("");
+        require(ok, "refund failed");
+    }
+
+    receive() external payable {}
+}
+
 contract UserFundedClient {
     IReputationAggregator public immutable agg;
-
-    uint256 public constant MAX_ORACLE_FEE = 15e13;
-    uint256 public constant BASE_COST = 8e9;
-
-    mapping(bytes32 => address) public payerOf;
+    mapping(bytes32 => RequestWallet) public walletOf;
 
     constructor(address aggregator) {
         agg = IReputationAggregator(aggregator);
     }
 
     function submit(string[] calldata cids) external payable returns (bytes32 id) {
-        require(msg.value == agg.maxTotalFee(MAX_ORACLE_FEE), "send exactly maxTotalFee");
-
-        // Move the refunds of earlier rounds into this contract first. With
-        // no credit left in the aggregator, this round is funded by this
-        // user's ETH alone, and the round's accounting is this user's
-        _pullCredit();
-
-        id = agg.requestAIEvaluationWithApproval{value: msg.value}(
-            cids, "", 500, MAX_ORACLE_FEE, BASE_COST, 5, 128
-        );
-        payerOf[id] = msg.sender;
+        IReputationAggregator.Jury memory jury = IReputationAggregator.Jury({K: 6, M: 5, N: 4, P: 3, timeout: 300});
+        require(msg.value == agg.maxTotalFee(15e13, 0, false, jury.K, jury.P), "send exactly maxTotalFee");
+        RequestWallet w = new RequestWallet(agg, msg.sender);
+        w.request{value: msg.value}(cids, jury);
+        id = w.aggId();
+        walletOf[id] = w;
     }
-
-    // Pay the user back what the round did not spend. Call when the round
-    // has completed or has been closed after a timeout
-    function settle(bytes32 id) external {
-        address payer = payerOf[id];
-        require(payer != address(0), "unknown or settled");
-
-        (, , bool exists) = agg.getEvaluation(id);
-        require(exists || agg.isFailed(id), "not ready");
-
-        (uint256 received, uint256 base, uint256 bonus, , ) = agg.getEthAccounting(id);
-        uint256 refund = received - base - bonus;
-
-        delete payerOf[id];
-        _pullCredit();
-
-        (bool ok, ) = payer.call{value: refund}("");
-        require(ok, "Refund failed");
-    }
-
-    function _pullCredit() internal {
-        if (agg.ethOwed(address(this)) > 0) {
-            agg.withdrawEth();
-        }
-    }
-
-    // Withdrawals from the aggregator arrive here
-    receive() external payable {}
 }
 ```
 
+A finished round (phase 6) credited its refund at finalization, and nothing more is credited to the requester after that, so `reclaim()` at phase 6 is final. A failed round (phase 8) credited its refund at the draw or at settlement, unless it went to the treasury. A cancelled round (phase 9) returns nothing.
+
 ## Error Handling
 
-See the [Error Reference](../api/errors.md) for all possible revert conditions. The most common integration errors:
+See the [Error Reference](../api/errors.md) for all revert conditions. The most common integration errors:
 
-- **`InsufficientPayment()`** — The ETH sent with the request, plus the client's credit in the aggregator, is less than `maxTotalFee(maxOracleFee)`.
-- **`"No active oracles available with fee <= maxFee and requested class"`** — No oracle matches your class and fee ceiling. Use a class that oracles list and a `maxOracleFee` that is at least the fee they charge.
-- **`"Base cost must be less than max fee"`** — `estimatedBaseCost` must be strictly less than the fee ceiling in effect.
-- **`"already pending"`** (DemoClient) — Clear the previous request via `publish()` before submitting a new one.
-- **`"not ready"`** (DemoClient) — The round is still open. If it has passed its timeout, call `finalizeEvaluationTimeout()` on the aggregator first.
-- **`NothingOwed()`** — `withdrawEth()` was called by a contract that has no credit.
+- **`InsufficientPayment()`**: the ETH sent with the request, plus the client's credit, is less than `maxTotalFee(maxFee, minFee, withBeacons, K, P)` for the request's jury.
+- **`BadJury()`** (from `AggregatorLib`): the jury breaks one of the rules in [Step 1](#step-1-choose-the-jury). Include `error BadJury()` in your ABI to decode it.
+- **`BadInput()`**: `estimatedBaseCost` is not below the ceiling in effect, `alpha` is above 1000, the scaling factor is 0 or above 65,535, or the escrow does not fit in 88 bits.
+- **`TooEarly()`**: `drawJury` before block B+2 (or, in the beacon stage, before the quorum is in or the beacon deadline has passed), or `promote` before block C+2.
+- **`WrongPhase()`**: the step is not due in this phase, for example `closeCommits` before T+ or with fewer than M commits, or a second `promote`.
+- **`NotDue()`**: `settle` before the round's deadline.
+- **`DrawExpired()`** / **`SeedExpired()`**: the draw came too late; only `cancelUnsealed` is left.
+- **`NothingOwed()`**: `withdrawEth()` by an address with no credit.
+
+There is no "no arbiters" error at request time. A draw that finds no eligible arbiter fails the round (phase 8) and refunds the requester.
 
 ## Next Steps
 
-- [Integration Examples](index.md) — More client contracts, a test and frontend hooks
-- [Frontend Integration](frontend.md) — How to interact with the contracts from a web frontend
-- [Fee Mechanisms](../advanced/fees.md) — What a request costs in ETH
-- [Oracle Selection](../advanced/oracle-selection.md) — How oracle parameters affect selection
-- [Deployment Guide](../deployment/index.md) — Deploying your own contracts
+- [Integration Examples](index.md): more client contracts, a test and frontend hooks
+- [Frontend Integration](frontend.md): how to drive a round from a web frontend
+- [Fee Mechanisms](../advanced/fees.md): what a request costs in ETH
+- [Oracle Selection](../advanced/oracle-selection.md): how the jury is drawn
+- [Deployment Guide](../deployment/index.md): deploying the v2 contracts
