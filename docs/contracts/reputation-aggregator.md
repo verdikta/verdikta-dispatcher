@@ -55,8 +55,8 @@ The constructor sets these values, and [`deploy/03_config.js`](https://github.co
 | Setting | Default | Read it with | Set it with |
 |---------|---------|--------------|-------------|
 | Largest K a request may ask for | 50 | `maxJury()` | `setLimits` |
-| Longest round timeout a request may ask for | 3,600 s | `maxTimeout()` | `setLimits` |
-| T+, the commit window after the draw; every timeout must exceed it | 155 s | `tPlus()` | `setLimits` |
+| Longest round timeout a request may ask for (a timeout above 1 day is refused even if this allows it) | 3,600 s | `maxTimeout()` | `setLimits` |
+| T+, the commit window after the draw; every timeout must exceed it, and a round keeps the T+ of its request | 155 s | `tPlus()` | `setLimits` |
 | Bonus multiplier B (bonus = B × the juror's fee) | 3 | `bonusMultiplier()` | `setParams` |
 | Highest per-arbiter fee a request can offer (the fee ceiling) | 0.0004 ETH | `maxOracleFee()` | `setParams` |
 | Spread floor for the quality classes, on the 0..1,000,000 score scale | 30,000 | `spreadFloor()` | `setParams` |
@@ -140,7 +140,10 @@ The request reverts with `BadJury()` (from `AggregatorLib.checkJury`) unless all
 - N ≤ 40 (the N-th reveal pays for clustering; at 20 outcomes, 40 reveals cost about 8M gas);
 - P ≥ 2, unless N = 1 (a cluster holds at least the closest pair);
 - K ≤ `maxJury()` (50) and K ≤ the keeper's `shortlistSize()` (60);
-- `tPlus()` < timeout ≤ `maxTimeout()` (155 s < timeout ≤ 3,600 s).
+- `tPlus()` < timeout ≤ `maxTimeout()` (155 s < timeout ≤ 3,600 s);
+- timeout ≤ 1 day (86,400 s, `AggregatorLib.MAX_TIMEOUT`), whatever `maxTimeout()` says: the keeper's unbonding period (at least 2 days) assumes a round settles within a day of its draw.
+
+The round keeps the T+ its timeout was checked against: a later `setLimits` that changes T+ does not change this round's commit window.
 
 The other checks: `KeeperNotSet()` if no keeper is set; `BadInput()` for no CIDs, more than 10, a CID over 100 bytes, an addendum over 1,000 bytes, `estimatedBaseCost >= eff`, `alpha > 1000`, a scaling factor outside 1..65,535, or a prepay above 2^88 − 1 wei; `InsufficientPayment()` if `msg.value` plus your credit is below the prepay; `EnforcedPause()` while paused. A request with `withBeacons` while `beacons()` is zero reverts without an error message.
 
@@ -148,7 +151,7 @@ The other checks: `KeeperNotSet()` if no keeper is set; `BadInput()` for no CIDs
 
 The call must be funded with `maxTotalFee(maxFee, minFee, withBeacons, j.K, j.P)` (see [Fee Structure](#fee-structure)). Credit in `ethOwed(caller)` covers only what `msg.value` does not: sending exactly the prepay leaves your credit untouched, and any ETH above it is added to your credit. The escrow is always exactly the prepay. `RequestFunded` records how much came from credit and how much from `msg.value`.
 
-Before it escrows, the request settles due rounds from the settlement queue, within a budget of `settlePerRequest() × K` slots, so its gas use depends a little on other rounds.
+Before it escrows, the request settles due rounds from the settlement queue until `settlePerRequest() × K` slots are spent (see [the settlement queue](#driving-a-round)), so its gas use depends a little on other rounds.
 
 #### Returns
 
@@ -190,7 +193,7 @@ function cancelUnsealed(bytes32 aggId) external
     - `SeedExpired()` if the seed was never sealed and blockhash(B+1) is no longer readable;
     - `OutOfGas()` if the caller sent too little gas for the keeper call.
 - It reads block hashes with `BLOCKHASH` for 256 blocks and then from the EIP-2935 history contract for up to 8,191 blocks.
-- On success the phase becomes 3 (commit). The deadline is set to `now + timeout` and the commit window to `now + tPlus()`. The keeper sends a health call to every juror and to 3 other shortlisted arbiters.
+- On success the phase becomes 3 (commit). The deadline is set to `now + timeout` and the commit window to `now +` the T+ in force at the request (`windowEnd`), which a later `setLimits` does not change. The keeper sends a health call to every juror and to 3 other shortlisted arbiters.
 - **Repeats.** When the keeper's shortlist ends up with m < K arbiters, the jury fills with repeats: slot k holds pick k mod m. This happens:
     - when fewer than K arbiters are eligible;
     - when `shortlistSize()` was lowered below K after the request (selection reads the current value);
@@ -219,7 +222,7 @@ function cancelUnsealed(bytes32 aggId) external
 
 **`settle`** reverts with `WrongPhase()` outside phases 3 to 6 and `NotDue()` until the deadline has passed. A round that never finalized is failed here, with `EvaluationFailed(aggId, phase)` for phase 3, 4 or 5. Then one call to the keeper's `applyOutcomes` carries every slot's outcome code (see [Settlement](#settlement)).
 
-**The settlement queue.** Every drawn round joins a queue. Each new request walks the queue in order, settling rounds within a budget of `settlePerRequest() × K` slots, where K is the new request's. The walk stops at the first unsettled round whose K exceeds the remaining budget, or whose deadline has not passed. Rounds behind it wait as well, even if they are due, until a larger request comes or anyone calls `settle`. The walk takes at most `settlePerRequest() × 8` queue entries per request. `setParams` accepts `settlePerRequest = 0`, which turns settlement by requests off: then only `settle` settles. Only scores (and a failed round's refund) wait; a result is readable from finalization.
+**The settlement queue.** Every drawn round joins a queue. Each new request walks the queue in order, settling due rounds until `settlePerRequest() × K` slots are spent, where K is the new request's. The last round settled may overshoot the budget by at most its own K, so the first due round is always settled, whatever its size: a big round at the head cannot stall the queue. The walk stops at the first unsettled round whose deadline has not passed. Rounds behind it wait as well, even if they are due, until it is due or anyone calls `settle`, so a long-timeout round at the head holds back shorter ones. The walk takes at most `settlePerRequest() × 8` queue entries per request. `setParams` accepts `settlePerRequest = 0`, which turns settlement by requests off: then only `settle` settles. Until a round settles, its scores and penalties (and a failed round's refund) wait, and an arbiter that completes its exit first escapes them; a result is readable from finalization.
 
 **`cancelUnsealed`** reverts with `WrongPhase()` outside phases 1 and 2 and `TooEarly()` before its time. It credits the whole prepay to the treasury (phase 9, `RoundCancelled`). An undrawn round never times out on its own: only this call ends it.
 
@@ -270,7 +273,7 @@ function getRoundInfo(bytes32 aggId)
         uint256 bonuses,      // bonuses credited at finalization
         uint256 rewards,      // draw and promote rewards, beacon payments
         uint256 deadline,     // 0 until the draw; settle is due after it
-        uint256 windowEnd,    // the draw time + T+
+        uint256 windowEnd,    // 0 until the draw, then the draw time + the request's T+
         uint256 commits,      // commits received
         uint256 requestTime   // drawJury's 1-day limit and cancelUnsealed run from it
     )
@@ -324,7 +327,8 @@ The owner has no function that takes ETH out of the contract. The only code that
 ```solidity
 // Bounds on a request's jury: largest K, longest timeout, and T+ (seconds).
 // Reverts InvalidConfig() if maxJury_ == 0, tPlus_ == 0 or maxTimeout_ <= tPlus_.
-// There is no upper bound on maxTimeout_
+// A maxTimeout_ above one day is accepted, but checkJury caps every request's timeout at
+// one day (AggregatorLib.MAX_TIMEOUT), so no request can use more
 function setLimits(uint8 maxJury_, uint40 maxTimeout_, uint40 tPlus_) external onlyOwner
 
 // Bonus multiplier (at most 20), rounds settled per request (any value; 0 turns settlement by
@@ -348,7 +352,7 @@ function pause() external onlyOwner
 function unpause() external onlyOwner
 ```
 
-The bonus multiplier, the draw and promote rewards and the beacon quorum are fixed in each round at its request, since its escrow was sized on them. The spread floor, the dispatch stipend, the draw priority and the reveal window apply to rounds in flight. T+ is read twice: `checkJury` checks the timeout against the T+ in force at the request, while the round's commit window (`windowEnd`) uses the T+ in force at the draw. A T+ changed in between applies to that round's commit window even if its timeout no longer exceeds it. The shortlist that bounds K is read at the request, and again by the keeper at the draw. Ownership uses OpenZeppelin `Ownable` (`owner()`, `transferOwnership`, `renounceOwnership`).
+The bonus multiplier, the draw and promote rewards and the beacon quorum are fixed in each round at its request, since its escrow was sized on them. The spread floor, the dispatch stipend, the draw priority and the reveal window apply to rounds in flight. A round keeps the T+ of its request: `checkJury` checks the timeout against it, the round holds it in `windowEnd` until the draw, and the draw adds the draw time. A T+ changed in between does not reach that round, so it can never push the commit window past the deadline. The `maxTimeout` in force at the request applies, and no timeout may exceed one day whatever it says. The shortlist that bounds K is read at the request, and again by the keeper at the draw. Ownership uses OpenZeppelin `Ownable` (`owner()`, `transferOwnership`, `renounceOwnership`).
 
 `dispatchOracleRequest(...)` is external only so that the contract can call itself with a gas stipend. It reverts with `OnlySelf()` for any other caller.
 
@@ -752,7 +756,7 @@ For the full accounting see [Fee Mechanisms](../advanced/fees.md).
 
 ### Common Issues
 
-**`BadJury()`**: check K ≥ M ≥ N ≥ P ≥ 1, N ≤ 40, P ≥ 2 unless N = 1, K ≤ `maxJury()` and ≤ the keeper's `shortlistSize()`, and `tPlus()` < timeout ≤ `maxTimeout()`.
+**`BadJury()`**: check K ≥ M ≥ N ≥ P ≥ 1, N ≤ 40, P ≥ 2 unless N = 1, K ≤ `maxJury()` and ≤ the keeper's `shortlistSize()`, and `tPlus()` < timeout ≤ `maxTimeout()` and ≤ 1 day (86,400 s).
 
 **`InsufficientPayment()`**
 ```javascript

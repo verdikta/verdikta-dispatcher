@@ -20,7 +20,7 @@ const value = required > credit ? required - credit : 0n;
 ```
 
 #### `BadJury()`
-- **Cause**: The jury breaks a rule: `K ≥ M ≥ N ≥ P ≥ 1`, `N ≤ 40`, `P ≥ 2` unless `N = 1`, `K ≤ maxJury()` (50), `K ≤` the keeper's `shortlistSize()` (60), `tPlus() < timeout ≤ maxTimeout()` (155 s and 3,600 s)
+- **Cause**: The jury breaks a rule: `K ≥ M ≥ N ≥ P ≥ 1`, `N ≤ 40`, `P ≥ 2` unless `N = 1`, `K ≤ maxJury()` (50), `K ≤` the keeper's `shortlistSize()` (60), `tPlus() < timeout ≤ maxTimeout()` (155 s and 3,600 s), and timeout ≤ 1 day (86,400 s) whatever `maxTimeout()` says
 - **Solution**: Fix the jury. The error is declared in `AggregatorLib`; add `error BadJury()` to your ABI to see its name
 
 #### `BadInput()`
@@ -69,7 +69,7 @@ const value = required > credit ? required - credit : 0n;
 
 #### The round is past its deadline with no result
 - **Cause**: Too few commits, no promotion, or too few reveals before `deadline` (`getRoundInfo`). The round is dead, but `isFailed()` stays false and the refund stays in the round until it is settled
-- **Solution**: Call `settle(aggId)` (anyone may). New requests also settle due rounds, but only in queue order and within a budget of `settlePerRequest()` × their own K slots, so don't wait for that. Send a new request if you still need the evaluation
+- **Solution**: Call `settle(aggId)` (anyone may). New requests also settle due rounds, in queue order until `settlePerRequest()` × their own K slots are spent, but a round not yet past its deadline stops that walk, so don't wait for that. Send a new request if you still need the evaluation
 
 #### `NotDue()`
 - **Cause**: `settle` before the round's deadline

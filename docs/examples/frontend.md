@@ -343,7 +343,7 @@ Scores are on the arbiters' 0 to 1,000,000 scale. A question that asks for one n
 
 ### 5. Dead Rounds
 
-A round still in the commit, closing or reveal phase at its `deadline` has failed, but `isFailed()` stays false until someone calls `settle()`. Until then its refund stays in the round. `nextStep()` returns `'settle'` for it. Settling credits the unspent prepayment back to the requester, except when M commits arrived and the round was never promoted: that refund goes to the treasury, so that nobody can abort a jury they dislike for a refund. New requests settle due rounds too, but only within a budget (`settlePerRequest()` × their own K slots, in queue order), so don't count on it.
+A round still in the commit, closing or reveal phase at its `deadline` has failed, but `isFailed()` stays false until someone calls `settle()`. Until then its refund stays in the round. `nextStep()` returns `'settle'` for it. Settling credits the unspent prepayment back to the requester, except when M commits arrived and the round was never promoted: that refund goes to the treasury, so that nobody can abort a jury they dislike for a refund. New requests settle due rounds too (in queue order, until `settlePerRequest()` × their own K slots are spent), but a round not yet past its deadline stops that walk, so don't count on it.
 
 ```javascript
 async function settleDeadRound(signer, aggregatorAddress, requestId) {

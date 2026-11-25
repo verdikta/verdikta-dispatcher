@@ -29,7 +29,7 @@ The examples share a few values.
 | ETH to send | `maxTotalFee(maxFee, minFee, withBeacons, K, P)` | For Small at the ceiling above: `15e13 × (6 + 3 × 3) + 15e13 × (2 + 1)` = 0.0027 ETH. A worst-case budget: the rest comes back as credit |
 | Aggregator | set at the v2 deployment | [Deployment Guide](../deployment/index.md) |
 
-A jury the aggregator accepts satisfies `K ≥ M ≥ N ≥ P ≥ 1`, `N ≤ 40`, `P ≥ 2` unless `N = 1`, `K ≤ maxJury()` (50 by default) and `K ≤` the keeper's `shortlistSize()` (60), and `tPlus() < timeout ≤ maxTimeout()` (155 s and 3,600 s by default). Anything else reverts with `BadJury()`.
+A jury the aggregator accepts satisfies `K ≥ M ≥ N ≥ P ≥ 1`, `N ≤ 40`, `P ≥ 2` unless `N = 1`, `K ≤ maxJury()` (50 by default) and `K ≤` the keeper's `shortlistSize()` (60), and `tPlus() < timeout ≤ maxTimeout()` (155 s and 3,600 s by default), with the timeout never above one day (86,400 s) whatever `maxTimeout()` says. Anything else reverts with `BadJury()`.
 
 Three more points apply to every example:
 
@@ -45,7 +45,7 @@ Three more points apply to every example:
 |-------|---------|-----------|------|
 | 1 draw | escrowed, awaiting the draw | `drawJury(aggId)` | from block `requestBlock + 2`, and within a day of the request |
 | 2 beacons | beacon stage (requests with `withBeacons` only) | `drawJury(aggId)` again | once `JuryBeacons.result(aggregator, aggId)` is ready (state 2) or expired (state 3) |
-| 3 commit | jurors commit | `closeCommits(aggId)` | only if the phase is still open after `windowEnd` (T+ after the draw) with at least M commits; the M+-th commit closes it by itself |
+| 3 commit | jurors commit | `closeCommits(aggId)` | only if the phase is still open after `windowEnd` (the request's T+ after the draw; 0 until the draw) with at least M commits; the M+-th commit closes it by itself |
 | 4 closing | commit phase closed | `promote(aggId)` | from block `closeBlock + 2` |
 | 5 reveal | promoted jurors reveal | none | the N-th counted reveal finalizes the round |
 | 6 final | result readable | `settle(aggId)` (optional) | after `deadline` |

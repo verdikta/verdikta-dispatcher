@@ -143,7 +143,7 @@ Every request carries its own jury, `Jury {K, M, N, P, timeout}`:
 | `P` | cluster size; the cluster's mean is the result and its members earn the bonus | 3 |
 | `timeout` | seconds from the draw to the round's deadline | 300 |
 
-The aggregator checks it on every request and reverts with `BadJury()` unless `K ≥ M ≥ N ≥ P ≥ 1`, `N ≤ 40`, `P ≥ 2` unless `N = 1`, `K ≤ maxJury()` and `K ≤` the keeper's `shortlistSize()`, and `tPlus() < timeout ≤ maxTimeout()`. The bounty program's presets (Small 6/5/4/3/300 s, Medium 8/5/4/3/300 s, Large 21/16/13/10/300 s, Jumbo 50/38/27/17/600 s with beacons) are sized against collusion in [TODO.md item 15](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/TODO.md); a larger jury costs more and is harder to steer. See [Security Model](../advanced/security.md#collusion-and-jury-size).
+The aggregator checks it on every request and reverts with `BadJury()` unless `K ≥ M ≥ N ≥ P ≥ 1`, `N ≤ 40`, `P ≥ 2` unless `N = 1`, `K ≤ maxJury()` and `K ≤` the keeper's `shortlistSize()`, and `tPlus() < timeout ≤ maxTimeout()`, with the timeout at most one day (86,400 s) whatever `maxTimeout()` says. The bounty program's presets (Small 6/5/4/3/300 s, Medium 8/5/4/3/300 s, Large 21/16/13/10/300 s, Jumbo 50/38/27/17/600 s with beacons) are sized against collusion in [TODO.md item 15](https://github.com/verdikta/verdikta-dispatcher/blob/beacon/reputationBasedAggregator/TODO.md); a larger jury costs more and is harder to steer. See [Security Model](../advanced/security.md#collusion-and-jury-size).
 
 If fewer than K arbiters are eligible, the draw does not fail: it repeats the eligible ones (slot k holds pick k mod m). A repeated arbiter is paid and scored once per slot and can decide a thin round alone, so check the pool before relying on a round: the keeper's `eligibleCount(class, maxFee)` counts the arbiters eligible now.
 
@@ -205,7 +205,7 @@ bytes32 aggId = agg.requestAIEvaluationWithApproval{value: value}(
 | `withBeacons` | false | Reverts if set while the aggregator has no beacon contract. See [Oracle Selection](../advanced/oracle-selection.md#beacons) |
 | `jury` | Small | Step 1 |
 
-The request only escrows and records the query in its block, B. It also settles rounds that are due, within a budget of `settlePerRequest()` (2) × its own K jury slots, so its gas varies: estimate it and add headroom.
+The request only escrows and records the query in its block, B. It also settles rounds that are due, in queue order, until `settlePerRequest()` (2) × its own K jury slots are spent (the last round settled may overshoot by its own K), so its gas varies: estimate it and add headroom.
 
 ### Step 4: Draw the Jury
 
@@ -224,7 +224,7 @@ With `withBeacons`, the first `drawJury` starts the beacon stage and the jury is
 
 After the draw the jurors commit. The commit phase closes by itself at the M+-th commit (M+ = M + ⌈(K − M)/2⌉, 6 for Small), or with any commit that brings the count to at least M once T+ (`tPlus()`, 155 seconds) has passed since the draw. If no commit arrives after T+, someone has to call `closeCommits(aggId)`. From two blocks after the close, someone calls `promote(aggId)`, which draws M of the commits at random and asks them to reveal; its caller earns 1 × the ceiling. Promoted jurors get at least `revealWindow()` (120 seconds) to reveal, and the N-th counted reveal finalizes the round.
 
-`getRoundInfo(aggId)` returns everything a driver needs: the phase, `requestBlock`, `sealedHash`, `closeBlock`, the escrow amounts, `deadline`, `windowEnd`, `commits` and `requestTime`. The [round lifecycle table](index.md#the-round-lifecycle) gives the call due in each phase. This Node script drives a `VerdiktaClient` round with the `readStatus` helper from [Integration Examples](index.md#frontend-integration-examples) (saved as `verdikta.js`):
+`getRoundInfo(aggId)` returns everything a driver needs: the phase, `requestBlock`, `sealedHash`, `closeBlock`, the escrow amounts, `deadline` and `windowEnd` (both 0 until the draw), `commits` and `requestTime`. The [round lifecycle table](index.md#the-round-lifecycle) gives the call due in each phase. This Node script drives a `VerdiktaClient` round with the `readStatus` helper from [Integration Examples](index.md#frontend-integration-examples) (saved as `verdikta.js`):
 
 ```javascript
 // drive.mjs: node drive.mjs <clientAddress> <aggId>   (RPC_URL and PRIVATE_KEY in the environment)
@@ -299,7 +299,7 @@ A round that is still in the commit, closing or reveal phase at its `deadline` h
 agg.settle(aggId);
 ```
 
-Before the deadline `settle` reverts with `NotDue()`. It marks the round failed (`isFailed(aggId)` returns true), reports every juror's outcome to the keeper, and credits the unspent prepayment back, either to the requester or, when M commits arrived but the round was never promoted, to the treasury. The base fees credited at the draw stay with the jurors. New requests also settle due rounds, but only in queue order and within a budget of `settlePerRequest()` × their own K slots, so a round may wait a long time for one that fits: call `settle` yourself rather than rely on that. The refund waits until the round is settled. Nothing is retried: send a new request if you still need the evaluation. `VerdiktaClient.publish()` makes the call itself.
+Before the deadline `settle` reverts with `NotDue()`. It marks the round failed (`isFailed(aggId)` returns true), reports every juror's outcome to the keeper, and credits the unspent prepayment back, either to the requester or, when M commits arrived but the round was never promoted, to the treasury. The base fees credited at the draw stay with the jurors. New requests also settle due rounds, in queue order until `settlePerRequest()` × their own K slots are spent, but the walk stops at the first round not yet past its deadline, so a round behind a long-timeout round waits for it: call `settle` yourself rather than rely on that. The refund waits until the round is settled. Nothing is retried: send a new request if you still need the evaluation. `VerdiktaClient.publish()` makes the call itself.
 
 ### Step 8: Collect the Credit
 

@@ -102,8 +102,8 @@ comparing the two ABIs and the code that calls them.
 | `maxTotalFee(maxFee)` | `maxTotalFee(maxFee, minFee, withBeacons, K, P)`: `max(eff, minFee) × (K + B×P [+ 2]) + eff × (2 + 1)`, for the jury the request will ask for |
 | `K()`, `M()`, `N()`, `P()`, `setConfig` | none: the jury is the request's. `getJury(aggId)` returns a round's `(K, M, N, P, timeout)`; the owner bounds requests with `setLimits(maxJury, maxTimeout, tPlus)` (`maxJury()`, `maxTimeout()`, `tPlus()`) |
 | (none) | `drawJury(aggId)` from block B+2: a passthrough on the wallet, like `startEvaluation`, so the draw reward reaches the hunter. With beacons, call it twice: once to start the stage, then again once 2 beacon values are in |
-| `finalizeEvaluationTimeout(aggId)` | `settle(aggId)` after the round's deadline. Anyone may call it. New requests also settle due rounds, but only within a budget of `settlePerRequest` × their own K slots and in queue order, so a big or long round can need an explicit `settle` |
-| `getAggregationStatus(aggId)` → `isComplete, failed, …` | `getRoundInfo(aggId)` → `phase, …`. Settled = phase 7 (settled) or 8 (failed); `isFailed(aggId)`. After the escrow fields it also returns `deadline` (0 until the draw; `settle` is due after it), `windowEnd` (T+ after the draw), `commits` and `requestTime` (added 2026-11-23, for consumers' on-chain views) |
+| `finalizeEvaluationTimeout(aggId)` | `settle(aggId)` after the round's deadline. Anyone may call it. New requests also settle due rounds, in queue order until `settlePerRequest` × their own K slots are spent (the last may overshoot, so the first due round is always settled), but a round not yet past its deadline stops the walk, so rounds behind a long one can need an explicit `settle` |
+| `getAggregationStatus(aggId)` → `isComplete, failed, …` | `getRoundInfo(aggId)` → `phase, …`. Settled = phase 7 (settled) or 8 (failed); `isFailed(aggId)`. After the escrow fields it also returns `deadline` (0 until the draw; `settle` is due after it), `windowEnd` (0 until the draw, then the draw time + the request's T+; changed 2026-11-25), `commits` and `requestTime` (added 2026-11-23, for consumers' on-chain views) |
 | `getEvaluation(aggId)` | same; valid from finalization (phase 6), before settlement |
 | `responseTimeoutSeconds()` | none: the jury's `timeout`, run from the draw, not the request |
 
@@ -134,7 +134,7 @@ Behaviour BountyEscrow must allow for:
   timeout are the bounty's (its class preset), passed with every request; one aggregator serves every
   class. The request reverts (`BadJury`, from AggregatorLib) unless K >= M >= N >= P >= 1, N <= 40,
   P >= 2 unless N = 1, K <= `maxJury()` and the keeper's `shortlistSize()`, and T+ < timeout <=
-  `maxTimeout()`.
+  `maxTimeout()` and <= 1 day (`AggregatorLib.MAX_TIMEOUT`, whatever `maxTimeout()` says).
 - **A thin pool repeats arbiters.** With fewer than K eligible, the jury fills with repeats (slot k
   holds pick k mod m); the draw fails (refunded) only when none is eligible. Repeats can also happen
   in a deep pool, if `shortlistSize` is lowered after the request or the walk's `maxScan` entries hold

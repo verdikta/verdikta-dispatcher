@@ -131,7 +131,7 @@ The refund, `received − baseFees − bonuses − rewards`, is credited once, w
 | Dead in the reveal phase: fewer than N reveals (phase 8) | at `settle` | requester |
 | Never drawable: unsealed for 8,191 blocks, or undrawn a day after the request (phase 9) | `cancelUnsealed`: the whole prepayment | **treasury** |
 
-The `RequesterRefunded(aggId, to, amount)` event names the address credited. A dead round's refund waits until someone calls `settle(aggId)` after the deadline. New requests also settle due rounds, but in queue order and only within a budget of `settlePerRequest()` (2) × their own K slots: the walk stops at the first round that is too big for what is left of the budget, or not yet past its deadline. A K = 50 round at the head of the queue is settled by a new request only if that request has K ≥ 25, and a long-timeout round at the head holds back shorter ones behind it. Call `settle` yourself.
+The `RequesterRefunded(aggId, to, amount)` event names the address credited. A dead round's refund waits until someone calls `settle(aggId)` after the deadline. New requests also settle due rounds, in queue order, until `settlePerRequest()` (2) × their own K slots are spent; the last round settled may overshoot, so the first due round is always settled, whatever its size. The walk stops at the first round not yet past its deadline, so a long-timeout round at the head holds back shorter ones behind it, and `settlePerRequest = 0` turns this off. Call `settle` yourself.
 
 #### ETH Flow Diagram
 
@@ -288,11 +288,11 @@ The constructor sets the defaults; `deploy/03_config.js` sets the request bounds
 |-----------|---------|--------|-------------|
 | `maxOracleFee` | 0.0004 ETH (`4e14` wei) | `setParams(..., maxOracleFee)` | Global fee ceiling. A request's `maxFee` above it is lowered to it, in the quote and in selection |
 | `bonusMultiplier` | 3 | `setParams(bonusMult, ...)` | B, at most 20. Stored per round at request |
-| `settlePerRequest` | 2 | `setParams(..., settlePerReq, ...)` | A request settles due rounds up to this × its own K slots |
+| `settlePerRequest` | 2 | `setParams(..., settlePerReq, ...)` | A request settles due rounds until this × its own K slots are spent (the last may overshoot); 0 turns it off |
 | `drawRewardFees` | 2 | `setRewards(drawFees, priority, promoteFees, revealWindow)` | Draw reward, in multiples of eff. Stored per round |
 | `requesterDrawPriority` | 30 s | `setRewards(...)` | Seconds in which only the requester earns the draw reward |
 | `promoteRewardFees` | 1 | `setRewards(...)` | Promote reward, in multiples of eff. Stored per round |
-| `maxJury`, `maxTimeout`, `tPlus` | 50, 3,600 s, 155 s | `setLimits(maxJury, maxTimeout, tPlus)` | Bounds on the request's jury |
+| `maxJury`, `maxTimeout`, `tPlus` | 50, 3,600 s, 155 s | `setLimits(maxJury, maxTimeout, tPlus)` | Bounds on the request's jury; no timeout may exceed 1 day, whatever `maxTimeout` says |
 | `treasury` | the deployer | `setContracts(keeper, beacons, treasury)` | Receives the refunds that would be re-rolls |
 
 The beacon quorum is `JuryBeacons.quorum()` (2 by default), set with `JuryBeacons.setParams(polled, quorum, timeout)`; each round stores it at request.

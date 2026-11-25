@@ -16,7 +16,7 @@ v2 is a breaking redeploy, so changes to the request or the wire format cost lea
 - **Item 3, the refund beneficiary (`refundTo`).** The only numbered contract item not built, and
   optional. It would let BountyEscrow drop the per-submission `EvaluationWallet`. Decide before
   porting BountyEscrow.
-- **Bytecode budget.** The aggregator has 383 B of headroom under the 24,576 B limit. A new bonus rule
+- **Bytecode budget.** The aggregator has 21 B of headroom under the 24,576 B limit (24,555 B after dd3d188, 2026-11-25). A new bonus rule
   or another request field may need code moved into a library first.
 - **`setContracts` does not check** that the beacon contract uses the same keeper. `deploy/` deploys
   them as a pair, so this matters only for a manual swap. A one-line check if bytecode allows.
@@ -827,6 +827,8 @@ the randomness exists.
       round's penalties landed.
     - Unbonding is 2 days by default, owner-set, never below 2 days (`MIN_UNBONDING`): a day for the
       latest draw, a day for that round to finish and settle. It was 7 days, never derived.
+      (2026-11-25, dd3d188: `checkJury` now caps every timeout at one day, `MAX_TIMEOUT`, whatever
+      `maxTimeout` says, so this holds.)
     - Gas: registering in one class 0.36M appending, 0.33M into a freed slot; `completeExit` 0.13M.
       The aggregator grew 48 B (254 B of headroom left).
     - Dead nodes: the operator owner or the keeper owner can exit a frozen arbiter (`requestExit`,
@@ -2304,8 +2306,9 @@ call `promote` first; the draw reward goes back to the hunter.
   bribe). Keep Medium offered at ~$1K, not above.
 - **Configs per class: done (2026-11-24) as a per-request jury.** Each request carries K/M/N/P and
   its timeout, bounded by `setLimits` and the keeper's shortlist (60), so one aggregator serves every
-  class. Settlement per request is budgeted in slots (`settlePerRequest × K`), so a small request never
-  settles a Jumbo round. Several deployments stay available for a harder separation later.
+  class. Settlement per request is budgeted in slots (`settlePerRequest × K`). Fixed 2026-11-25
+  (dd3d188): the last round settled may overshoot the budget, so a Jumbo round at the head no longer
+  stalls the queue behind it; a round keeps the T+ of its request; timeouts are capped at a day. Several deployments stay available for a harder separation later.
 - **Beacon flag per class or per bounty.** The class preset sets the flag. Whether a requester may
   also turn it on for Medium or Large is open: at their juries it raises the sequencer limit but
   weakens the honest-hunter figures (table above). Item 9's stricter variant (all 4 beacon values

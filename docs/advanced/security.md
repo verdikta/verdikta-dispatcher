@@ -13,7 +13,7 @@ All v2 contracts use OpenZeppelin's `Ownable`. The owner is trusted not to break
 
 **ReputationAggregator:**
 
-- `setLimits(maxJury, maxTimeout, tPlus)`: bounds on a request's jury.
+- `setLimits(maxJury, maxTimeout, tPlus)`: bounds on a request's jury. No timeout may exceed one day, whatever `maxTimeout` says (`AggregatorLib.MAX_TIMEOUT`), and a round keeps the T+ of its request.
 - `setParams(bonusMult, settlePerReq, dispatchGas, spreadFloor, maxOracleFee)`: bonus multiplier (at most 20), settlement budget, dispatch stipend (100k to 2M), spread floor, fee ceiling.
 - `setRewards(drawFees, priority, promoteFees, revealWindow)`: draw and promote rewards, the requester's draw priority, the reveal window. Applies to new requests only.
 - `setContracts(keeper, beacons, treasury)`: rounds in flight call the new contracts, so swap the keeper only when no round awaits settlement and the beacon contract only when no round is in its beacon stage. It does not check that the beacon contract uses the same keeper.
@@ -113,7 +113,7 @@ The aggregator returns a result and every counted juror's score; what a result i
 
 ## Settlement and Exits
 
-Scores are applied at settlement, after the deadline, in one keeper call per round. Anyone may call `settle(aggId)`; each new request also settles due rounds, in queue order, within `settlePerRequest()` × its own K slots, and stops at the first round too big for what is left or not yet past its deadline. A K = 50 round at the head is settled by a request only if that request has K ≥ 25, and a long-timeout round at the head holds back shorter ones behind it, so settlement can need an outside caller. The result itself is readable from finalization and does not wait.
+Scores are applied at settlement, after the deadline, in one keeper call per round. Anyone may call `settle(aggId)`; each new request also settles due rounds, in queue order, until `settlePerRequest()` × its own K slots are spent. The last round settled may overshoot the budget by at most its own K, so the first due round is always settled and a big round at the head cannot stall the queue. The walk stops at the first round not yet past its deadline: a long-timeout round at the head holds back shorter ones behind it, so settlement can need an outside caller. The result itself is readable from finalization and does not wait.
 
 Exits are bounded so penalties land: `requestExit` makes an arbiter ineligible at once and `completeExit` refunds the stake only after the unbonding period (at least 2 days: a day for the latest draw that can read a B from before the exit, and a day for that round to finish and settle). Blocks and bans still apply during unbonding, and a blocked arbiter cannot complete its exit. But an arbiter that completes its exit before a round it served in is settled escapes that round's points, because `applyOutcomes` skips unregistered keys. Settle rounds promptly.
 

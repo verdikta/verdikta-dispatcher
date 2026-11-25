@@ -17,7 +17,7 @@ These come from `requestAIEvaluationWithApproval(...)`.
 |-------|---------|---------|
 | `KeeperNotSet()` | `keeper() == address(0)` | No ReputationKeeper is configured (`setContracts`) |
 | `BadInput()` | Declared in `AggregatorLib` (`buildCommitPayload`): no CIDs, more than 10, a CID over 100 bytes, or an addendum over 1,000 bytes | The query payload is out of bounds |
-| `BadJury()` | Declared in `AggregatorLib` (`checkJury`). The jury breaks one of: K ≥ M ≥ N ≥ P ≥ 1; N ≤ 40; P ≥ 2 unless N = 1; K ≤ `maxJury()`; K ≤ the keeper's `shortlistSize()`; `tPlus()` < timeout ≤ `maxTimeout()` | The requested jury is not allowed. All limits are read at request time |
+| `BadJury()` | Declared in `AggregatorLib` (`checkJury`). The jury breaks one of: K ≥ M ≥ N ≥ P ≥ 1; N ≤ 40; P ≥ 2 unless N = 1; K ≤ `maxJury()`; K ≤ the keeper's `shortlistSize()`; `tPlus()` < timeout ≤ `maxTimeout()`; timeout ≤ 1 day (86,400 s, `AggregatorLib.MAX_TIMEOUT`, whatever `maxTimeout()` says) | The requested jury is not allowed. All limits are read at request time |
 | `BadInput()` | Declared in the aggregator: `estimatedBaseCost >= min(maxFee, maxOracleFee())`, `alpha > 1000`, `maxFeeBasedScalingFactor` outside 1..65,535, or a prepay above 2^88 − 1 wei | A fee or weighting parameter is out of bounds |
 | `InsufficientPayment()` | `msg.value` plus the caller's `ethOwed` credit is below `maxTotalFee(maxFee, minFee, withBeacons, K, P)` | Send the missing ETH. Credit covers only what `msg.value` does not |
 | `EnforcedPause()` | The owner has called `pause()` | Inherited from OpenZeppelin `Pausable`. Only new requests stop |
@@ -54,7 +54,7 @@ The request first settles due rounds. A revert in the request undoes that too.
 
 | Error | Trigger | Meaning |
 |-------|---------|---------|
-| `InvalidConfig()` | `setLimits` with `maxJury_ == 0`, `tPlus_ == 0` or `maxTimeout_ <= tPlus_` | There is no upper bound on `maxTimeout_` |
+| `InvalidConfig()` | `setLimits` with `maxJury_ == 0`, `tPlus_ == 0` or `maxTimeout_ <= tPlus_` | A `maxTimeout_` above one day is accepted, but `checkJury` caps every request's timeout at one day, so no request can use more |
 | `InvalidConfig()` | `setParams` with `bonusMult > 20`, `dispatchGas_` outside 100,000..2,000,000, or `spreadFloor_ > 1e34` | `settlePerReq` and `maxOracleFee_` are not checked; `settlePerReq = 0` turns settlement by requests off |
 | `InvalidConfig()` | `setRewards` with `revealWindow_ == 0` | |
 | `InvalidConfig()` | `setContracts` with a zero keeper or treasury | A zero beacon address is allowed and turns beacons off |

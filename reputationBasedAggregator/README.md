@@ -160,12 +160,16 @@ timeout), so one deployment serves every class. Local networks get a `MockLinkTo
   slots, not arbiters.
 - **The jury is the request's** (`requestAIEvaluationWithApproval(…, withBeacons, jury)`, with
   `jury = (K, M, N, P, timeout)`; `getJury(aggId)` reads it back). The owner bounds it with
-  `setLimits(maxJury, maxTimeout, tPlus)`. Each new request settles due rounds up to
-  `settlePerRequest × its own K` slots, in queue order, so a small request never pays to settle a
-  Jumbo round. The walk stops at the first round that is too big for the remaining budget or not yet
-  past its deadline: a K = 50 round at the head is settled by a request only if that request has
-  K ≥ 25, and a long-timeout round at the head holds back shorter ones behind it. Those rounds wait
-  for such a request or for anyone's `settle()`, so settlement can need an outside caller.
+  `setLimits(maxJury, maxTimeout, tPlus)`; `checkJury` also caps every timeout at one day
+  (`AggregatorLib.MAX_TIMEOUT`), whatever `maxTimeout` says, since the keeper's 2-day unbonding
+  assumes a round settles within a day of its draw. A round keeps the T+ of its request (held in
+  `windowEnd` until the draw, which adds the draw time), so raising T+ cannot push a pending round's
+  commit window past its deadline. Each new request settles due rounds in queue order until
+  `settlePerRequest × its own K` slots are spent; the last round settled may overshoot by at most its
+  own K, so the first due round is always settled, whatever its size. The walk stops at the first
+  round not yet past its deadline: a long-timeout round at the head holds back shorter ones behind
+  it until it is due or anyone calls `settle()`. Until a round settles its scores and penalties wait
+  (an arbiter that completes its exit first escapes them). `settlePerRequest = 0` turns this off.
 - **`promote` pays its caller 1 x eff** (`promoteRewardFees`, in the escrow), so third parties call it
   and a requester cannot withhold it. A round that closed but was never promoted sends its unspent
   prepay to the treasury, not back to the requester, so aborting a promotion draw buys no refund.

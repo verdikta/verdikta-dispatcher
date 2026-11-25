@@ -132,7 +132,7 @@ Repeats happen when fewer than K arbiters are eligible, and also in a deep pool 
 
 Waiting for M+ commits and promoting at random from them is the main protection small rounds have against a cartel that commits first to win promotion. A Small round (6/5/4/3) closes at the 6th commit; a Jumbo round (50/38/27/17) at the 44th.
 
-The aggregator accepts a jury with `K ≥ M ≥ N ≥ P ≥ 1`, `N ≤ 40`, `P ≥ 2` unless `N = 1`, `K ≤ maxJury()` (50) and `K ≤ shortlistSize()` (60), and `tPlus() < timeout ≤ maxTimeout()` (3,600 s); anything else reverts `BadJury()`. `getJury(aggId)` returns a round's jury.
+The aggregator accepts a jury with `K ≥ M ≥ N ≥ P ≥ 1`, `N ≤ 40`, `P ≥ 2` unless `N = 1`, `K ≤ maxJury()` (50) and `K ≤ shortlistSize()` (60), and `tPlus() < timeout ≤ maxTimeout()` (3,600 s), and the timeout at most one day whatever `maxTimeout()` says; anything else reverts `BadJury()`. `getJury(aggId)` returns a round's jury.
 
 ### The Cluster
 
@@ -166,7 +166,7 @@ Ties go by `keccak256(blockhash(B+1), slot)`, not by reveal order, so the fastes
 | `maxScan` | 400 | `setSelection(...)` | Entries visited per walk, at least the shortlist |
 | `liveRandom` | 3 | `setSelection(...)` | Extra health calls per draw |
 | `callDeadline` | 60 s | `ReputationKeeper.setTiming(lock, decay, deadline, unbonding)` | Time to answer a health call before freezing |
-| `maxJury`, `maxTimeout`, `tPlus` | 50, 3,600 s, 155 s | `ReputationAggregator.setLimits(...)` | Bounds on the request's jury |
+| `maxJury`, `maxTimeout`, `tPlus` | 50, 3,600 s, 155 s | `ReputationAggregator.setLimits(...)` | Bounds on the request's jury; no timeout may exceed 1 day, whatever `maxTimeout` says |
 | `revealWindow` | 120 s | `ReputationAggregator.setRewards(...)` | Least reveal time after `promote` |
 | `polled`, `quorum`, `timeout` | 4, 2, 120 s | `JuryBeacons.setParams(polled, quorum, timeout)` | Beacon stage |
 
