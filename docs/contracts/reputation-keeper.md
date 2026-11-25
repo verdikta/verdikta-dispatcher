@@ -188,8 +188,11 @@ struct Selected { address oracle; bytes32 key; uint256 fee; }   // fee: posted f
 function selectArbiters(SelectParams calldata sp, bytes32 seed, uint256 atBlock, uint256 atTime)
     external returns (Selected[] memory)
 
-function pickBeacons(bytes32 seed, uint64 cls, uint256 atBlock, uint256 atTime, uint256 count)
+function pickBeacons(bytes32 seed, uint64 cls, uint256 atBlock, uint256 atTime, uint256 count, uint256 maxFee)
     external returns (bytes32[] memory keys)
+
+// Charge a recorded pick's beacons that revealed nothing after B+1 by `deadline` (ROLE_SELECT, once per pick)
+function missedBeacons(bytes32[] calldata keys, uint256 atBlock, uint256 pickedAt, uint256 deadline) external
 ```
 
 Both revert with `NotApproved()` for a caller that `setApproved` has not approved, `FutureBlock()` if `atBlock` is not in the past, and `StaleBlock()` if `atTime` is more than `MAX_DRAW_AGE` (1 day) old. `selectArbiters` also reverts with `BadParams()` (alpha above 1,000, count 0, base cost not below `maxFee`, scaling factor 0) and `NoEligibleArbiters()`.
@@ -217,7 +220,9 @@ Both revert with `NotApproved()` for a caller that `setApproved` has not approve
 4. **Draw**: `count` weighted picks without replacement, each from `keccak256(seed, k)`. **Repeats**: when the shortlist holds m < `count` arbiters, slot k holds pick k mod m. That happens when fewer than `count` are eligible, when `shortlistSize` is below `count` (it is read at selection, so lowering it after a request applies to that request's draw), and when the walk stops at `maxScan` entries before it has found `count` eligible ones though the class holds more. One operator can then hold several slots, or every slot; each slot is paid, committed, revealed and scored separately. `NoEligibleArbiters()` fires only when the walk finds none.
 5. **Health calls** go to every juror and to `liveRandom()` (3) other shortlisted arbiters.
 
-`pickBeacons` uses the same walk and eligibility rules, without the fee test, and returns up to `count` keys, each sent a health call.
+`pickBeacons` uses the same walk and the same eligibility rules, including the fee test against the round's ceiling `maxFee` (the aggregator passes `min(maxFee, maxOracleFee)`), and returns up to `count` keys, each sent a health call. Keys priced above the ceiling are never jurors, so without the fee test a swarm of them could take beacon seats at no juror risk and void rounds by withholding (round-2 economics review). The pick is recorded for `missedBeacons`.
+
+`missedBeacons` is how JuryBeacons charges silent beacons (`chargeSilent`). It accepts only a pick that the caller itself made (recorded by `pickBeacons` as `keccak256(caller, keys, atBlock, time picked)`), once, after `deadline`, and only if `deadline` is at least `callDeadline` after the pick. The keeper reads the reveals itself (`revealAfter(key, atBlock + 1)`): each key with no reveal at or before `deadline` gets the no-commit outcome (−400 timeliness, a block if that reaches 0), even if it is frozen by then. So a ROLE_SELECT holder can only charge beacons that it picked and that did not answer, and needs no ROLE_SCORE. Otherwise it reverts with `BadParams()`.
 
 ### The arbiter pool draw
 

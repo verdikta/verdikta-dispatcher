@@ -12,7 +12,7 @@ contract EvilBeacons {
         extra = n;
     }
 
-    function start(bytes32, bytes32, uint64, uint256, uint256, uint8 q) external pure returns (uint256) {
+    function start(bytes32, bytes32, uint64, uint256, uint256, uint8 q, uint256) external pure returns (uint256) {
         return q;
     }
 

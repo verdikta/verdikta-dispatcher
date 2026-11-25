@@ -894,10 +894,16 @@ the randomness exists.
     cannot be read goes unpaid, and the draw goes ahead.
   - **Cost:** about 0.39M gas to start. A beacon answer is an ordinary health answer (123k). Jumbo is
     about $0.53 a round in gas with beacons, $0.52 without (2026-11-20).
-  - **Withholding is cheap** (second review, 2026-11-19). A beacon that answers just after the deadline
-    is frozen only from the 60 s call deadline until then, with no score change. With the default
-    2 of 4, a cartel needs 3 seats to force a no-result round; with all 4 required, 1. The option is
-    −400 timeliness for a beacon whose value was not in when the stage missed its quorum (deferred).
+  - **Withholding** (second review, 2026-11-19; fixed 2026-11-25 after the round-2 economics review).
+    A beacon that answered just after the deadline was frozen only from the 60 s call deadline until
+    then, with no score change, and `pickBeacons` checked no fee: keys posted above every ceiling
+    (never jurors, so no juror risk) took beacon seats in proportion to their share of the class. With
+    3 of 4 seats a priced-out swarm could void a Jumbo round and win much of the forfeit back from the
+    arbiter pool (300 eligible + 600 Sybils: 68% of rounds voidable, at a profit). Now beacons are
+    fee-eligible (the round's ceiling reaches `pickBeacons`), and `JuryBeacons.chargeSilent` (anyone,
+    after the deadline) has the keeper charge −400 timeliness to each beacon with no value by the
+    deadline, frozen or not. With the default 2 of 4, a cartel still needs 3 seats to force a
+    no-result round; with all 4 required, 1.
   - **Other fixes from the second review:**
     - A jury shortage after the beacon stage is refunded only if selection walks the whole class list
       (`scansAll`). Otherwise the outcome depended on the seed, and a beacon's timing could buy a

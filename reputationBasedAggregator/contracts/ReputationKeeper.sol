@@ -189,6 +189,9 @@ contract ReputationKeeper is Ownable {
     uint8 public constant ROLE_SELECT = 2;
     uint8 public constant ROLE_SCORE = 4;
     uint8 private constant ROLE_ALL = 7;
+    /// @dev beacon picks awaiting their stage's end: keccak256(caller, keys, atBlock, time picked) -> count.
+    ///      Only a pick recorded here can be charged for silent beacons (missedBeacons), once.
+    mapping(bytes32 => uint256) internal beaconPicks;
     /// @dev every registered arbiter once (the arbiter pool's draw), in slots like the class lists: an
     ///      exit frees its slot (0) for the next registration, and the length is checkpointed, so the pool
     ///      pick reads the registry as of the request block with the class lists' slot-reuse argument
@@ -577,7 +580,7 @@ contract ReputationKeeper is Ownable {
      *         arbiter's choice. Item 9's beacons use it as the beacon value, with `b` = B+1.
      */
     function revealAfter(bytes32 key, uint256 b)
-        external
+        public
         view
         returns (bytes32 value, uint256 blk, uint256 at, address oracle)
     {
@@ -730,16 +733,19 @@ contract ReputationKeeper is Ownable {
 
     /**
      * @notice Pick up to `count` beacons for a draw (item 9's beacon flag) from `cls`, entirely from the
-     *         state as of block `atBlock` (time `atTime`): registered, and not paused, banned, exiting,
-     *         under-staked, blocked or frozen. Each beacon gets a health call, and its beacon value is
+     *         state as of block `atBlock` (time `atTime`): eligible as for selection (registered, and not
+     *         paused, banned, exiting, under-staked, blocked or frozen, with a posted fee at most the
+     *         round's ceiling `maxFee`), so a key priced out of every jury cannot hold a beacon seat
+     *         (where it could only withhold). Each beacon gets a health call, and its beacon value is
      *         its next hash-chain value as of block B+1 (revealAfter): its answer to that call, or to
      *         an earlier one if it answered after B+1. The value was fixed by the end of B+1, so
      *         nothing later (who starts the stage, when, or a chain rotation) changes the pick or the
      *         values.
      * @dev Visits the class list in a seed-derived random order (as selection does), at most `maxScan`
-     *      entries. Fewer than `count` are returned only if the walk finds fewer.
+     *      entries. Fewer than `count` are returned only if the walk finds fewer. The pick is recorded
+     *      for missedBeacons.
      */
-    function pickBeacons(bytes32 seed, uint64 cls, uint256 atBlock, uint256 atTime, uint256 count)
+    function pickBeacons(bytes32 seed, uint64 cls, uint256 atBlock, uint256 atTime, uint256 count, uint256 maxFee)
         external
         onlyRole(ROLE_SELECT)
         returns (bytes32[] memory keys)
@@ -757,8 +763,7 @@ contract ReputationKeeper is Ownable {
                 bytes32 key = list[_nextPos(wk)];
                 if (key == bytes32(0)) continue;      // a freed slot (counts as a visit)
                 Ck memory c = _at(key, atBlock);
-                if (c.flags & (F_REGISTERED | F_PAUSED | F_BANNED | F_EXITING | F_UNDERSTAKED) == F_REGISTERED
-                    && c.blockedUntil <= atTime && !_frozenAt(c, atTime)) {
+                if (_eligibleAt(c, maxFee, atTime)) {
                     keys[m] = key;
                     m++;
                     _call(key);
@@ -768,6 +773,32 @@ contract ReputationKeeper is Ownable {
         assembly ("memory-safe") {   // shrink in place (lengths only decrease)
             mstore(keys, m)
         }
+        beaconPicks[keccak256(abi.encode(msg.sender, keys, atBlock, block.timestamp))]++;
+    }
+
+    /**
+     * @notice Charge the beacons of a pick by the caller (`keys`, from block `atBlock`, picked at
+     *         `pickedAt`) that revealed no value after B+1 by `deadline`: each loses the no-commit points
+     *         (timeliness), as a juror that did not commit in a failed round. Withholding a beacon value
+     *         (to void a round, or to choose among seeds) then costs score, and a repeat blocks the key.
+     *         Unlike a juror's miss it is charged even if the beacon is frozen by then: a beacon was live
+     *         at B, and withholding means not answering, which freezes. Once per pick; `deadline` must
+     *         have passed and give at least the call deadline D, so a caller cannot charge an honest
+     *         beacon for an impossibly short stage.
+     */
+    function missedBeacons(bytes32[] calldata keys, uint256 atBlock, uint256 pickedAt, uint256 deadline)
+        external
+        onlyRole(ROLE_SELECT)
+    {
+        bytes32 h = keccak256(abi.encode(msg.sender, keys, atBlock, pickedAt));
+        if (beaconPicks[h] == 0 || deadline < pickedAt + callDeadline || deadline >= block.timestamp) revert BadParams();
+        beaconPicks[h]--;
+        uint256 burnTotal;
+        for (uint256 i = 0; i < keys.length; i++) {
+            (, uint256 blk, uint256 at,) = revealAfter(keys[i], atBlock + 1);
+            if (blk == 0 || at > deadline) burnTotal += _outcome(keys[i], C_COMMITTED | T_NOCOMMIT_FAILED, 0, points);
+        }
+        if (burnTotal > 0) _burn(burnTotal);
     }
 
     /// @dev The visiting order of a selection walk: random positions in [0, n) without repeats.
@@ -849,40 +880,41 @@ contract ReputationKeeper is Ownable {
         if (keys.length != codes.length) revert BadParams();
         Points memory pt = points;
         uint256 burnTotal;
-        for (uint256 i = 0; i < keys.length; i++) {
-            uint8 code = codes[i];
-            if (code == 0) continue;
-            bytes32 key = keys[i];
-            Ck memory c = _cur(key);
-            if (c.flags & F_REGISTERED == 0 || c.flags & F_BANNED != 0) continue;
-            if (code & C_COMMITTED == 0 && _frozenWhen(c, roundEnd)) {
-                emit OutcomeSkippedFrozen(key);
-                continue;
-            }
-            int256 t = int256(uint256(c.timeliness));
-            int256 q = int256(uint256(c.quality));
-            uint8 te = code & 0x0F;
-            uint8 qe = (code >> 4) & 0x03;
-            if (te == T_DELIVERED) t += int256(uint256(pt.gain));
-            else if (te == T_MISS_FINISHED) t -= int256(uint256(pt.major));
-            else if (te == T_MISS_FAILED) t -= int256(uint256(pt.fail));
-            else if (te == T_NOCOMMIT_FAILED) t -= int256(uint256(pt.nocommit));
-            if (qe == Q_CLOSE) q += int256(uint256(pt.gain));
-            else if (qe == Q_OFF) q -= int256(uint256(pt.minor));
-            else if (qe == Q_FAR) q -= int256(uint256(pt.major));
-            int256 capI = int256(uint256(pt.cap));
-            if (t > capI) t = capI;
-            if (q > capI) q = capI;
-            bool hit = false;
-            if (t <= 0) { t = int256(uint256(pt.start)); hit = true; }
-            if (q <= 0) { q = int256(uint256(pt.start)); hit = true; }
-            c.timeliness = uint16(uint256(t));
-            c.quality = uint16(uint256(q));
-            if (hit) burnTotal += _block(key, c);
-            _write(key, c);
-            emit ScoresUpdated(key, uint256(q), uint256(t));
-        }
+        for (uint256 i = 0; i < keys.length; i++) burnTotal += _outcome(keys[i], codes[i], roundEnd, pt);
         if (burnTotal > 0) _burn(burnTotal);
+    }
+
+    /// @dev one outcome (see applyOutcomes); returns the VDKA to burn
+    function _outcome(bytes32 key, uint8 code, uint256 roundEnd, Points memory pt) internal returns (uint256 burned) {
+        if (code == 0) return 0;
+        Ck memory c = _cur(key);
+        if (c.flags & F_REGISTERED == 0 || c.flags & F_BANNED != 0) return 0;
+        if (code & C_COMMITTED == 0 && _frozenWhen(c, roundEnd)) {
+            emit OutcomeSkippedFrozen(key);
+            return 0;
+        }
+        int256 t = int256(uint256(c.timeliness));
+        int256 q = int256(uint256(c.quality));
+        uint8 te = code & 0x0F;
+        uint8 qe = (code >> 4) & 0x03;
+        if (te == T_DELIVERED) t += int256(uint256(pt.gain));
+        else if (te == T_MISS_FINISHED) t -= int256(uint256(pt.major));
+        else if (te == T_MISS_FAILED) t -= int256(uint256(pt.fail));
+        else if (te == T_NOCOMMIT_FAILED) t -= int256(uint256(pt.nocommit));
+        if (qe == Q_CLOSE) q += int256(uint256(pt.gain));
+        else if (qe == Q_OFF) q -= int256(uint256(pt.minor));
+        else if (qe == Q_FAR) q -= int256(uint256(pt.major));
+        int256 capI = int256(uint256(pt.cap));
+        if (t > capI) t = capI;
+        if (q > capI) q = capI;
+        bool hit = false;
+        if (t <= 0) { t = int256(uint256(pt.start)); hit = true; }
+        if (q <= 0) { q = int256(uint256(pt.start)); hit = true; }
+        c.timeliness = uint16(uint256(t));
+        c.quality = uint16(uint256(q));
+        if (hit) burned = _block(key, c);
+        _write(key, c);
+        emit ScoresUpdated(key, uint256(q), uint256(t));
     }
 
     /// @dev Block with lazy offense decay (updates `c` in memory); returns the VDKA to burn. A hit while

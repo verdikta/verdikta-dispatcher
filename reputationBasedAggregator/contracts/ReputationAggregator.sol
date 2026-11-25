@@ -13,7 +13,7 @@ interface IOracleOwnerAgg { function owner() external view returns (address); }
 
 interface IJuryBeacons {
     function quorum() external view returns (uint8);
-    function start(bytes32 aggId, bytes32 seed, uint64 cls, uint256 atBlock, uint256 atTime, uint8 quorum_)
+    function start(bytes32 aggId, bytes32 seed, uint64 cls, uint256 atBlock, uint256 atTime, uint8 quorum_, uint256 maxFee)
         external
         returns (uint256 picked);
     function result(address aggregator, bytes32 aggId)
@@ -403,7 +403,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
             if (r.sealedHash == bytes32(0)) _seal(r, aggId);
             if (r.beaconFees != 0) {
                 uint256 picked = beacons.start(aggId, keccak256(abi.encodePacked(aggId, "beacons", r.sealedHash)),
-                    r.cls, r.requestBlock, r.requestTime, r.beaconFees);
+                    r.cls, r.requestBlock, r.requestTime, r.beaconFees, eff);
                 if (picked < r.beaconFees) {
                     r.phase = PH_FAILED;          // pool shortage, as for an empty jury pool: refund
                     _refund(r, aggId, r.requester);

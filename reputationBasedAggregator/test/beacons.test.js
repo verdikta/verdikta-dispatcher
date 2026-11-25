@@ -120,7 +120,7 @@ describe("JuryBeacons (item 9's beacon flag)", function () {
   });
 
   it("only an approved aggregator can start a stage; owner limits on the parameters", async () => {
-    await expect(beacons.start(ethers.ZeroHash, ethers.ZeroHash, 1, 0, 0, 2)).to.be.revertedWithCustomError(beacons, "NotApproved");
+    await expect(beacons.start(ethers.ZeroHash, ethers.ZeroHash, 1, 0, 0, 2, H.MAX_FEE)).to.be.revertedWithCustomError(beacons, "NotApproved");
     await expect(beacons.setParams(4, 0, 120)).to.be.revertedWithCustomError(beacons, "InvalidConfig");
     await expect(beacons.setParams(1, 2, 120)).to.be.revertedWithCustomError(beacons, "InvalidConfig");
     await expect(beacons.setParams(17, 2, 120)).to.be.revertedWithCustomError(beacons, "InvalidConfig");
@@ -315,7 +315,7 @@ describe("JuryBeacons (item 9's beacon flag)", function () {
     expect(rewards).to.equal(3n * H.MAX_FEE);                                 // 2 x draw reward + 1 beacon
   });
 
-  it("withholding is cheap: a beacon that answers just after the deadline is frozen only from 60 s, and its value does not count", async () => {
+  it("a beacon that answers just after the deadline is frozen only from 60 s, and its value does not count", async () => {
     const r = await drv.requestOnly();
     await drv.beaconStage(r, { answering: 1 });
     const b = r.beacons[1];
@@ -444,37 +444,53 @@ describe("JuryBeacons (item 9's beacon flag)", function () {
     expect(await keeper.isEligible(b.key, H.MAX_FEE)).to.equal(true);
   });
 
-  it("after the beacon stage a thin jury pool fills with repeats; none eligible fails, refunded only if selection walks the whole list", async () => {
-    // 7 of 12 arbiters cost more than the request's maxFee: beacons ignore fees, and the jury (K = 6)
-    // fills from the 5 that are left, one of them twice
+  it("after the beacon stage a thin jury pool fills with repeats; beacons come from the same fee-eligible arbiters", async () => {
+    // 7 of 12 arbiters cost more than the request's maxFee: beacons and jury (K = 6) both come from the
+    // 5 that are left, the jury repeating one of them
     for (const a of arbs.slice(5)) await keeper.setFee(a.key, H.MAX_FEE + 1n);
+    const ok = new Set(arbs.slice(0, 5).map((a) => a.key));
     const thin = await drv.requestOnly();
     await drv.beaconStage(thin, { answering: 2 });
+    expect(thin.beacons.length).to.equal(4);
+    for (const b of thin.beacons) expect(ok.has(b.key)).to.equal(true);
     await agg.connect(stranger).drawJury(thin.aggId, { gasLimit: 16_000_000 });
     expect(await phase(thin)).to.equal(PH.COMMIT);
     const keys = [];
     for (let i = 0; i < 6; i++) keys.push((await agg.getSlot(thin.aggId, i)).key);
     expect(new Set(keys).size).to.equal(5);
     expect(keys[5]).to.equal(keys[0]);
-    // every arbiter priced out: the jury finds none and the round fails
+    // every arbiter priced out: no beacon either, so the round fails at the start and is refunded
     for (const a of arbs.slice(0, 5)) await keeper.setFee(a.key, H.MAX_FEE + 1n);
-    const run = async () => {
+    const r = await drv.requestOnly();
+    await mine(1);
+    const rc = await (await agg.connect(stranger).drawJury(r.aggId)).wait();
+    expect(ev(beacons, rc, "BeaconCalled").length).to.equal(0);
+    expect(await phase(r)).to.equal(PH.FAILED);
+    const [, , , , received] = await agg.getRoundInfo(r.aggId);
+    expect(await agg.ethOwed(requester.address)).to.equal(received);
+  });
+
+  it("a jury walk that misses every eligible arbiter after a beacon stage: no refund when the walk is partial", async () => {
+    // 2 eligible of 12, walks of 6, quorum 1: the beacon walk can find one while the jury walk (another
+    // seed) finds none. With a full walk this cannot happen any more (beacons are fee-eligible jurors)
+    for (const a of arbs.slice(2)) await keeper.setFee(a.key, H.MAX_FEE + 1n);
+    await keeper.setSelection(6, 6, 0);
+    await beacons.setParams(4, 1, 120);
+    let o;
+    for (let t = 0; t < 60 && !o; t++) {
       const r = await drv.requestOnly();
-      await drv.beaconStage(r, { answering: 2 });
+      await drv.beaconStage(r, { answering: 1 });
+      if ((await phase(r)) !== PH.BEACON) continue;                           // no beacon found
       const [owedReq, owedTreasury] = [await agg.ethOwed(requester.address), await agg.ethOwed(ethers.ZeroAddress)];
       await agg.connect(stranger).drawJury(r.aggId, { gasLimit: 16_000_000 });
-      expect(await phase(r)).to.equal(PH.FAILED);
+      if ((await phase(r)) !== PH.FAILED) continue;                           // the jury walk found one
       const [, , , , received] = await agg.getRoundInfo(r.aggId);
-      return { received, req: (await agg.ethOwed(requester.address)) - owedReq,
-               treasury: (await agg.ethOwed(ethers.ZeroAddress)) - owedTreasury };
-    };
-    let o = await run();                                                       // maxScan 400 >= 12: seed-independent
-    expect(o.req).to.equal(o.received - 2n * H.MAX_FEE);                      // refund less the 2 beacons
-    expect(o.treasury).to.equal(0n);
-    await keeper.setSelection(6, 6, 0);                                        // walks 6 of 12: seed-dependent
-    o = await run();
+      o = { received, req: (await agg.ethOwed(requester.address)) - owedReq,
+            treasury: (await agg.ethOwed(ethers.ZeroAddress)) - owedTreasury };
+    }
+    expect(o).to.not.equal(undefined);
     expect(o.req).to.equal(0n);                                                // a refund would be a re-roll
-    expect(o.treasury).to.equal(o.received - 2n * H.MAX_FEE);
+    expect(o.treasury).to.equal(o.received - H.MAX_FEE);
   });
 
   it("an owner change of polled below a round's fixed quorum does not fail the round", async () => {
@@ -541,5 +557,124 @@ describe("JuryBeacons (item 9's beacon flag)", function () {
     let owed = 0n;
     for (const p of payees) owed += await agg.ethOwed(p);
     expect(await ethers.provider.getBalance(agg.target)).to.equal(owed);
+  });
+
+  describe("fee-eligible beacons (round-2 economics: a priced-out swarm withholding to void rounds)", () => {
+    let swarm;
+    beforeEach(async () => {
+      // 24 Sybil keys posted above every request's ceiling: never jurors, so no juror risk
+      swarm = await H.registerArbiters(core, 24, { fee: H.MAX_FEE + 1n, gate: false });
+      await keeper.setRoles(deployer.address, 2);                             // ROLE_SELECT, to pick directly
+    });
+
+    it("a swarm priced above the ceiling never gets a beacon seat; an eligible set of 4 still forms", async () => {
+      const bad = new Set(swarm.map((a) => a.key));
+      expect(await keeper.scansAll(1)).to.equal(true);                        // 36 entries, maxScan 400
+      const bn = BigInt(await ethers.provider.getBlockNumber());
+      const ts = BigInt(await time.latest());
+      await mine(1);
+      for (let i = 0; i < 40; i++) {
+        const seed = ethers.keccak256(ethers.toBeHex(i, 32));
+        const keys = await keeper.pickBeacons.staticCall(seed, 1, bn, ts, 4, H.MAX_FEE);
+        expect(keys.length).to.equal(4);
+        for (const k of keys) expect(bad.has(k)).to.equal(false);
+        // the same ceiling as juror selection: at a ceiling above the swarm's fee it is eligible again
+        const hi = await keeper.pickBeacons.staticCall(seed, 1, bn, ts, 36, H.MAX_FEE + 1n);
+        expect(hi.length).to.equal(36);
+      }
+      // through the aggregator: the round's ceiling (min(maxFee, maxOracleFee)) reaches the pick
+      for (let i = 0; i < 4; i++) {
+        const r = await drv.requestOnly();
+        await drv.beaconStage(r);
+        expect(r.beacons.length).to.equal(4);
+        for (const b of r.beacons) expect(bad.has(b.key)).to.equal(false);
+        await drv.draw(r, { waitBlocks: 0 });
+        expect(await phase(r)).to.equal(PH.COMMIT);
+      }
+    });
+
+    it("a fee exactly at the ceiling is eligible as a beacon (posted fee <= ceiling, as for jurors)", async () => {
+      for (const a of arbs) await keeper.setFee(a.key, H.MAX_FEE);
+      const bn = BigInt(await ethers.provider.getBlockNumber());
+      const ts = BigInt(await time.latest());
+      await mine(1);
+      const keys = await keeper.pickBeacons.staticCall(ethers.ZeroHash, 1, bn, ts, 12, H.MAX_FEE);
+      expect([...keys].sort()).to.deep.equal(arbs.map((a) => a.key).sort());
+    });
+  });
+
+  describe("withholding costs score (chargeSilent)", () => {
+    const tl = async (key) => (await keeper.getArbiter(key)).timeliness;
+
+    it("missed quorum: each beacon with no value counted by the deadline loses 400, frozen or late; once per stage", async () => {
+      const r = await drv.requestOnly();
+      await drv.beaconStage(r, { answering: 1 });
+      const before = await Promise.all(r.beacons.map((b) => tl(b.key)));
+      await expect(beacons.chargeSilent(agg.target, r.aggId)).to.be.revertedWithCustomError(keeper, "BadParams");   // not yet
+      await time.increase(121);
+      await drv.answerBeacon(r, 1);                                            // too late: still silent for the stage
+      for (const b of r.beacons.slice(2)) expect(await keeper.isFrozen(b.key)).to.equal(true);
+      await agg.connect(stranger).drawJury(r.aggId);
+      expect(await phase(r)).to.equal(PH.FAILED);
+      await expect(beacons.connect(stranger).chargeSilent(agg.target, r.aggId)).to.emit(beacons, "SilentCharged");
+      expect(await tl(r.beacons[0].key)).to.equal(before[0]);                 // answered in time
+      for (let i = 1; i < 4; i++) expect(await tl(r.beacons[i].key)).to.equal(before[i] - 400n);
+      await expect(beacons.chargeSilent(agg.target, r.aggId)).to.be.revertedWithCustomError(keeper, "BadParams");
+    });
+
+    it("a drawn round: the beacons that never answered are charged too, the ones that answered after the quorum are not", async () => {
+      const r = await drv.requestOnly();
+      await drv.beaconStage(r, { answering: 3 });
+      await drv.draw(r, { waitBlocks: 0 });
+      expect(await phase(r)).to.equal(PH.COMMIT);
+      const before = await Promise.all(r.beacons.map((b) => tl(b.key)));
+      await time.increase(121);
+      await beacons.chargeSilent(agg.target, r.aggId);
+      for (let i = 0; i < 3; i++) expect(await tl(r.beacons[i].key)).to.equal(before[i]);
+      expect(await tl(r.beacons[3].key)).to.equal(before[3] - 400n);
+    });
+
+    it("a repeat blocks the key, as any score hit", async () => {
+      // one arbiter alone in class 7, quorum 1: it is every stage's only beacon
+      const solo = (await H.registerArbiters(core, 1, { cls: 7 }))[0];
+      await beacons.setParams(1, 1, 120);
+      const d7 = new RoundDriver(core, [...arbs, solo], requester, { beacons: true });
+      const req = async () => {
+        const value = await H.quote(agg, H.MAX_FEE, 0, true);
+        await agg.connect(requester).requestAIEvaluationWithApproval(["Qm"], "", 500, H.MAX_FEE, 0, H.BASE_COST, 5, 7, true, H.JURY, { value });
+        return { aggId: ethers.zeroPadValue(ethers.toBeHex(await agg.roundCount()), 32), slots: {} };
+      };
+      for (let i = 0; i < 2; i++) {
+        const r = await req();
+        await d7.beaconStage(r, { answering: 0 });
+        expect(r.beacons.map((b) => b.key)).to.deep.equal([solo.key]);
+        await time.increase(121);
+        await beacons.chargeSilent(agg.target, r.aggId);
+        await keeper.connect(solo.node).answerHealthCall(solo.key, solo.ch.next());   // back up for the next pick
+      }
+      const v = await keeper.getArbiter(solo.key);
+      expect(v.timeliness).to.equal(500n);                                     // reset after the hit
+      expect(v.blockedUntil).to.be.greaterThan(BigInt(await time.latest()));
+    });
+
+    it("the keeper charges only the caller's own recorded pick, and only after a stage of at least D", async () => {
+      const r = await drv.requestOnly();
+      await drv.beaconStage(r, { answering: 0 });
+      const [keys, atBlock, dl] = await beacons.getBeacons(agg.target, r.aggId);
+      const startedAt = dl - 120n;
+      await time.increase(121);
+      await expect(keeper.connect(stranger).missedBeacons([...keys], atBlock, startedAt, dl))
+        .to.be.revertedWithCustomError(keeper, "NotApproved");
+      await keeper.setRoles(stranger.address, 2);                             // another ROLE_SELECT holder
+      await expect(keeper.connect(stranger).missedBeacons([...keys], atBlock, startedAt, dl))
+        .to.be.revertedWithCustomError(keeper, "BadParams");                  // not its pick
+      await expect(beacons.chargeSilent(agg.target, ethers.ZeroHash)).to.be.revertedWithCustomError(keeper, "BadParams");   // no stage
+      // a stage shorter than the call deadline D cannot be charged
+      await beacons.setParams(4, 2, 30);
+      const s = await drv.requestOnly();
+      await drv.beaconStage(s, { answering: 0 });
+      await time.increase(31);
+      await expect(beacons.chargeSilent(agg.target, s.aggId)).to.be.revertedWithCustomError(keeper, "BadParams");
+    });
   });
 });

@@ -314,12 +314,12 @@ timeout), so one deployment serves every class. Local networks get a `MockLinkTo
   frozen at round end and so escapes the −400. Being frozen costs it only being unselectable until it
   answers. The simulator lets colluders always answer calls, so it does not model this. Options: a
   cooldown after a late answer, or counting freezes in failed rounds as offenses.
-- **Withholding is cheap for a beacon.** A beacon that stays silent, forcing a no-result round or
-  choosing among seeds, can answer just after the deadline. It is then frozen for about a minute, with
-  no score change.
+- **Withholding by a beacon.** A beacon that stays silent, forcing a no-result round or choosing
+  among seeds, loses 400 timeliness once anyone calls `JuryBeacons.chargeSilent` after the deadline
+  (the keeper's `missedBeacons` checks the reveals itself), as Table 1 does for a missing commit.
+  Beacons are also fee-eligible like jurors, so keys priced above every ceiling hold no seats
+  (round-2 economics review, 2026-11-25).
   - With 2 of 4, forcing a no-result round takes 3 cartel seats; with all 4 required, it takes 1.
-  - Option: −400 timeliness to each beacon whose value was not in when the stage missed its quorum,
-    as Table 1 does for a missing commit (deferred, 2026-11-19).
 - **Jumbo draw size.** Jumbo's draw uses 12.3–13.2M of the 16.8M per-transaction cap, depending on
   the jury, with the operator gate. Each juror whose operator burns its whole stipend adds about 98k.
   With beacons, 33 such jurors of 50 still fit and 35 do not; without, 35 fit and 38 do not (measured

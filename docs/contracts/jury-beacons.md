@@ -35,7 +35,10 @@ If the keeper finds fewer candidates than the quorum, `start` returns the count 
 - Values are mixed in beacon-index order, so arrival decides only which values are used, not their order.
 - A re-synced value is never a beacon value (the keeper's `revealAfter` takes only a value that hashes to the head before it). A beacon that re-syncs after B+1 counts as having withheld.
 
-A cartel holding beacon seats can still choose among a few seeds by when it reveals, and it can force a no-result round by withholding (item 9, "What it buys and costs"). Withholding is cheap: a beacon that answers just after the deadline is frozen only from the 60 s call deadline until then, and its value does not count.
+A cartel holding beacon seats can still choose among a few seeds by when it reveals, and it can force a no-result round by withholding (item 9, "What it buys and costs"). Two limits apply:
+
+- Beacons are picked with the jurors' eligibility, including the round's fee ceiling. Keys posted above the ceiling never sit on a jury, so they cost a Sybil no juror risk; before this rule they took beacon seats in proportion to their share of the class, and a priced-out swarm holding 3 of the 4 seats could void a round and win much of the forfeit back from the arbiter pool.
+- Withholding costs score. After the deadline anyone may call `chargeSilent`, and each beacon with no value counted by the deadline loses 400 timeliness through the keeper (as a juror that did not commit in a failed round), whether the stage met its quorum or not, and even if it is frozen by then. A second hit within the decay period blocks the key.
 
 ## Contract Interface
 
@@ -45,8 +48,12 @@ A cartel holding beacon seats can still choose among a few seeds by when it reve
 // Start the beacon stage for one request (approved aggregators only, once per aggId).
 // Picks max(polled, quorum_) beacons through the keeper. Returns the number picked; with fewer than
 // quorum_ the stage is not started and the caller should fail the round
-function start(bytes32 aggId, bytes32 seed, uint64 cls, uint256 atBlock, uint256 atTime, uint8 quorum_)
+function start(bytes32 aggId, bytes32 seed, uint64 cls, uint256 atBlock, uint256 atTime, uint8 quorum_, uint256 maxFee)
     external returns (uint256 picked)
+
+// After the deadline, anyone, once per stage: the keeper charges each beacon of the stage whose value
+// was not revealed by the deadline (missedBeacons). Emits SilentCharged
+function chargeSilent(address aggregator, bytes32 aggId) external
 ```
 
 | Parameter | Description |
@@ -56,8 +63,11 @@ function start(bytes32 aggId, bytes32 seed, uint64 cls, uint256 atBlock, uint256
 | `cls` | The request's class |
 | `atBlock`, `atTime` | The request block B and its timestamp: the pick reads the state as of then |
 | `quorum_` | The values the aggregator escrowed for, fixed at the request |
+| `maxFee` | The round's fee ceiling, `min(maxFee, maxOracleFee)`: only arbiters whose posted fee is at most this are picked, as for the jury |
 
-Reverts with `NotApproved()` for a caller that `setApproved` has not approved, and with `AlreadyStarted()` for a second start of the same `aggId` by the same aggregator. The keeper's `pickBeacons` reverts with `NotApproved()` if the keeper has not approved this contract, with `FutureBlock()` and with `StaleBlock()`. These errors revert the aggregator's `drawJury`.
+`chargeSilent` reverts with the keeper's `BadParams()` before the deadline, for a request with no stage, for a second call, and when `timeout` was below the keeper's `callDeadline` (60 s) at the start.
+
+`start` reverts with `NotApproved()` for a caller that `setApproved` has not approved, and with `AlreadyStarted()` for a second start of the same `aggId` by the same aggregator. The keeper's `pickBeacons` reverts with `NotApproved()` if the keeper has not approved this contract, with `FutureBlock()` and with `StaleBlock()`. These errors revert the aggregator's `drawJury`.
 
 ### Views
 

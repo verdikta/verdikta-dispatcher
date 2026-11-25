@@ -4,9 +4,11 @@ pragma solidity ^0.8.23;
 import "@openzeppelin/contracts/access/Ownable.sol";
 
 interface IBeaconKeeper {
-    function pickBeacons(bytes32 seed, uint64 cls, uint256 atBlock, uint256 atTime, uint256 count)
+    function pickBeacons(bytes32 seed, uint64 cls, uint256 atBlock, uint256 atTime, uint256 count, uint256 maxFee)
         external
         returns (bytes32[] memory keys);
+
+    function missedBeacons(bytes32[] calldata keys, uint256 atBlock, uint256 pickedAt, uint256 deadline) external;
 
     function revealAfter(bytes32 key, uint256 b)
         external
@@ -42,9 +44,13 @@ interface IBeaconKeeper {
  *             cannot change it, and once ready it is final;
  *           - mixing in index order means arrival decides only which values are used, not their order.
  *         A cartel holding beacon seats still chooses among a few seeds by when it reveals, and can
- *         force a no-result round by withholding (item 9, "What it buys and costs"). Withholding is
- *         cheap: a beacon that answers just after the deadline is frozen only from the call deadline
- *         (60 s) until then, and its value does not count.
+ *         force a no-result round by withholding (item 9, "What it buys and costs"). Two limits:
+ *           - beacons are eligible as jurors are, including the round's fee ceiling, so keys priced
+ *             out of every jury (which cost a Sybil nothing in juror risk) hold no beacon seats;
+ *           - withholding costs score: once the deadline has passed, anyone may call
+ *             chargeSilent(), and each beacon with no value counted by the deadline loses the
+ *             keeper's no-commit points (-400), as a juror that did not commit in a failed round,
+ *             whether or not its value was needed.
  *
  *         Payment is the aggregator's: it credits one per-arbiter fee to the payee (operator owner) of
  *         each used value when it draws. The owner is read here with a fixed stipend.
@@ -80,6 +86,7 @@ contract JuryBeacons is Ownable {
 
     event BeaconCalled(address indexed aggregator, bytes32 indexed aggId, uint256 index, bytes32 indexed key, uint256 deadline);
     event Approval(address indexed aggregator, bool ok);
+    event SilentCharged(address indexed aggregator, bytes32 indexed aggId);
 
     constructor(address keeper_) Ownable(msg.sender) {
         keeper = IBeaconKeeper(keeper_);
@@ -90,8 +97,9 @@ contract JuryBeacons is Ownable {
      *         beacons picked; with fewer than `quorum_` the caller should fail the round (pool shortage).
      * @param seed    entropy for the pick (from blockhash(B+1))
      * @param quorum_ the values the aggregator escrowed for (fixed at request)
+     * @param maxFee  the round's fee ceiling: only arbiters that could be jurors are picked
      */
-    function start(bytes32 aggId, bytes32 seed, uint64 cls, uint256 atBlock, uint256 atTime, uint8 quorum_)
+    function start(bytes32 aggId, bytes32 seed, uint64 cls, uint256 atBlock, uint256 atTime, uint8 quorum_, uint256 maxFee)
         external
         returns (uint256 picked)
     {
@@ -100,7 +108,7 @@ contract JuryBeacons is Ownable {
         if (q.deadline != 0) revert AlreadyStarted();
         // at least the round's quorum, fixed at request, so an owner change of `polled` cannot fail it
         uint8 count = polled < quorum_ ? quorum_ : polled;
-        bytes32[] memory keys = keeper.pickBeacons(seed, cls, atBlock, atTime, count);
+        bytes32[] memory keys = keeper.pickBeacons(seed, cls, atBlock, atTime, count, maxFee);
         picked = keys.length;
         if (picked < quorum_ || quorum_ == 0) return picked;
         uint40 dl = uint40(block.timestamp) + timeout;
@@ -189,6 +197,15 @@ contract JuryBeacons is Ownable {
             if and(ok, gt(returndatasize(), 31)) { w := mload(0) }
         }
         return w >> 160 == 0 ? address(uint160(w)) : address(0);
+    }
+
+    /// @notice After the deadline (anyone, once per stage): the keeper charges each of the stage's beacons
+    ///         that revealed no value counted by the deadline (missedBeacons; the keeper checks the reveals
+    ///         itself and that the keys are its own pick for this stage).
+    function chargeSilent(address aggregator, bytes32 aggId) external {
+        Req storage q = reqs[aggregator][aggId];
+        keeper.missedBeacons(q.keys, q.atBlock, q.startedAt, q.deadline);
+        emit SilentCharged(aggregator, aggId);
     }
 
     /// @notice The request's beacons, the request block B (values are the first reveals after B+1)

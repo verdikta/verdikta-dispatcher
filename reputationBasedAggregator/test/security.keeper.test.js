@@ -218,7 +218,7 @@ describe("ReputationKeeper security PoCs", function () {
       await expect(keeper.connect(x).selectArbiters(SP(1), rndSeed(), bn, ts)).to.be.revertedWithCustomError(keeper, "NotApproved");
       await keeper.setRoles(x.address, 2);   // ROLE_SELECT: selection and the beacon pick, no scoring, no gate
       expect(await keeper.isContractApproved(x.address)).to.equal(false);
-      await keeper.connect(x).pickBeacons(rndSeed(), 1, bn, ts, 2);
+      await keeper.connect(x).pickBeacons(rndSeed(), 1, bn, ts, 2, H.MAX_FEE);
       await expect(keeper.connect(x).applyOutcomes([arbs[0].key], [H.code(H.T.MISS_FAILED)], 0))
         .to.be.revertedWithCustomError(keeper, "NotApproved");
       await keeper.setApproved(x.address, true);
@@ -253,7 +253,7 @@ describe("ReputationKeeper security PoCs", function () {
       for (let b = first; b <= last; b++) {
         let st = hist[0];
         for (const h of hist) if (h[0] <= b) st = h;
-        const got = await keeper.connect(fakeAgg).pickBeacons.staticCall(rndSeed(), 9, b, ts, 1);
+        const got = await keeper.connect(fakeAgg).pickBeacons.staticCall(rndSeed(), 9, b, ts, 1, H.MAX_FEE);
         expect(got.length, `block ${b}`).to.equal(st[1] ? 0 : 1);
         // revealAfter(b): the first answer after b reveals the preimage of the head as of b
         const nxt = hist.find((h) => h[0] > b && h[2] !== st[2]);

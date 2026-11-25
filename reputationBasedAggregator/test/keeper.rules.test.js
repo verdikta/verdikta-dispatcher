@@ -288,7 +288,7 @@ describe("ReputationKeeper rules (item 14)", function () {
       expect(new Set(keys).size).to.equal(6);
       expect(keys).to.not.include(ethers.ZeroHash);
       const [bn, ts] = await at();
-      const beacons = await keeper.connect(fakeAgg).pickBeacons.staticCall(rndSeed(), 1, bn, ts, 6);
+      const beacons = await keeper.connect(fakeAgg).pickBeacons.staticCall(rndSeed(), 1, bn, ts, 6, H.MAX_FEE);
       expect([...beacons].sort()).to.deep.equal(arbs.slice(6).map((a) => a.key).sort());
     });
 
@@ -318,7 +318,7 @@ describe("ReputationKeeper rules (item 14)", function () {
       const B = await at();
       await time.increase(DAY + 1);
       await expect(selectedKeys(6, rndSeed(), B)).to.be.revertedWithCustomError(keeper, "StaleBlock");
-      await expect(keeper.connect(fakeAgg).pickBeacons(rndSeed(), 1, B[0], B[1], 4))
+      await expect(keeper.connect(fakeAgg).pickBeacons(rndSeed(), 1, B[0], B[1], 4, H.MAX_FEE))
         .to.be.revertedWithCustomError(keeper, "StaleBlock");
     });
   });
