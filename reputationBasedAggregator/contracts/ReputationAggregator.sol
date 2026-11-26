@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.23;
 
-import "@chainlink/contracts/src/v0.8/operatorforwarder/ChainlinkClient.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 import "./ReputationKeeper.sol";
 import "./AggregatorLib.sol";
@@ -71,8 +70,7 @@ interface IJuryBeacons {
  * @dev Round ids are sequential (aggId = bytes32(roundId)), which lets a Chainlink request id map to
  *      (round, slot) in a single storage word. Scores are on the arbiters' 0..1,000,000 scale.
  */
-contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Pausable {
-    using Chainlink for Chainlink.Request;
+contract ReputationAggregator is Ownable, ReentrancyGuardTransient, Pausable {
 
     // ------------------------------------------------------------------ constants
     uint8 private constant PH_DRAW = 1;           // escrowed, awaiting the jury draw
@@ -114,15 +112,26 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
     uint8 private constant C_COMMITTED = 0x80;
 
     // ------------------------------------------------------------------ types
+    /// @dev two words written at the draw (the operator is in requestRef and the keeper's record of `key`)
     struct Slot {
-        address oracle;       // s0
-        uint96 fee;           // paid: max(posted fee as of B, the round's floor)
+        address payee;        // s0
+        uint64 fee;           // the posted fee as of B; paid = max(fee, the round's floor)
+        uint8 flags;
+        uint8 qcode;
         bytes32 key;          // s1
-        address payee;        // s2
+        bytes32 commitHash;   // s2: keccak256(abi.encode(aggId, operator, response, salt)), all 32 bytes
+    }
+
+    /// @notice getSlot's view (the v2 layout): fee is the amount paid; committedAt is no longer recorded (0)
+    struct SlotView {
+        address oracle;
+        uint96 fee;
+        bytes32 key;
+        address payee;
         uint40 committedAt;
         uint8 flags;
         uint8 qcode;
-        bytes32 commitHash;   // s3: keccak256(abi.encode(aggId, operator, response, salt)), all 32 bytes
+        bytes32 commitHash;
     }
 
     /// @notice The jury a request asks for (item 15's class presets): K drawn, M promoted, N counted, P
@@ -169,12 +178,12 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         uint40 timeout;       // the request's round timeout, from the draw
         bytes32 sealedHash;   // s6
         string payload;
-        uint256[] aggregated;
-        uint256[] median;
+        uint128[] aggregated; // scores are clamped to MAX_SCORE < 2^113: two per word, lossless
+        uint128[] median;
         uint8[] order;        // counted slots, in reveal order
         string justifications;
         mapping(uint256 => Slot) slots;
-        mapping(uint256 => uint256[]) likes;
+        mapping(uint256 => uint128[]) likes;
         mapping(uint256 => string) cids;
     }
 
@@ -189,7 +198,6 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
     error NotAuthorized();
     error NothingOwed();
     error EthTransferFailed();
-    error OnlySelf();
     error InvalidConfig();
     error TooEarly();
     error SeedExpired();
@@ -243,19 +251,23 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
     uint256 public maxOracleFee = 4e14;
     uint256 private constant MAX_LIKELIHOOD_LENGTH = 20;
 
+    /// @dev LINK (ERC-677): requests go out as transferAndCall(operator, 0, operatorRequest(...))
+    address private immutable link;
     ReputationKeeper public keeper;
     IJuryBeacons public beacons;
 
     // ------------------------------------------------------------------ state
     uint256 public roundCount;
     mapping(uint256 => Round) internal rounds;
-    mapping(bytes32 => uint256) public requestRef;      // chainlink request id => roundId << 8 | slot
+    /// @notice chainlink request id => operator << 96 | roundId << 8 | slot, until the request is fulfilled
+    ///         (one fulfilment per request, from its operator only); 0 after
+    mapping(bytes32 => uint256) public requestRef;
     mapping(address => uint256) public ethOwed;
     uint256[] public settleQueue;
     uint256 public settleHead;
 
-    constructor(address link, address _keeper) Ownable(msg.sender) {
-        _setChainlinkToken(link);
+    constructor(address link_, address _keeper) Ownable(msg.sender) {
+        link = link_;
         keeper = ReputationKeeper(_keeper);
     }
 
@@ -458,10 +470,12 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         r.windowEnd += uint40(block.timestamp);
         r.mPlus = uint8(uint256(r.M) + (uint256(r.K) - r.M + 1) / 2);
         r.deadline = uint40(block.timestamp) + r.timeout;
-        string memory payload = r.payload;
+        // one request template for all K slots: the CBOR parameters are the same, only the operator, the
+        // job id and the nonce are patched per slot
+        bytes memory tpl = AggregatorLib.requestTemplate(bytes(r.payload), aggId, this.fulfill.selector);
         uint96 base;
         uint256 floor_ = r.minFee;
-        for (uint256 i = 0; i < sel.length; i++) base += _pollSlot(r, aggId, id, i, sel[i], payload, eff, floor_);
+        for (uint256 i = 0; i < sel.length; i++) base += _pollSlot(r, aggId, id, i, sel[i], tpl, eff, floor_);
         r.baseCredited = base;
 
         uint256 reward;
@@ -501,15 +515,13 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         uint256 id,
         uint256 i,
         ReputationKeeper.Selected memory s,
-        string memory payload,
+        bytes memory tpl,
         uint256 effMaxFee,
         uint256 minFee
     ) internal returns (uint96 credited) {
         if (s.fee > effMaxFee) revert InsufficientPayment();
         uint256 paid = s.fee < minFee ? minFee : s.fee;    // the floor (item 8); the bonus scales off it
         Slot storage sl = r.slots[i];
-        sl.oracle = s.oracle;
-        sl.fee = uint96(paid);
         sl.key = s.key;
         // low-level, so a malformed return (short, or dirty high bits) skips the slot instead of
         // reverting the draw, which would leave the round undrawable
@@ -524,55 +536,50 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
             if and(ok, gt(returndatasize(), 31)) { w := mload(0) }   // arguments right to left
         }
         if (w == 0 || w >> 160 != 0) {
+            sl.fee = uint64(s.fee);
             emit SlotSkipped(aggId, i, 1);
             return 0;
         }
         address payee = address(uint160(w));
-        (bool sent, bytes32 opReq) = _dispatch(aggId, s.oracle, s.key, payload);
-        if (sent) {
-            sl.payee = payee;
-            sl.flags = S_DISPATCHED;
-            requestRef[opReq] = (id << 8) | i;
+        if (_dispatch(tpl, s.oracle, s.jobId, (id << 8) | i, 0)) {
+            (sl.payee, sl.fee, sl.flags) = (payee, uint64(s.fee), S_DISPATCHED);
             ethOwed[payee] += paid;
             credited = uint96(paid);
             emit BasePayment(aggId, i, payee, paid);
         } else {
+            sl.fee = uint64(s.fee);
             emit SlotSkipped(aggId, i, 2);
         }
     }
 
-    /// @dev one oracle request with the fixed stipend; false if the operator reverted or burned it all
-    function _dispatch(bytes32 aggId, address oracle, bytes32 key, string memory payload) internal returns (bool, bytes32) {
-        bytes32 jobId = keeper.jobIdOf(key);
+    /// @dev One oracle request with the fixed stipend: LINK transferAndCall(oracle, 0, operatorRequest) from the
+    ///      round's template, with this slot's operator, job id and nonce patched in. False if the operator
+    ///      reverted, burned the stipend or LINK returned false. The nonce is (ref << 1 | reveal), unique per
+    ///      request, so the request id keccak256(this, nonce) needs no counter. Only the first word of the
+    ///      return data is copied (no return-data bomb).
+    function _dispatch(bytes memory tpl, address oracle, bytes32 jobId, uint256 ref, uint256 reveal) internal returns (bool ok) {
+        uint256 nonce = (ref << 1) | reveal;
         uint256 dg = dispatchGas;
+        address l = link;
         _needGas(dg);
-        try this.dispatchOracleRequest{gas: dg}(aggId, oracle, jobId, payload) returns (bytes32 opReq) {
-            return (true, opReq);
-        } catch {
-            return (false, 0);
+        assembly ("memory-safe") {
+            let p := add(tpl, 32)
+            mstore(add(p, 4), oracle)
+            mstore(add(p, 200), jobId)
+            mstore(add(p, 264), nonce)
+            mstore(0, 0)
+            ok := call(dg, l, 0, p, mload(tpl), 0, 32)
+            ok := and(ok, and(gt(returndatasize(), 31), eq(mload(0), 1)))
         }
-    }
-
-    /// @dev self-call trampoline so a reverting operator hook fails only its own slot
-    function dispatchOracleRequest(bytes32 aggId, address operator, bytes32 jobId, string calldata payload)
-        external
-        returns (bytes32)
-    {
-        if (msg.sender != address(this)) revert OnlySelf();
-        Chainlink.Request memory req = _buildOperatorRequest(jobId, this.fulfill.selector);
-        req._add("cid", payload);
-        req._add("aggId", AggregatorLib.bytes32ToHex(aggId));
-        return _sendOperatorRequestTo(operator, req, 0);
+        if (ok) requestRef[keccak256(abi.encodePacked(address(this), nonce))] = (uint256(uint160(oracle)) << 96) | ref;
     }
 
     // ================================================================== commit / reveal
-    function fulfill(bytes32 requestId, uint256[] memory response, string memory cid)
-        public
-        recordChainlinkFulfillment(requestId)
-        nonReentrant
-    {
+    function fulfill(bytes32 requestId, uint256[] memory response, string memory cid) public nonReentrant {
         uint256 ref = requestRef[requestId];
-        if (ref == 0) revert UnknownRequest();
+        if (ref >> 96 != uint160(msg.sender)) revert UnknownRequest();   // unknown, fulfilled, or not its operator
+        delete requestRef[requestId];                                    // one fulfilment per request
+        ref &= type(uint96).max;
         uint256 id = ref >> 8;
         uint256 s = ref & 0xff;
         Round storage r = rounds[id];
@@ -584,7 +591,6 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
             bytes32 h = bytes32(response[0]);
             if (r.phase != PH_COMMIT || h == bytes32(0) || sl.flags & S_COMMITTED != 0) return;
             sl.commitHash = h;
-            sl.committedAt = uint40(block.timestamp);
             sl.flags |= S_COMMITTED;
             uint256 c = ++r.commits;
             emit CommitReceived(bytes32(id), s, h);
@@ -610,13 +616,13 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
 
         if (r.phase == PH_REVEAL) {
             sl.flags |= S_COUNTED;
-            r.likes[s] = response;
+            _store(r.likes[s], response);
             r.cids[s] = cleanCid;
             r.order.push(uint8(s));
             emit RevealReceived(bytes32(id), s, false, 0);
             if (++r.reveals == r.N) _finalize(r, id);
         } else {
-            uint8 q = ScoringLib.classifyOne(response, r.median, r.spread);
+            uint8 q = ScoringLib.classifyOne(response, _load(r.median), r.spread);
             sl.qcode = q;
             emit RevealReceived(bytes32(id), s, true, q);
         }
@@ -666,14 +672,18 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         uint256[] memory chosen = ScoringLib.pickPromoted(committed, m, seedIn);
         r.phase = PH_REVEAL;
         bytes32 aggId = bytes32(id);
+        bytes memory tpl = AggregatorLib.requestTemplate("", aggId, this.fulfill.selector);
         for (uint256 j = 0; j < m; j++) {
             uint256 s = chosen[j];
             Slot storage sl = r.slots[s];
             sl.flags |= S_PROMOTED;
-            string memory payload = string(abi.encodePacked("2:", AggregatorLib.bytes32ToHexLower(sl.commitHash)));
-            (bool sent, bytes32 opReq) = _dispatch(aggId, sl.oracle, sl.key, payload);
-            if (sent) requestRef[opReq] = (id << 8) | s;
-            else emit SlotSkipped(aggId, s, 3);
+            string memory hx = AggregatorLib.bytes32ToHexLower(sl.commitHash);   // the payload "2:<commit hash>"
+            assembly ("memory-safe") {
+                mstore(add(tpl, 432), mload(add(hx, 32)))
+                mstore(add(tpl, 464), mload(add(hx, 64)))
+            }
+            (address oracle, bytes32 jobId) = keeper.oracleJob(sl.key);
+            if (!_dispatch(tpl, oracle, jobId, (id << 8) | s, 1)) emit SlotSkipped(aggId, s, 3);
         }
         emit CommitPhaseComplete(aggId, m);
     }
@@ -683,18 +693,19 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         uint256 n = r.order.length;
         uint256[][] memory ll = new uint256[][](n);
         uint256[] memory ids = new uint256[](n);
-        for (uint256 i = 0; i < n; i++) (ll[i], ids[i]) = (r.likes[r.order[i]], r.order[i]);
+        for (uint256 i = 0; i < n; i++) (ll[i], ids[i]) = (_load(r.likes[r.order[i]]), r.order[i]);
         // aggregate resizes the vectors to their most common length first, and breaks cluster ties
         // by a seeded order of the slots, not by who revealed first
         (bool[] memory inCl, uint256[] memory agg, uint8[] memory codes, uint256[] memory med, uint256 spread) =
             ScoringLib.aggregate(ll, r.P, spreadFloor, r.sealedHash, ids);
         uint96 bonus;
         bytes memory just;
+        uint256 floor_ = r.minFee;
         for (uint256 i = 0; i < n; i++) {
             if (!inCl[i]) continue;
             uint256 s = r.order[i];
             Slot storage sl = r.slots[s];
-            uint256 b = uint256(sl.fee) * r.bonusMult;
+            uint256 b = (sl.fee < floor_ ? floor_ : sl.fee) * r.bonusMult;   // the paid fee (item 8)
             if (b > 0) {
                 ethOwed[sl.payee] += b;
                 bonus += uint96(b);
@@ -702,15 +713,25 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
             }
             just = just.length == 0 ? bytes(r.cids[s]) : abi.encodePacked(just, ",", r.cids[s]);
         }
-        r.aggregated = agg;
+        _store(r.aggregated, agg);
         r.justifications = string(just);
         r.bonusCredited = bonus;
         for (uint256 i = 0; i < n; i++) r.slots[r.order[i]].qcode = codes[i];
-        r.median = med;
+        _store(r.median, med);
         r.spread = uint128(spread);
         r.phase = PH_FINAL;
         _refund(r, bytes32(id), r.requester);
         emit FulfillAIEvaluation(bytes32(id), agg, string(just));
+    }
+
+    /// @dev a vector into packed storage (every value is at most MAX_SCORE < 2^128)
+    function _store(uint128[] storage a, uint256[] memory v) internal {
+        for (uint256 i = 0; i < v.length; i++) a.push(uint128(v[i]));
+    }
+
+    function _load(uint128[] storage a) internal view returns (uint256[] memory v) {
+        v = new uint256[](a.length);
+        for (uint256 i = 0; i < v.length; i++) v[i] = a[i];
     }
 
     function _refund(Round storage r, bytes32 aggId, address to) internal {
@@ -816,7 +837,7 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
     function getEvaluation(bytes32 aggId) external view returns (uint256[] memory, string memory, bool) {
         Round storage r = rounds[uint256(aggId)];
         bool valid = r.phase == PH_FINAL || r.phase == PH_SETTLED;
-        return (r.aggregated, r.justifications, valid);
+        return (_load(r.aggregated), r.justifications, valid);
     }
 
     /// @notice Item 11: every counted reveal's raw score for `outcome`, in reveal order (a short reveal
@@ -827,14 +848,19 @@ contract ReputationAggregator is ChainlinkClient, Ownable, ReentrancyGuard, Paus
         uint256 n = r.order.length;
         scores = new uint256[](n);
         for (uint256 i = 0; i < n; i++) {
-            uint256[] storage v = r.likes[r.order[i]];
+            uint128[] storage v = r.likes[r.order[i]];
             if (outcome < v.length) scores[i] = v[outcome];
         }
         valid = true;
     }
 
-    function getSlot(bytes32 aggId, uint256 i) external view returns (Slot memory) {
-        return rounds[uint256(aggId)].slots[i];
+    function getSlot(bytes32 aggId, uint256 i) external view returns (SlotView memory v) {
+        Round storage r = rounds[uint256(aggId)];
+        Slot storage sl = r.slots[i];
+        if (sl.key != bytes32(0)) (v.oracle, ) = keeper.oracleJob(sl.key);
+        uint256 fee = sl.fee < r.minFee ? r.minFee : sl.fee;
+        if (sl.key == bytes32(0)) fee = 0;
+        (v.fee, v.key, v.payee, v.flags, v.qcode, v.commitHash) = (uint96(fee), sl.key, sl.payee, sl.flags, sl.qcode, sl.commitHash);
     }
 
     /// @notice phase (1 draw, 2 beacons, 3 commit, 4 closing, 5 reveal, 6 final, 7 settled, 8 failed,

@@ -289,8 +289,9 @@ function isFailed(bytes32 aggId) external view returns (bool)
 
 // One slot of the jury
 function getSlot(bytes32 aggId, uint256 i) external view returns (Slot memory)
-// Slot: oracle, fee (paid: max(posted fee at B, minFee)), key (keeper key), payee (operator owner),
-//       committedAt, flags (1 dispatched, 2 committed, 4 promoted, 8 revealed, 16 counted),
+// Slot: oracle (read from the keeper by key), fee (paid: max(posted fee at B, minFee)), key (keeper key),
+//       payee (operator owner), committedAt (always 0: the time is in CommitReceived's block),
+//       flags (1 dispatched, 2 committed, 4 promoted, 8 revealed, 16 counted),
 //       qcode (quality class: 1 close, 2 off, 3 far), commitHash
 
 // The prepay for a request, in wei (see Fee Structure)
@@ -301,7 +302,7 @@ function maxTotalFee(uint256 maxFee, uint256 minFee, bool withBeacons, uint8 K, 
 // ethOwed(address(0)) is the arbiter pool
 function ethOwed(address payee) external view returns (uint256)
 
-// Chainlink request id => roundId << 8 | slot
+// Chainlink request id => operator << 96 | roundId << 8 | slot, until the request is answered; 0 after
 function requestRef(bytes32 requestId) external view returns (uint256)
 
 function roundCount() external view returns (uint256)
@@ -358,7 +359,7 @@ function unpause() external onlyOwner
 
 The bonus multiplier, the draw and promote rewards and the beacon quorum are fixed in each round at its request, since its escrow was sized on them. The spread floor, the dispatch stipend, the draw priority and the reveal window apply to rounds in flight. A round keeps the T+ of its request: `checkJury` checks the timeout against it, the round holds it in `windowEnd` until the draw, and the draw adds the draw time. A T+ changed in between does not reach that round, so it can never push the commit window past the deadline. The `maxTimeout` in force at the request applies, and no timeout may exceed one day whatever it says. The shortlist that bounds K is read at the request, and again by the keeper at the draw. Ownership uses OpenZeppelin `Ownable` (`owner()`, `transferOwnership`, `renounceOwnership`).
 
-`dispatchOracleRequest(...)` is external only so that the contract can call itself with a gas stipend. It reverts with `OnlySelf()` for any other caller.
+**How requests go out.** The aggregator does not use Chainlink's `ChainlinkClient`. It builds one request per round as calldata for LINK's `transferAndCall(operator, 0, operatorRequest(...))`, byte for byte what `ChainlinkClient` would send (CBOR parameters `cid` and `aggId`, data version 2, callback `fulfill`), and writes in each slot's operator, job id and nonce. Each call gets the `dispatchGas` stipend; a slot whose operator reverts, burns the stipend or makes LINK return false is skipped (`SlotSkipped`). The nonce is `(roundId << 8 | slot) << 1 | r`, with `r` 0 for the commit request and 1 for the reveal, so a request id can be computed off-chain: `keccak256(abi.encodePacked(aggregator, nonce))`, as the operator computes it. `fulfill` accepts an answer only from the operator the request went to, and only once (`UnknownRequest()` otherwise).
 
 ## Events
 

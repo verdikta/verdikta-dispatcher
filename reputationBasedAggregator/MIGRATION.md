@@ -10,6 +10,15 @@ comparing the two ABIs and the code that calls them.
 - **Request and callback shape.** Requests carry `cid` = `1:<cids>[:addendum]` (commit) or
   `2:<commit hash>` (reveal), plus `aggId`. The callback is `fulfill(bytes32, uint256[], string)`.
   The commit and the reveal's salt change (items 4 and 5, under "Arbiter node" below).
+- **Requests are sent without `ChainlinkClient`,** as LINK `transferAndCall` calls built from one template
+  per round. Operators receive the same `operatorRequest` bytes `ChainlinkClient` would send (data
+  version 2, same CBOR keys). Off-chain readers lose the aggregator's `ChainlinkRequested` and
+  `ChainlinkFulfilled` events: use the operator's `OracleRequest`/`OracleResponse`, or compute the id as
+  `keccak256(abi.encodePacked(aggregator, ((roundId << 8 | slot) << 1) | isReveal))`.
+- **Compiled for Cancun** (`evmVersion: "cancun"`, for the transient-storage reentrancy guard). Deploy
+  only to chains with Cancun; Base has it.
+- **`getSlot` keeps its tuple,** but `committedAt` is always 0 (use the `CommitReceived` block) and
+  `oracle` is read from the keeper by the slot's key (fixed per key).
 - **`aggId` is now sequential** (`bytes32(roundId)`) rather than a hash. Nodes treat it as an opaque
   string, so this should not matter, but check any node-side parsing.
 - **`ArbiterOperator`'s keeper gate** calls `isContractApproved(requester)` on each keeper in its list,

@@ -124,6 +124,7 @@ contract ReputationKeeper is Ownable {
         address oracle;
         bytes32 key;
         uint256 fee;
+        bytes32 jobId;
     }
 
     struct SelectParams {
@@ -717,7 +718,8 @@ contract ReputationKeeper is Ownable {
             }
             taken[pick] = true;
             remaining -= w[pick];
-            sel[k] = Selected(metas[sk[pick]].oracle, sk[pick], fees[pick]);
+            Meta storage mt = metas[sk[pick]];
+            sel[k] = Selected(mt.oracle, sk[pick], fees[pick], mt.jobId);
             _call(sk[pick]);                       // every juror gets a health call
         }
         uint256 probes = liveRandom;
@@ -982,6 +984,12 @@ contract ReputationKeeper is Ownable {
 
     function jobIdOf(bytes32 key) external view returns (bytes32) {
         return metas[key].jobId;
+    }
+
+    /// @notice The operator and job of `key` (the aggregator's reveal dispatch)
+    function oracleJob(bytes32 key) external view returns (address, bytes32) {
+        Meta storage m = metas[key];
+        return (m.oracle, m.jobId);
     }
 
     /// @notice The classes the arbiter is registered in (emptied by completeExit; its slots are freed).

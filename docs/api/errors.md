@@ -37,8 +37,7 @@ The request first settles due rounds. A revert in the request undoes that too.
 | `BadSelectionCount()` | The keeper returned a jury of a size other than K | A guard; the keeper always returns K (with repeats if needed) |
 | `InsufficientPayment()` | A drawn arbiter's fee as of B is above the round's fee ceiling | A guard; the keeper filters by fee |
 | `OutOfGas()` | `drawJury`, `settle` or a dispatch had too little gas for a call whose failure the contract tolerates (the stipend check, or a keeper call starved by the caller) | Raise the gas limit. It stops a caller from choosing a gas limit that skips a slot or the scores |
-| `UnknownRequest()` | `fulfill` with a request id that maps to no slot | A guard. In practice an unknown id first fails Chainlink's `recordChainlinkFulfillment` with `"Source must be the oracle of the request"` |
-| `OnlySelf()` | `dispatchOracleRequest(...)` from any address but the aggregator | An internal step that has to be `external` |
+| `UnknownRequest()` | `fulfill` with a request id that maps to no slot, that was already answered, or from an address other than the operator it was sent to | One answer per request, from its own operator |
 
 `fulfill` does not revert on a bad answer. It ignores without an error a commit outside phase 3, a zero or repeated commit, a reveal from a slot that is not promoted or has already revealed, a reveal of the wrong length, an over-long or malformed `cid:salt`, a hash mismatch, and anything after the deadline. The Chainlink request is used up all the same.
 

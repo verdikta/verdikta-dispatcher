@@ -259,7 +259,7 @@ event EthWithdrawn(address indexed payee, uint256 amount);
 
 ### Inherited Events
 
-`OwnershipTransferred(address indexed previousOwner, address indexed newOwner)` from OpenZeppelin `Ownable`, `Paused(address account)` / `Unpaused(address account)` from `Pausable`, and Chainlink's `ChainlinkRequested(bytes32 indexed id)` (for each commit and reveal request sent) and `ChainlinkFulfilled(bytes32 indexed id)` (for each answer, accepted or not) from `ChainlinkClient`. The owner's setters (`setLimits`, `setParams`, `setRewards`, `setContracts`) emit no event.
+`OwnershipTransferred(address indexed previousOwner, address indexed newOwner)` from OpenZeppelin `Ownable`, `Paused(address account)` / `Unpaused(address account)` from `Pausable`. The aggregator does not use `ChainlinkClient`, so Chainlink's `ChainlinkRequested` and `ChainlinkFulfilled` events are not emitted: the operator's `OracleRequest` and `OracleResponse` events cover each request, and its id can be computed (see the contract page, "How requests go out"). The owner's setters (`setLimits`, `setParams`, `setRewards`, `setContracts`) emit no event.
 
 ## ReputationKeeper Events
 

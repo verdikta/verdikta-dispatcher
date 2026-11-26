@@ -278,6 +278,25 @@ library AggregatorLib {
     }
 
     // ----------------------------------------------------------------------
+    //                          ORACLE REQUEST TEMPLATE
+    // ----------------------------------------------------------------------
+
+    /// @notice The LINK transferAndCall(operator, 0, operatorRequest(...)) calldata for one round's requests,
+    ///         with the CBOR parameters {cid: payload, aggId: 0x<aggId>} exactly as Chainlink's library
+    ///         encodes them. The operator (byte 4), job id (byte 200) and nonce (byte 264) are left zero for
+    ///         the caller to patch per slot. `payload` empty means the reveal payload "2:" + 64 hex chars,
+    ///         patched per slot at byte 400.
+    function requestTemplate(bytes memory payload, bytes32 aggId, bytes4 callback) public pure returns (bytes memory) {
+        if (payload.length == 0) payload = "2:0000000000000000000000000000000000000000000000000000000000000000";
+        uint256 n = payload.length;
+        bytes memory hdr = n < 24 ? abi.encodePacked(uint8(0x60 + n)) : n < 256
+            ? abi.encodePacked(uint8(0x78), uint8(n)) : abi.encodePacked(uint8(0x79), uint16(n));
+        bytes memory cbor = abi.encodePacked(hex"63636964", hdr, payload, hex"6561676749647842", bytes32ToHex(aggId));
+        return abi.encodeWithSelector(bytes4(0x4000aea0), address(0), uint256(0),          // transferAndCall(address,uint256,bytes)
+            abi.encodeWithSelector(bytes4(0x3c6d41b9), address(0), uint256(0), bytes32(0), callback, uint256(0), uint256(2), cbor));
+    }
+
+    // ----------------------------------------------------------------------
     //                          HEX CONVERSIONS
     // ----------------------------------------------------------------------
 
