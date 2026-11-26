@@ -1,37 +1,52 @@
 #!/usr/bin/env node
-/*
-Enhanced version that can auto-discover expected addresses
+/*  scripts/reveal-forensics.js  (v2 aggregator)
+    -------------------------------------------------------------------------------------------
+    Per-slot forensics for ONE round: why each juror's commit and reveal did or did not count.
 
-HARDHAT_NETWORK=base_sepolia \
-node scripts/reveal-forensics.js \
-  --aggregator 0x6a26f45D5BbFC3AEEd8De9bd2B8285b96554bC47 \
-  --aggid      0x064e3289be2ffdda5257a7df59aab4b7e417bdb4f047d8ba0b3050091fd20857 \
-  --auto-discover
+    v2 emits no diagnostic events for bad replies (it ignores them silently), so this script
+    reconstructs every verdict itself:
+      1. getRoundInfo / getJury / getSlot(aggId, i) give the jury, each slot's operator, key,
+         flags (dispatched, committed, promoted, revealed, counted), qcode and stored commit;
+      2. the commit and reveal request ids are computed (scripts/lib/v2-reveal.js) and checked
+         against the operators' OracleRequest events in the draw and promote transactions;
+      3. each operator's OracleResponse(requestId) leads to the fulfil transaction, whose calldata
+         (fulfillOracleRequestV / fulfillOracleRequest2) carries (requestId, scores, "cid:salt");
+      4. the replies are replayed in chain order against the aggregator's checks: deadline, phase,
+         slot flags, score count, cid length, cid:salt format and the commit hash
+         keccak256(abi.encode(aggId, operator, scores, salt)). The replay's verdict is compared with
+         the CommitReceived / RevealReceived events of the same transaction (column "chain").
+    The ArbiterOperator's OracleCallbackAttempt/Result events (gas, success, revert reason) are
+    shown when present.
 
-HARDHAT_NETWORK=base \
-node scripts/reveal-forensics.js \
-  --aggregator 0x2f7a02298D4478213057edA5e5bEB07F20c4c054 \
-  --aggid      0x56fcb9c02f8cd5b682c6cc50d2f64d3e7330f939c4c7ae30686dba69f1eb9050 \
-  --auto-discover
+    HARDHAT_NETWORK=base_sepolia node scripts/reveal-forensics.js \
+      --aggregator 0x... --aggid 0x000...002a --auto-discover
+    (--aggid also takes a plain round number, e.g. --aggid 42)
 
-*/
+    --auto-discover  tags each fulfil tx's sender against the operators' getAuthorizedSenders()
+    --fromaddrs      comma-separated node addresses to tag against instead
+    --lookahead      blocks scanned past the round deadline (late replies, settlement)
+   ------------------------------------------------------------------------------------------- */
+const { ethers } = require("ethers");
+const { lc, getLogsChunked, makeTimestamper, decodeOperatorFulfill } = require("./lib/chain-stats-utils");
+const V2 = require("./lib/v2-reveal");
 
-require("dotenv").config();
-const hre = require("hardhat");
-const { ethers } = hre;
-const { keccak256, toUtf8Bytes } = ethers;
-const yargs = require("yargs/yargs");
-const { hideBin } = require("yargs/helpers");
-
-const lc  = (x) => (x || "").toLowerCase();
 const pad = (s, n) => String(s).padEnd(n);
+const short = (s, n) => (s && s.length > n ? s.slice(0, n - 1) + "…" : s);
+
+const OP_IFACE = new ethers.Interface([
+  "event OracleRequest(bytes32 indexed specId, address requester, bytes32 requestId, uint256 payment, address callbackAddr, bytes4 callbackFunctionId, uint256 cancelExpiration, uint256 dataVersion, bytes data)",
+  "event OracleResponse(bytes32 indexed requestId)",
+  "event OracleCallbackAttempt(bytes32 indexed requestId, address callback, bytes4 selector, uint256 gasBefore)",
+  "event OracleCallbackResult(bytes32 indexed requestId, bool success, bytes returnData, uint256 gasAfter)",
+  "function getAuthorizedSenders() view returns (address[])",
+]);
 
 function normalizeAggId(s) {
-  s = (s || "").trim();
+  s = String(s || "").trim();
+  if (/^\d+$/.test(s)) return V2.aggIdOf(BigInt(s));
   const m = s.match(/0x[0-9a-fA-F]{64}/) || s.match(/[0-9a-fA-F]{64}/);
-  if (!m) throw new Error(`--aggid must be 0x + 64 hex; got: ${s}`);
-  const hex = m[0].startsWith("0x") ? m[0] : "0x" + m[0];
-  return hex.toLowerCase();
+  if (!m) throw new Error(`--aggid must be a round number or 0x + 64 hex; got: ${s}`);
+  return lc(m[0].startsWith("0x") ? m[0] : "0x" + m[0]);
 }
 
 function hexToAscii(hex) {
@@ -39,516 +54,334 @@ function hexToAscii(hex) {
   let out = "";
   for (let i = 0; i < hex.length; i += 2) {
     const byte = parseInt(hex.slice(i, i + 2), 16);
-    if (!byte) continue;
-    out += String.fromCharCode(byte);
+    if (byte >= 32 && byte < 127) out += String.fromCharCode(byte);
   }
   return out;
 }
 
-function decodeRevertData(dataHex, contracts) {
-  if (!dataHex || typeof dataHex !== "string") return "";
+function decodeRevertData(dataHex, ifaces) {
+  if (!dataHex || dataHex === "0x") return "(no data)";
   const d = dataHex.startsWith("0x") ? dataHex : "0x" + dataHex;
-  const sel = d.slice(0, 10);
+  const coder = ethers.AbiCoder.defaultAbiCoder();
   try {
-    if (sel === "0x08c379a0") {
-      const [reason] = ethers.AbiCoder.defaultAbiCoder().decode(["string"], "0x" + d.slice(10));
-      return String(reason);
-    }
-    if (sel === "0x4e487b71") {
-      const [code] = ethers.AbiCoder.defaultAbiCoder().decode(["uint256"], "0x" + d.slice(10));
-      return `panic code ${code}`;
-    }
-  } catch {}
-  // Try custom error decoding against known contract interfaces
-  if (contracts) {
-    for (const c of contracts) {
-      try {
-        const parsed = c.interface.parseError(d);
-        if (parsed) {
-          const args = parsed.args.length ? `(${parsed.args.join(", ")})` : "";
-          return parsed.name + args;
-        }
-      } catch {}
-    }
+    if (d.startsWith("0x08c379a0")) return String(coder.decode(["string"], "0x" + d.slice(10))[0]);
+    if (d.startsWith("0x4e487b71")) return `panic code ${coder.decode(["uint256"], "0x" + d.slice(10))[0]}`;
+  } catch { /* fall through */ }
+  for (const i of ifaces) {
+    try { const p = i.parseError(d); if (p) return p.name + (p.args.length ? `(${p.args.join(", ")})` : ""); } catch { /* next */ }
   }
   return d.length > 74 ? `revert data ${d.slice(0, 74)}…` : d;
 }
 
-(async () => {
+const before = (a, b) => a[0] < b[0] || (a[0] === b[0] && a[1] < b[1]);
+
+/**
+ * Core: gather and replay one round. Returns a plain object (printed by printReport):
+ * { aggregator, aggId, roundId, jury, info, phase, outcome, slots[], expected[] }
+ * opts: { provider, aggregator, aggId, aggAbi, fromaddrs: [], autoDiscover, lookahead, toBlock, chunk }
+ */
+async function forensics(opts) {
+  const { provider, aggAbi } = opts;
+  const AGG = ethers.getAddress(opts.aggregator);
+  const AGG_LC = lc(AGG);
+  const aggId = normalizeAggId(opts.aggId);
+  const roundId = V2.roundIdOf(aggId);
+  const agg = new ethers.Contract(AGG, aggAbi, provider);
+  const lookahead = opts.lookahead ?? 1500;
+
+  const ri = await agg.getRoundInfo(aggId);
+  const info = {
+    phase: Number(ri.phase), requestBlock: Number(ri.requestBlock), closeBlock: Number(ri.closeBlock),
+    deadline: Number(ri.deadline), windowEnd: Number(ri.windowEnd), commits: Number(ri.commits),
+    requestTime: Number(ri.requestTime), sealedHash: ri.sealedHash,
+  };
+  if (info.phase === 0) throw new Error(`round ${roundId} unknown to aggregator ${AGG}`);
+  const j = await agg.getJury(aggId);
+  const jury = { K: Number(j.K), M: Number(j.M), N: Number(j.N), P: Number(j.P), timeout: Number(j.timeout) };
+
+  /* ── scan range: request block .. deadline (estimated as a block) + lookahead ── */
+  const latest = await provider.getBlockNumber();
+  let to = opts.toBlock ?? latest;
+  if (opts.toBlock == null && info.deadline) {
+    const T = await makeTimestamper(provider, Math.max(0, info.requestBlock - 1), latest);
+    const dlBlock = info.requestBlock + Math.ceil((info.deadline - info.requestTime) / Math.max(T.blockTime, 1e-3));
+    to = Math.min(latest, dlBlock + lookahead);
+  }
+  const from = info.requestBlock;
+
+  /* ── aggregator events for this round (all are indexed by aggId) ── */
+  const names = ["JuryDrawn", "BasePayment", "SlotSkipped", "CommitReceived", "CommitWindowClosed", "CommitPhaseComplete",
+    "RevealReceived", "FulfillAIEvaluation", "EvaluationFailed", "RoundSettled", "RoundCancelled"];
+  const topics = names.map((n) => agg.interface.getEvent(n).topicHash);
+  const logs = (await getLogsChunked(provider, { address: AGG, topics: [topics, aggId] }, from, to, opts.chunk ?? 10000, "aggregator"))
+    .sort((a, b) => a.blockNumber - b.blockNumber || a.index - b.index);
+  const evs = logs.map((l) => ({ ...agg.interface.parseLog(l), pos: [l.blockNumber, l.index], tx: l.transactionHash, block: l.blockNumber }));
+  const ev1 = (n) => evs.find((e) => e.name === n);
+  const drawn = ev1("JuryDrawn");
+  const promoted = ev1("CommitPhaseComplete");
+
+  // phase timeline (what fulfill saw): each entry is [pos, phase]
+  const timeline = [];
+  if (drawn) timeline.push([drawn.pos, 3]);
+  for (const e of evs) {
+    if (e.name === "CommitWindowClosed") timeline.push([e.pos, 4]);
+    if (e.name === "CommitPhaseComplete") timeline.push([e.pos, 5]);
+    if (e.name === "FulfillAIEvaluation") timeline.push([e.pos, 6]);
+    if (e.name === "EvaluationFailed") timeline.push([e.pos, 8]);
+    if (e.name === "RoundSettled") timeline.push([e.pos, e.args.failed ? 8 : 7]);
+  }
+  const phaseAt = (pos) => { let p = 1; for (const [q, ph] of timeline) if (before(q, pos)) p = ph; return p; };
+
+  /* ── slots ── */
+  const keeper = new ethers.Contract(await agg.keeper(),
+    ["function oracleJob(bytes32) view returns (address, bytes32)"], provider);
+  const slots = [];
+  for (let i = 0; i < jury.K; i++) {
+    const s = await agg.getSlot(aggId, i);
+    let jobId = null;
+    if (s.key !== ethers.ZeroHash) { try { jobId = lc((await keeper.oracleJob(s.key))[1]); } catch { /* keeper changed */ } }
+    slots.push({
+      slot: i, operator: lc(s.oracle), key: lc(s.key), jobId, payee: lc(s.payee), flags: Number(s.flags),
+      qcode: Number(s.qcode), commitHash: lc(s.commitHash), fee: s.fee,
+      commitId: V2.requestIdFor(AGG, roundId, i, false), revealId: V2.requestIdFor(AGG, roundId, i, true),
+      skipped: evs.filter((e) => e.name === "SlotSkipped" && Number(e.args.pollIndex) === i).map((e) => V2.SKIP_REASONS[Number(e.args.reason)] || `reason ${e.args.reason}`),
+      commit: null, reveal: null,
+    });
+  }
+
+  /* ── OracleRequest events in the draw and promote transactions: confirm the computed ids ── */
+  const reqTopic = OP_IFACE.getEvent("OracleRequest").topicHash;
+  const seenReq = new Map();   // requestId -> {operator, specId, cbAddr, cbFunc, block}
+  for (const e of [drawn, promoted].filter(Boolean)) {
+    const rc = await provider.getTransactionReceipt(e.tx);
+    for (const l of rc.logs) {
+      if (l.topics[0] !== reqTopic) continue;
+      try {
+        const p = OP_IFACE.parseLog(l);
+        if (lc(p.args.requester) !== AGG_LC) continue;
+        seenReq.set(lc(p.args.requestId), {
+          operator: lc(l.address), specId: lc(p.args.specId), cbAddr: lc(p.args.callbackAddr),
+          cbFunc: lc(p.args.callbackFunctionId), block: l.blockNumber,
+        });
+      } catch { /* not an operator request */ }
+    }
+  }
+  const FULFILL_SEL = lc(agg.interface.getFunction("fulfill").selector);
+
+  /* ── replies: OracleResponse(requestId) at the slot's operator -> fulfil tx ── */
+  const respTopic = OP_IFACE.getEvent("OracleResponse").topicHash;
+  const attempts = [];
+  const blockTs = new Map();
+  const tsOf = async (n) => { if (!blockTs.has(n)) blockTs.set(n, (await provider.getBlock(n)).timestamp); return blockTs.get(n); };
+  for (const s of slots) {
+    for (const kind of ["commit", "reveal"]) {
+      const id = kind === "commit" ? s.commitId : s.revealId;
+      const req = seenReq.get(id);
+      const operator = req?.operator || s.operator;
+      const st = { kind, requestId: id, requested: !!req, req, operator, reply: null };
+      s[kind] = st;
+      if (!operator || operator === lc(ethers.ZeroAddress)) continue;
+      let rl = [];
+      try {
+        rl = await getLogsChunked(provider, { address: ethers.getAddress(operator), topics: [respTopic, id] },
+          drawn ? drawn.block : from, to, opts.chunk ?? 10000, "operator");
+      } catch { /* RPC refused */ }
+      if (!rl.length) continue;
+      const log = rl[0];
+      const [tx, rc] = await Promise.all([provider.getTransaction(log.transactionHash), provider.getTransactionReceipt(log.transactionHash)]);
+      const r = {
+        hash: tx.hash, from: lc(tx.from), nonce: tx.nonce, status: rc.status, block: rc.blockNumber,
+        ts: await tsOf(rc.blockNumber), pos: [log.blockNumber, log.index], sig: (tx.data || "0x").slice(0, 10),
+        cbAttemptGas: null, cbSuccess: null, cbReason: null, dec: null, decodeError: null,
+      };
+      try { r.dec = decodeOperatorFulfill(tx.data); } catch (e) { r.decodeError = e.message; }
+      for (const lg of rc.logs) {
+        if (lc(lg.address) !== operator || lc(lg.topics[1]) !== id) continue;
+        try {
+          const p = OP_IFACE.parseLog(lg);
+          if (p.name === "OracleCallbackAttempt") r.cbAttemptGas = p.args.gasBefore.toString();
+          if (p.name === "OracleCallbackResult") {
+            r.cbSuccess = p.args.success;
+            if (!p.args.success) r.cbReason = decodeRevertData(p.args.returnData, [agg.interface]);
+          }
+        } catch { /* other event */ }
+      }
+      // the aggregator's own events in the same transaction for this slot
+      r.chain = evs.filter((e) => e.tx === tx.hash && (e.name === "CommitReceived" || e.name === "RevealReceived") &&
+        Number(e.args.pollIndex) === s.slot);
+      r.refOpen = (await agg.requestRef(id)) !== 0n;   // still set: the aggregator's call reverted
+      st.reply = r;
+      attempts.push({ s, st, r });
+    }
+  }
+
+  /* ── replay in chain order ── */
+  attempts.sort((a, b) => (before(a.r.pos, b.r.pos) ? -1 : 1));
+  const committed = new Set(), revealed = new Set();
+  for (const { s, st, r } of attempts) {
+    const v = (verdict, accepted = false, extra = {}) => Object.assign(r, { verdict, accepted, ...extra });
+    if (r.cbSuccess === false) { v(`aggregator reverted: ${r.cbReason}`); continue; }
+    if (r.refOpen) { v("aggregator call reverted (request still open)"); continue; }
+    if (!r.dec) { v(`undecodable fulfil (${short(r.decodeError || "", 40)})`); continue; }
+    if (r.dec.requestId !== st.requestId) { v("inner requestId differs"); continue; }
+    if (r.dec.callback !== AGG_LC) { v("callback is not this aggregator"); continue; }
+    if (info.deadline && r.ts > info.deadline) { v(`past deadline (+${r.ts - info.deadline}s)`); continue; }
+    const scores = r.dec.scores;
+    const ph = phaseAt(r.pos);
+    r.phaseSeen = V2.PHASES[ph] || String(ph);
+    if (V2.isCommitShaped(scores, r.dec.cid)) {
+      r.shape = "commit";
+      if (ph !== 3) v(`commit in phase ${r.phaseSeen}`);
+      else if (BigInt(scores[0]) === 0n) v("zero commit hash");
+      else if (committed.has(s.slot)) v("already committed");
+      else { committed.add(s.slot); v("committed", true); }
+    } else {
+      r.shape = "reveal";
+      if (ph !== 5 && ph !== 6) v(`reveal in phase ${r.phaseSeen}`);
+      else if (!(s.flags & V2.SLOT_FLAGS.PROMOTED)) v("slot not promoted");
+      else if (revealed.has(s.slot)) v("already revealed");
+      else {
+        const c = V2.checkReveal({ aggId, operator: st.operator, scores, cid: r.dec.cid, commitHash: s.commitHash });
+        r.cidOnly = c.cid;
+        if (!c.ok) v(c.reason);
+        else {
+          revealed.add(s.slot);
+          v(ph === 5 ? "counted" : `late (after final, q=${V2.QCODES[s.qcode] || s.qcode})`, true, { clamped: c.clamped });
+        }
+      }
+    }
+    const want = r.shape === "commit" ? "CommitReceived" : "RevealReceived";
+    const onChain = r.chain.some((e) => e.name === want);
+    r.chainAgrees = onChain === r.accepted;
+  }
+
+  /* ── per-slot diagnosis ── */
+  for (const s of slots) {
+    const c = s.commit.reply, rv = s.reveal.reply;
+    s.diagnosis =
+      s.skipped.length && !(s.flags & V2.SLOT_FLAGS.DISPATCHED) ? `skipped at draw: ${s.skipped.join(", ")}` :
+      !(s.flags & V2.SLOT_FLAGS.COMMITTED) ? (c ? `commit ignored: ${c.verdict}` : "no commit reply") :
+      !(s.flags & V2.SLOT_FLAGS.PROMOTED) ? (promoted ? "committed, not promoted" : "committed (round not promoted)") :
+      s.flags & V2.SLOT_FLAGS.COUNTED ? "OK (counted)" :
+      s.flags & V2.SLOT_FLAGS.REVEALED ? `OK (late reveal, q=${V2.QCODES[s.qcode] || s.qcode})` :
+      s.skipped.includes(V2.SKIP_REASONS[3]) ? "reveal dispatch reverted" :
+      rv ? `reveal ignored: ${rv.verdict}` : "no reveal reply";
+    if ([c, rv].some((r) => r && r.chainAgrees === false)) s.diagnosis += " | REPLAY DISAGREES WITH CHAIN";
+    if (rv?.clamped) s.diagnosis += ` | ${rv.clamped} score(s) clamped to 1e34`;
+  }
+
+  /* ── expected node senders ── */
+  let expected = (opts.fromaddrs || []).map((a) => lc(ethers.getAddress(a)));
+  if (opts.autoDiscover) {
+    const ops = [...new Set(slots.map((s) => s.operator).filter((o) => o && o !== lc(ethers.ZeroAddress)))];
+    const found = new Set();
+    for (const o of ops) {
+      try {
+        const c = new ethers.Contract(ethers.getAddress(o), OP_IFACE, provider);
+        for (const a of await c.getAuthorizedSenders()) found.add(lc(a));
+      } catch { /* not a Chainlink Operator */ }
+    }
+    expected = [...found];
+  }
+
+  const ph = info.phase;
+  const failedEv = evs.find((e) => e.name === "EvaluationFailed");
+  const outcome =
+    ph === 6 || ph === 7 ? `COMPLETED${ph === 7 ? " (settled)" : " (awaiting settlement)"}` :
+    ph === 8 ? `FAILED${failedEv ? ` in phase ${V2.PHASES[Number(failedEv.args.phase)] || failedEv.args.phase}` : ""}` :
+    ph === 9 ? "CANCELLED" : `IN PROGRESS (phase ${V2.PHASES[ph] || ph})`;
+
+  return {
+    aggregator: AGG, aggId, roundId: roundId.toString(), jury, info, phase: V2.PHASES[ph] || String(ph), outcome,
+    range: { from, to }, fulfillSelector: FULFILL_SEL, drawBlock: drawn?.block ?? null, promoteBlock: promoted?.block ?? null,
+    finalizeBlock: ev1("FulfillAIEvaluation")?.block ?? null, slots, expected,
+  };
+}
+
+function printReport(R, log = console.log) {
+  const F = V2.SLOT_FLAGS;
+  const list = (f) => R.slots.filter(f).map((s) => s.slot);
+  log(`Round ${R.roundId} (${R.aggId}) on ${R.aggregator}`);
+  log(`  jury K=${R.jury.K} M=${R.jury.M} N=${R.jury.N} P=${R.jury.P} timeout=${R.jury.timeout}s; phase ${R.phase}; ` +
+    `blocks: request ${R.info.requestBlock}, draw ${R.drawBlock ?? "-"}, close ${R.info.closeBlock || "-"}, ` +
+    `promote ${R.promoteBlock ?? "-"}, final ${R.finalizeBlock ?? "-"}; deadline ${R.info.deadline || "-"}; scanned ${R.range.from}..${R.range.to}`);
+  log("Dispatched slots:", list((s) => s.flags & F.DISPATCHED));
+  log("Committed slots :", list((s) => s.flags & F.COMMITTED));
+  log("Promoted slots  :", list((s) => s.flags & F.PROMOTED));
+  log("Counted slots   :", list((s) => s.flags & F.COUNTED));
+  log("Late reveals    :", list((s) => (s.flags & F.REVEALED) && !(s.flags & F.COUNTED)));
+  log("Missing slots   :", list((s) => (s.flags & F.PROMOTED) && !(s.flags & F.REVEALED)));
+  log("RequestIds (slot -> reveal requestId @ operator):");
+  for (const s of R.slots.filter((x) => x.flags & F.PROMOTED)) log(`  ${s.slot}: ${s.revealId} @ ${s.operator}`);
+
+  const exp = new Set(R.expected);
+  const tag = (a) => (!a ? "-" : !exp.size ? ethers.getAddress(a) : `${ethers.getAddress(a)} (${exp.has(a) ? "expected" : "UNEXPECTED"})`);
+  const yn = (b) => (b == null ? "-" : b ? "yes" : "NO");
+
+  log(`\nAggregator fulfill selector (expected by job): ${R.fulfillSelector}`);
+  log("\nCommit stage (slot, flags DCPRK, commit request seen, reply block, lag from draw, verdict):");
+  for (const s of R.slots) {
+    const r = s.commit.reply;
+    log(" ", pad(s.slot, 4), pad(V2.flagString(s.flags), 6), pad(yn(s.commit.requested), 4),
+      pad(r ? r.block : "-", 9), pad(r && R.drawBlock != null ? r.block - R.drawBlock : "-", 6),
+      r ? r.verdict + (r.chainAgrees === false ? " (chain disagrees)" : "") : (s.skipped.length ? `skipped: ${s.skipped.join(", ")}` : "no reply"));
+  }
+
+  log("\nReveal stage (promoted slots):");
+  log(pad("slot", 4), pad("operator", 42), pad("requestId", 66), pad("promBlk", 8), pad("jobId", 34),
+    pad("cbAddrOK", 8), pad("cbFuncOK", 8), pad("reqIdOK", 8), pad("aggCounted", 12), pad("cbAttemptGas", 12),
+    pad("cbSuccess", 10), pad("reason/return", 34), pad("opTx(hash…)", 20), pad("block", 8), pad("lag", 5),
+    pad("from", 53), pad("nonce", 6), pad("status", 6), pad("op.sig", 10), pad("phase", 8), pad("scores", 16),
+    pad("cid", 36), pad("verdict", 28));
+  for (const s of R.slots.filter((x) => x.flags & F.PROMOTED)) {
+    const q = s.reveal.req, r = s.reveal.reply;
+    const jobId = s.jobId || q?.specId;
+    const jobShow = jobId ? `${hexToAscii(jobId) || "?"} (${jobId.slice(0, 10)}…)` : "-";
+    const scores = r?.dec ? `${r.dec.scores.length}:[${r.dec.scores.slice(0, 3).join(",")}${r.dec.scores.length > 3 ? "…" : ""}]` : "-";
+    const cid = r?.dec ? (r.cidOnly ?? r.dec.cid) || "(empty)" : "-";
+    log(pad(s.slot, 4), pad(s.operator, 42), pad(s.revealId, 66), pad(R.promoteBlock ?? "-", 8), pad(short(jobShow, 33), 34),
+      pad(q ? yn(q.cbAddr === lc(R.aggregator)) : "-", 8), pad(q ? yn(q.cbFunc === R.fulfillSelector) : "-", 8),
+      pad(yn(s.reveal.requested), 8),
+      pad(s.flags & F.COUNTED ? "counted" : s.flags & F.REVEALED ? "late" : "no", 12),
+      pad(r?.cbAttemptGas ?? "-", 12), pad(r ? yn(r.cbSuccess) : "-", 10), pad(short(r?.cbReason || "-", 33), 34),
+      pad(r ? r.hash.slice(0, 18) + "…" : "-", 20), pad(r ? r.block : "-", 8),
+      pad(r && R.promoteBlock != null ? r.block - R.promoteBlock : "-", 5), pad(r ? tag(r.from) : "-", 53),
+      pad(r ? r.nonce : "-", 6), pad(r ? r.status : "-", 6), pad(r ? r.sig : "-", 10), pad(r?.phaseSeen || "-", 8),
+      pad(scores, 16), pad(short(cid, 35), 36), pad(s.diagnosis, 28));
+  }
+
+  log("\nPer-slot diagnosis:");
+  for (const s of R.slots) log(`  ${pad(s.slot, 3)} ${pad(V2.flagString(s.flags), 6)} ${s.diagnosis}`);
+  log("\nOutcome:", R.outcome);
+}
+
+if (require.main === module) {
+  const yargs = require("yargs/yargs");
+  const { hideBin } = require("yargs/helpers");
   const argv = yargs(hideBin(process.argv))
     .option("aggregator", { type: "string", demandOption: true })
-    .option("aggid",      { type: "string", demandOption: true })
-    .option("fromaddrs",  { type: "string", default: "" })
-    .option("auto-discover", { type: "boolean", default: false, description: "Automatically discover expected addresses from oracle operators" })
-    .option("lookahead",  { type: "number", default: 1500 })
+    .option("aggid", { type: "string", demandOption: true, desc: "0x + 64 hex, or the round number" })
+    .option("fromaddrs", { type: "string", default: "" })
+    .option("auto-discover", { type: "boolean", default: false, description: "Tag senders against the operators' getAuthorizedSenders()" })
+    .option("lookahead", { type: "number", default: 1500, desc: "blocks scanned past the round deadline" })
+    .option("to-block", { type: "number" })
+    .option("chunk", { type: "number", default: 10000 })
+    .option("json-out", { type: "string" })
     .strict().argv;
-
-  const provider = ethers.provider;
-  const aggAbi   = (await hre.artifacts.readArtifact("ReputationAggregator")).abi;
-  const agg      = new ethers.Contract(argv.aggregator, aggAbi, provider);
-
-  const AGG_ADDR    = ethers.getAddress(argv.aggregator);
-  const AGG_ADDR_LC = lc(AGG_ADDR);
-  const aggId       = normalizeAggId(argv.aggid);
-
-  // Auto-discover expected addresses or use provided ones
-  let EXPECTED = [];
-  let EXPECTED_LC = new Set();
-  
-  if (argv.autoDiscover) {
-    console.log("Auto-discovering expected addresses from oracle operators...");
-    
-    const latest = await provider.getBlockNumber();
-    const fromBlock = Math.max(0, latest - 50_000);
-    
-    // Get all OracleSelected events for this aggId to find operator addresses
-    const topicOracleSel = agg.interface.getEvent("OracleSelected").topicHash;
-    const selLogs = await provider.getLogs({
-      address: AGG_ADDR,
-      topics: [topicOracleSel, aggId],
-      fromBlock, toBlock: "latest"
+  (async () => {
+    require("dotenv").config();
+    const hre = require("hardhat");
+    const aggAbi = (await hre.artifacts.readArtifact("ReputationAggregator")).abi;
+    const R = await forensics({
+      provider: hre.ethers.provider, aggregator: argv.aggregator, aggId: argv.aggid, aggAbi,
+      fromaddrs: argv.fromaddrs.split(",").map((s) => s.trim()).filter(Boolean),
+      autoDiscover: argv.autoDiscover, lookahead: argv.lookahead, toBlock: argv.toBlock, chunk: argv.chunk,
     });
-    
-    const operatorAddresses = new Set();
-    for (const log of selLogs) {
-      const parsed = agg.interface.parseLog(log);
-      operatorAddresses.add(ethers.getAddress(parsed.args.oracle));
+    printReport(R);
+    if (argv.jsonOut) {
+      require("fs").writeFileSync(argv.jsonOut, JSON.stringify(R, (_, v) => (typeof v === "bigint" ? v.toString() : v), 2));
     }
-    
-    EXPECTED = Array.from(operatorAddresses);
-    EXPECTED_LC = new Set(EXPECTED.map(lc));
-    
-    console.log(`Discovered ${EXPECTED.length} oracle operator addresses:`, EXPECTED);
-  } else if (argv.fromaddrs) {
-    EXPECTED = (argv.fromaddrs || "")
-      .split(",").map(s => s.trim()).filter(Boolean)
-      .map(ethers.getAddress);
-    EXPECTED_LC = new Set(EXPECTED.map(lc));
-  }
+  })().catch((e) => { console.error(e); process.exit(1); });
+}
 
-  /* ── Topics / ABIs ─────────────────────────────────────────── */
-
-  // Aggregator events
-  const topicRevealReq      = agg.interface.getEvent("RevealRequestDispatched").topicHash;
-  const topicRecorded       = agg.interface.getEvent("NewOracleResponseRecorded").topicHash;
-  const topicEvalFailed     = agg.interface.getEvent("EvaluationFailed").topicHash;
-  const topicFulfilledAgg   = agg.interface.getEvent("FulfillAIEvaluation").topicHash;
-  const topicTimedOut       = agg.interface.getEvent("EvaluationTimedOut").topicHash;
-  const topicOracleSel      = agg.interface.getEvent("OracleSelected").topicHash;
-
-  const topicHashMismatch   = agg.interface.getEvent("RevealHashMismatch").topicHash;
-  const topicInvalidFmt     = agg.interface.getEvent("InvalidRevealFormat").topicHash;
-  const topicTooMany        = agg.interface.getEvent("RevealTooManyScores").topicHash;
-  const topicWrongCount     = agg.interface.getEvent("RevealWrongScoreCount").topicHash;
-  const topicTooFew         = agg.interface.getEvent("RevealTooFewScores").topicHash;
-
-  // ChainlinkClient events on consumer
-  const TOPIC_CL_REQUESTED  = keccak256(toUtf8Bytes("ChainlinkRequested(bytes32)"));
-  const TOPIC_CL_FULFILLED  = keccak256(toUtf8Bytes("ChainlinkFulfilled(bytes32)"));
-
-  // ArbiterOperator events
-  const topicOracleRequest  = keccak256(toUtf8Bytes(
-    "OracleRequest(bytes32,address,bytes32,uint256,address,bytes4,uint256,uint256,bytes)"
-  ));
-  const topicOracleResponse = keccak256(toUtf8Bytes(
-    "OracleResponse(bytes32)"
-  ));
-  const topicCallbackAttempt = keccak256(toUtf8Bytes(
-    "OracleCallbackAttempt(bytes32,address,bytes4,uint256)"
-  ));
-  const topicCallbackResult  = keccak256(toUtf8Bytes(
-    "OracleCallbackResult(bytes32,bool,bytes,uint256)"
-  ));
-
-  // Interfaces
-  const operatorIface = new ethers.Interface([
-    "event OracleRequest(bytes32 indexed specId, address requester, bytes32 requestId, uint256 payment, address callbackAddr, bytes4 callbackFunctionId, uint256 cancelExpiration, uint256 dataVersion, bytes data)",
-    "event OracleResponse(bytes32 indexed requestId)",
-    "event OracleCallbackAttempt(bytes32 indexed requestId, address callback, bytes4 selector, uint256 gasBefore)",
-    "event OracleCallbackResult(bytes32 indexed requestId, bool success, bytes returnData, uint256 gasAfter)"
-  ]);
-
-  // Decode OracleRequest.data payload (CBOR-decoded data already used by node; this is to get cb targets)
-  const decodeOracleRequestData = (dataHex) => {
-    const coder = ethers.AbiCoder.defaultAbiCoder();
-    return coder.decode(
-      ["address","bytes32","uint256","address","bytes4","uint256","uint256","bytes"],
-      dataHex
-    );
-  };
-
-  // Decode Operator tx input & nested consumer tuple
-  const opFulfillIface = new ethers.Interface([
-    "function fulfillOracleRequestV(bytes32 requestId,uint256 payment,address callbackAddress,bytes4 callbackFunctionId,uint256 expiration,bytes data)"
-  ]);
-  const consumerDataTypes = ["bytes32","uint256[]","string"]; // (requestId, value, cid)
-  const AGG_FULFILL_SELECTOR = ethers.id("fulfill(bytes32,uint256[],string)").slice(0, 10);
-
-  /* ── Gather dispatches for this aggId ─────────────────────── */
-
-  const latest    = await provider.getBlockNumber();
-  const fromBlock = Math.max(0, latest - 50_000);
-
-  const dispLogs = await provider.getLogs({
-    address: AGG_ADDR,
-    topics: [topicRevealReq, aggId],
-    fromBlock, toBlock: "latest"
-  });
-  if (dispLogs.length === 0) {
-    console.log("No RevealRequestDispatched found for this aggId in recent blocks.");
-    process.exit(0);
-  }
-  const dispatches = dispLogs.map(l => {
-    const p = agg.interface.parseLog(l);
-    return { slot: Number(p.args.pollIndex), commitHash: p.args.commitHash, blockNumber: l.blockNumber, txHash: l.transactionHash };
-  });
-  const dispatchedSlots = [...new Set(dispatches.map(d => d.slot))].sort((a,b)=>a-b);
-
-  // Which slots recorded?
-  const recLogsRaw = await provider.getLogs({
-    address: AGG_ADDR,
-    topics: [topicRecorded],
-    fromBlock, toBlock: "latest"
-  });
-  const recordedSlots = new Set();
-  const recordedBySlot = new Map();
-  for (const l of recLogsRaw) {
-    try {
-      const p = agg.interface.parseLog(l);
-      const parent = (await agg.requestIdToAggregatorId(p.args.requestId)).toLowerCase();
-      if (parent === aggId) {
-        const s = Number(p.args.pollIndex);
-        recordedSlots.add(s);
-        recordedBySlot.set(s, { requestId: lc(p.args.requestId), blockNumber: l.blockNumber, txHash: l.transactionHash });
-      }
-    } catch {}
-  }
-  const missingSlots = dispatchedSlots.filter(s => !recordedSlots.has(s));
-
-  console.log("Dispatched slots:", dispatchedSlots);
-  console.log("Recorded slots  :", [...recordedSlots].sort((a,b)=>a-b));
-  console.log("Missing slots   :", missingSlots);
-
-  // slot → operator via OracleSelected
-  const slotToOperator = new Map();
-  const selLogs = await provider.getLogs({
-    address: AGG_ADDR,
-    topics: [topicOracleSel, aggId],
-    fromBlock, toBlock: "latest"
-  });
-  for (const l of selLogs) {
-    const p = agg.interface.parseLog(l);
-    slotToOperator.set(Number(p.args.pollIndex), lc(p.args.oracle));
-  }
-
-  /* ── Recover requestIds from ChainlinkRequested (consumer) ─── */
-
-  const slotToReq = new Map(); // slot -> { requestId, operator, dispatchBlock }
-  for (const d of dispatches) {
-    const rcpt = await provider.getTransactionReceipt(d.txHash);
-
-    // Aggregator → ChainlinkRequested
-    for (const log of rcpt.logs) {
-      if (lc(log.address) !== AGG_ADDR_LC) continue;
-      if (log.topics[0] !== TOPIC_CL_REQUESTED) continue;
-      const requestId = (log.topics[1] || "").toLowerCase();
-      const parent = (await agg.requestIdToAggregatorId(requestId)).toLowerCase();
-      if (parent !== aggId) continue;
-      const slot = Number(await agg.requestIdToPollIndex(requestId));
-      const operator = slotToOperator.get(slot) || "-";
-      slotToReq.set(slot, { requestId, operator, dispatchBlock: d.blockNumber });
-    }
-  }
-
-  console.log("RequestIds (slot -> requestId @ operator):");
-  if (slotToReq.size === 0) {
-    console.log("  (none recovered; check if ChainlinkRequested is emitted in your build)");
-  } else {
-    [...slotToReq.entries()].sort((a,b)=>a[0]-b[0]).forEach(([slot, x]) =>
-      console.log(`  ${slot}: ${x.requestId} @ ${x.operator}`)
-    );
-  }
-
-  /* ── Decode OperatorRequest at dispatch (specId/cb targets) ─ */
-
-  const perSlotCb = new Map(); // slot -> { jobId, cbAddr, cbFuncId }
-  for (const d of dispatches) {
-    const rcpt = await provider.getTransactionReceipt(d.txHash);
-    for (const log of rcpt.logs) {
-      if (log.topics[0] !== topicOracleRequest) continue;
-      // ABI parse or fallback
-      let specId, requester, requestId, cbAddr, cbFuncId;
-      try {
-        const parsed = operatorIface.parseLog(log);
-        specId   = lc(parsed.args.specId);
-        requester= lc(parsed.args.requester);
-        requestId= lc(parsed.args.requestId);
-        cbAddr   = lc(parsed.args.callbackAddr);
-        cbFuncId = lc(ethers.hexlify(parsed.args.callbackFunctionId));
-      } catch {
-        // Manual fallback for safety
-        if (log.topics.length >= 2) specId = lc(log.topics[1]);
-        try {
-          const [reqr, rid, , cba, cbf] = decodeOracleRequestData(log.data);
-          requester= lc(reqr);
-          requestId= lc(rid);
-          cbAddr   = lc(cba);
-          cbFuncId = lc(ethers.hexlify(cbf));
-        } catch { continue; }
-      }
-      const parent = (await agg.requestIdToAggregatorId(requestId)).toLowerCase();
-      if (parent !== aggId) continue;
-      const slot = Number(await agg.requestIdToPollIndex(requestId));
-      perSlotCb.set(slot, { jobId: specId || "-", cbAddr: cbAddr || "-", cbFuncId: cbFuncId || "-" });
-    }
-  }
-
-  /* ── Failure-guard events emitted by consumer (if any) ────── */
-
-  const failureFilter = {
-    address: AGG_ADDR,
-    topics: [[topicHashMismatch, topicInvalidFmt, topicTooMany, topicWrongCount, topicTooFew], aggId],
-    fromBlock, toBlock: "latest"
-  };
-  const failureLogs = await provider.getLogs(failureFilter);
-  const perSlotFailures = new Map();
-  for (const l of failureLogs) {
-    const p = agg.interface.parseLog(l);
-    const s = Number(p.args.pollIndex);
-    const name = p.name;
-    const arr = perSlotFailures.get(s) || [];
-    arr.push(name);
-    perSlotFailures.set(s, arr);
-  }
-
-  /* ── Find OperatorResponse tx per requestId ───────────────── */
-
-  const firstDisp   = Math.min(...dispatches.map(d => d.blockNumber));
-  const lastDisp    = Math.max(...dispatches.map(d => d.blockNumber));
-  const searchStart = Math.max(0, firstDisp - 600);
-  const searchEnd   = lastDisp + argv.lookahead;
-
-  async function getOperatorResponseTx(operator, requestIdLower) {
-    if (!operator || operator === "-") return null;
-    try {
-      const logs = await provider.getLogs({
-        address: operator,
-        topics: [topicOracleResponse, requestIdLower],
-        fromBlock: searchStart,
-        toBlock: searchEnd
-      });
-      if (logs.length === 0) return null;
-      const log = logs[0];
-      const rcpt = await provider.getTransactionReceipt(log.transactionHash);
-      const tx   = await provider.getTransaction(log.transactionHash);
-      return {
-        hash: tx.hash,
-        from: lc(tx.from),
-        to: lc(tx.to),
-        data: lc(tx.data || "0x"),
-        nonce: tx.nonce,
-        status: rcpt.status,
-        block: rcpt.blockNumber,
-        logs: rcpt.logs
-      };
-    } catch { return null; }
-  }
-
-  async function aggregatorFulfilled(requestIdLower, aroundBlock) {
-    const from = aroundBlock ? Math.max(0, aroundBlock - 6) : searchStart;
-    const to   = aroundBlock ? aroundBlock + 6 : searchEnd;
-    try {
-      const logs = await provider.getLogs({
-        address: AGG_ADDR,
-        topics: [TOPIC_CL_FULFILLED, requestIdLower],
-        fromBlock: from,
-        toBlock: to
-      });
-      return logs.length > 0;
-    } catch { return false; }
-  }
-
-  function tagEOA(addrLc) {
-    if (!addrLc) return "-";
-    const chk = ethers.getAddress(addrLc);
-    
-    // If no expected addresses configured, just return the address without tags
-    if (EXPECTED_LC.size === 0) {
-      return chk;
-    }
-    
-    const inSet = EXPECTED_LC.has(addrLc);
-    return inSet ? `${chk} (expected)` : `${chk} (UNEXPECTED)`;
-  }
-
-  /* ── Table header ─────────────────────────────────────────── */
-
-  console.log(`\nAggregator fulfill selector (expected by job): ${AGG_FULFILL_SELECTOR}\n`);
-
-  console.log("Per-slot status:");
-  console.log(
-    pad("slot", 4),
-    pad("operator", 42),
-    pad("requestId", 66),
-    pad("dispBlk", 8),
-    pad("jobId", 34),
-    pad("cbAddrOK", 8),
-    pad("cbFuncOK", 8),
-    pad("aggRecorded", 12),
-    pad("clFulfilled", 12),
-    pad("cbAttemptGas", 12),
-    pad("cbSuccess", 10),
-    pad("reason/return", 34),
-    pad("opTx(hash…)", 20),
-    pad("block", 8),
-    pad("lag", 5),
-    pad("from", 49),
-    pad("nonce", 6),
-    pad("status", 6),
-    pad("op.sig", 10),
-    pad("reqIdOK", 8),
-    pad("scores", 16),
-    pad("cid", 36),
-    pad("notes", 28)
-  );
-
-  for (const slot of dispatchedSlots) {
-    const info     = slotToReq.get(slot);
-    const rec      = recordedBySlot.get(slot);
-    const operator = (info?.operator) || slotToOperator.get(slot) || "-";
-    const dispBlk  = info?.dispatchBlock ?? dispatches.find(d => d.slot === slot)?.blockNumber ?? "-";
-    const cb       = perSlotCb.get(slot) || { jobId: "-", cbAddr: "-", cbFuncId: "-" };
-
-    const cbAddrOK = cb.cbAddr === "-" ? null : (cb.cbAddr === AGG_ADDR_LC);
-    const cbFuncOK = cb.cbFuncId === "-" ? null : (cb.cbFuncId === lc(AGG_FULFILL_SELECTOR));
-    const cbAddrMark = cbAddrOK == null ? "-" : (cbAddrOK ? "yes" : "NO");
-    const cbFuncMark = cbFuncOK == null ? "-" : (cbFuncOK ? "yes" : "NO");
-
-    let opTx = null, clFul = "-", lag = "-", sig = "-";
-    let cbAttemptGas = "-", cbSuccess = "-", cbReason = "-";
-    let reqIdOK = "-", scoresPreview = "-", cidPreview = "-";
-    let notes = perSlotFailures.get(slot)?.join(",") || "";
-
-    if (info) {
-      opTx  = await getOperatorResponseTx(operator, info.requestId);
-      if (opTx) {
-        clFul = (await aggregatorFulfilled(info.requestId, opTx.block)) ? "yes" : "no";
-        sig   = opTx.data.slice(0, 10);
-        lag   = (typeof dispBlk === "number") ? (opTx.block - dispBlk) : "-";
-
-        // Decode operator input & nested consumer tuple
-        let dec = null;
-        try { dec = opFulfillIface.decodeFunctionData("fulfillOracleRequestV", opTx.data); } catch {}
-        if (dec) {
-          const outerReqId = lc(dec.requestId);
-          const cbAddrParam = lc(dec.callbackAddress);
-          const cbFuncParam = lc(ethers.hexlify(dec.callbackFunctionId));
-
-          // nested data
-          try {
-            const [rid, arr, s] = ethers.AbiCoder.defaultAbiCoder().decode(consumerDataTypes, dec.data);
-            const innerReqId = lc(rid);
-            reqIdOK = (outerReqId === innerReqId) ? "yes" : "NO";
-            const n = arr.length;
-            const pv = arr.slice(0, Math.min(n, 3)).map(x => x.toString());
-            scoresPreview = `${n}:[${pv.join(",")}${n>3?"…":""}]`;
-            cidPreview = s ? (s.length > 34 ? (s.slice(0,34)+"…") : s) : "";
-            if (!cidPreview) cidPreview = "(empty)";
-            // also verify params match the dispatch targets (sanity)
-            if (cbAddrOK !== null && cbAddrParam !== AGG_ADDR_LC) notes += (notes ? " | " : "") + "callbackAddress(param)!=aggregator";
-            if (cbFuncOK !== null && cbFuncParam !== lc(AGG_FULFILL_SELECTOR)) notes += (notes ? " | " : "") + "callbackFuncId(param)!=expected";
-          } catch {
-            reqIdOK = "decode-failed";
-            scoresPreview = "-";
-            cidPreview = "-";
-          }
-        }
-
-        // Read Operator's callback attempt/result for this requestId from the same receipt
-        const ridTopic = info.requestId; // already 0x… lower
-        for (const lg of opTx.logs) {
-          if (lg.topics[0] === topicCallbackAttempt && lc(lg.topics[1]) === ridTopic) {
-            try {
-              const p = operatorIface.parseLog(lg);
-              cbAttemptGas = p.args.gasBefore?.toString?.() || "-";
-            } catch {}
-          }
-          if (lg.topics[0] === topicCallbackResult && lc(lg.topics[1]) === ridTopic) {
-            try {
-              const p = operatorIface.parseLog(lg);
-              cbSuccess = p.args.success ? "yes" : "no";
-              cbReason  = p.args.success ? "-" : decodeRevertData(p.args.returnData, [agg]);
-            } catch {}
-          }
-        }
-      } else {
-        clFul = (await aggregatorFulfilled(info.requestId, null)) ? "yes" : "no";
-        notes = notes || "operator did not emit OracleResponse";
-      }
-    }
-
-    const jobIdAscii = cb.jobId !== "-" ? hexToAscii(cb.jobId) : "-";
-    const jobIdShow  = cb.jobId !== "-" ? `${jobIdAscii} (${cb.jobId.slice(0,10)}…)` : "-";
-
-    const recYes = !!rec;
-
-    // Final diagnosis line stays short; the columns above are the evidence
-    const diagnosis =
-      recYes ? "OK" :
-      (cbSuccess === "no") ? "consumer reverted" :
-      (clFul === "no" && opTx) ? "operator tx mined; no ChainlinkFulfilled" :
-      notes || "-";
-
-    console.log(
-      pad(slot, 4),
-      pad(operator, 42),
-      pad(info ? info.requestId : "-", 66),
-      pad(dispBlk, 8),
-      pad(jobIdShow, 34),
-      pad(cbAddrMark, 8),
-      pad(cbFuncMark, 8),
-      pad(recYes ? "yes" : "no", 12),
-      pad(clFul, 12),
-      pad(cbAttemptGas, 12),
-      pad(cbSuccess, 10),
-      pad(cbReason.length > 32 ? (cbReason.slice(0,32)+"…") : cbReason, 34),
-      pad(opTx ? (opTx.hash.slice(0,18) + "…") : "-", 20),
-      pad(opTx ? opTx.block : "-", 8),
-      pad(lag, 5),
-      pad(opTx ? tagEOA(opTx.from) : "-", 49),
-      pad(opTx ? opTx.nonce : "-", 6),
-      pad(opTx ? opTx.status : "-", 6),
-      pad(sig, 10),
-      pad(reqIdOK, 8),
-      pad(scoresPreview, 16),
-      pad(cidPreview, 36),
-      pad(diagnosis, 28)
-    );
-  }
-
-  /* ── Outcome summary ──────────────────────────────────────── */
-  const failed = (await provider.getLogs({
-    address: AGG_ADDR,
-    topics: [topicEvalFailed, aggId],
-    fromBlock, toBlock: "latest"
-  })).length > 0;
-
-  const success = (await provider.getLogs({
-    address: AGG_ADDR,
-    topics: [topicFulfilledAgg, aggId],
-    fromBlock, toBlock: "latest"
-  })).length > 0;
-
-  const timedOut = (await provider.getLogs({
-    address: AGG_ADDR,
-    topics: [topicTimedOut, aggId],
-    fromBlock, toBlock: "latest"
-  })).length > 0;
-
-  console.log("\nOutcome:",
-    success ? "COMPLETED" :
-    timedOut ? "FAILED/TIMED OUT" :
-    failed ? "FAILED" : "UNKNOWN (still running?)"
-  );
-})();
-
+module.exports = { forensics, printReport, normalizeAggId };

@@ -379,8 +379,9 @@ functions in one protocol is an avoidable source of off-chain mismatch bugs.
   - v1's truncated SHA-256 commit and a 20-hex salt are refused;
   - `parseCidSalt` against a JavaScript reference on 600 generated inputs, with coverage counts;
   - the hex encoders against ethers.
-- `scripts/arbiter-noise.js` and `scripts/lib/chain-stats-utils.js` still parse v1's format, on
-  purpose: they read the live v1 history.
+- `scripts/arbiter-stats.js` and `scripts/lib/chain-stats-utils.js` still parse v1's format, on
+  purpose: they read the live v1 history. `scripts/arbiter-noise.js` and `reveal-forensics.js` read
+  v2 (`scripts/lib/v2-reveal.js`); run their v1 versions from a checkout of the v1 tag.
 
 ### Why it's deferred
 Same lockstep problem as item 4: every arbiter must switch at the same moment the new

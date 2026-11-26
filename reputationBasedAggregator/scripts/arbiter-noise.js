@@ -11,19 +11,22 @@
       them is run-to-run noise alone, i.e. sigma_within. The "same code" premise is CHECKED, not
       assumed: analyze tests whether any arbiter sits consistently above or below the others.
 
-    WHERE THE SCORES COME FROM (3 to 4 per query)
-      Each round sends reveal requests to the first M=4 committers; the aggregator finalizes on
-      the N=3rd valid reveal. A 4th reveal that arrives later is REJECTED by the aggregator
-      (AggregationComplete), but the arbiter's operator transaction still succeeds (the callback
-      failure is caught and emitted as OracleCallbackResult(success=false)), so its scores are
-      on-chain in the operator calldata. This script recovers all of them:
-        1. aggregator ChainlinkRequested(id) is paired with the RevealRequestDispatched(aggId, slot)
-           that follows it in the same transaction  -> reveal requestId -> (round, slot)
-        2. operator OracleResponse(requestId) -> the fulfill transaction
-        3. calldata fulfillOracleRequestV / fulfillOracleRequest2 -> (requestId, scores, "cid:salt")
-        4. verified against the arbiter's commit: bytes16(sha256(abi.encode(operator, scores, salt)))
-           must equal CommitReceived.commitHash for that slot, exactly as the aggregator checks.
-           A late 4th reveal is therefore as trustworthy as a counted one. Mismatches are excluded.
+    WHERE THE SCORES COME FROM (v2 aggregator: M promoted reveals per query)
+      Each round promotes M of its committers to reveal; the aggregator finalizes on the N-th valid
+      reveal and still accepts later reveals until the deadline (RevealReceived late=true, classified
+      but not counted). A reveal that arrives after the deadline, or that the aggregator ignores for
+      any other reason, still left its scores in the operator's calldata. This script recovers all
+      of them:
+        1. BasePayment(aggId, slot) marks dispatched slots and CommitPhaseComplete promoted rounds;
+           getSlot(aggId, slot) gives each slot's operator, keeper key, flags and stored commit;
+        2. the reveal request id is computed, not looked up (scripts/lib/v2-reveal.js):
+           keccak256(abi.encodePacked(aggregator, ((roundId << 8 | slot) << 1) | 1));
+        3. operator OracleResponse(requestId) -> the fulfill transaction;
+           calldata fulfillOracleRequestV / fulfillOracleRequest2 -> (requestId, scores, "cid:salt");
+        4. verified as the aggregator verifies a reveal (score count, cid:salt format, and the commit
+           keccak256(abi.encode(aggId, operator, scores, salt)) == getSlot(...).commitHash), so a
+           late or past-deadline reveal is as trustworthy as a counted one. Failures are excluded.
+      Data files written by the v1 version of this script (meta.version absent) still analyze.
 
     METRIC
       Scores are converted to shares of 100: s_c = 100 * v_c / sum(v). For each round with n >= 2
@@ -37,7 +40,7 @@
 
     USAGE
       HARDHAT_NETWORK=base node scripts/arbiter-noise.js collect \
-          --aggregator 0xd8F38bCBEE43bE3bd31655a563f20c9B3e67142a --from-block 47087827 \
+          --aggregator <v2 ReputationAggregator> --from-block <its deploy block> \
           --out noise-data.json
       node scripts/arbiter-noise.js analyze --data noise-data.json --period week \
           --nominal 80 --threshold 90 --json-out arbiter-noise.json --csv-out arbiter-noise-weekly.csv
@@ -46,8 +49,11 @@
     PASS RATE FOR ONE DECISION (--nominal N --threshold T [--band 5] [--attempt-cost-usd 0.59])
       Uses the rounds whose center (median, and separately mean) of outcome --outcome-index is
       within +/- band of N. Each round's actual spread is shifted to center on N, clipped to
-      0..100, and run through the aggregator's rule (closest pair among 3 reveals; every 3-of-4
-      subset weighted equally) to give P(final >= T): the honest pass rate for a submission whose
+      0..100, and run through the aggregator's rule (the cluster of P among the first N counted
+      reveals, ScoringLib's 1-D rule: the P closest consecutive values; every N-subset of the
+      round's reveals weighted equally; N and P default to the most common jury in the data and
+      --counted/--cluster override; v1 data gives N=3, P=2, v1's closest pair) to give
+      P(final >= T): the honest pass rate for a submission whose
       arbiters typically answer N, measured WITHOUT assuming normal noise. Also reported:
         - a 95% Wilson interval (treating the rounds as the sample size),
         - the normal sd that reproduces that pass rate (use as --sigma-within in the risk model),
@@ -60,123 +66,127 @@
         (sqrt(sigma_within^2 + sigma_between^2)); the arbiter-consistency check flags this.
       - Only reveals that reached the chain are seen. Arbiters that never reveal add nothing.
       - Rounds whose request precedes --from-block are skipped (their slots are unknown).
+      - A round's class is the class all its jurors share (the request's class is not readable);
+        arbiters that completed their exit have no classes left (arbiterClasses is emptied).
    ------------------------------------------------------------------------------------------- */
-require("dotenv").config();
 const fs = require("fs");
+const { ethers } = require("ethers");
 const yargs = require("yargs/yargs");
 const { hideBin } = require("yargs/helpers");
 const {
   lc, jsonSafe, pMap, withRetry, getLogsChunked, makeTimestamper, resolveRange,
-  OPERATOR_IFACE, decodeOperatorFulfill, parseCidSalt, revealCommitHash,
+  OPERATOR_IFACE, decodeOperatorFulfill,
   mean, variance, quantile, fmt,
 } = require("./lib/chain-stats-utils");
+const V2 = require("./lib/v2-reveal");
 
 /* ───────────────────────────── collect ───────────────────────────── */
-async function collect(argv) {
-  const hre = require("hardhat");
-  const { ethers } = hre;
-  const provider = ethers.provider;
-  const aggAbi = (await hre.artifacts.readArtifact("ReputationAggregator")).abi;
-  const keeperAbi = (await hre.artifacts.readArtifact("ReputationKeeper")).abi;
-  const agg = new ethers.Contract(argv.aggregator, aggAbi, provider);
-  const aggAddr = lc(argv.aggregator);
+/**
+ * Scan a v2 aggregator's history and recover every reveal. Returns the data object that `collect`
+ * writes ({meta, rounds}). opts: { provider, aggregator, aggAbi, fromBlock, toBlock, days, chunk,
+ * concurrency, network, log }.
+ */
+async function collectData(opts) {
+  const { provider } = opts;
+  const log = opts.log || console.log;
+  const chunk = opts.chunk ?? 10000, conc = opts.concurrency ?? 6;
+  const agg = new ethers.Contract(opts.aggregator, opts.aggAbi, provider);
+  const aggAddr = lc(opts.aggregator);
 
-  const { from, to } = await resolveRange(provider,
-    { fromBlock: argv["from-block"], toBlock: argv["to-block"], days: argv.days });
-  const timeout = Number(await agg.responseTimeoutSeconds());
+  const { from, to } = await resolveRange(provider, { fromBlock: opts.fromBlock, toBlock: opts.toBlock, days: opts.days ?? 30 });
+  // reveals can land after `to`: up to the longest timeout after the draw, plus the promotion's reveal window
+  const tailSec = Number(await agg.maxTimeout()) + Number(await agg.revealWindow()) + 60;
   const T = await makeTimestamper(provider, from, to);
-  const tail = Math.ceil((timeout + 60) / T.blockTime); // late reveals can land after `to`
   const latest = await provider.getBlockNumber();
-  const toResp = Math.min(latest, to + tail);
-  console.log(`blocks ${from}..${to} (responses to ${toResp}), block time ${T.blockTime}s`);
+  const toResp = Math.min(latest, to + Math.ceil(tailSec / Math.max(T.blockTime, 1e-3)));
+  log(`blocks ${from}..${to} (responses to ${toResp}), block time ${T.blockTime}s`);
 
   // ---- aggregator logs ----
-  const names = ["RequestAIEvaluation", "OracleSelected", "CommitReceived", "RevealRequestDispatched",
-    "NewOracleResponseRecorded", "ChainlinkRequested", "FulfillAIEvaluation"];
+  const names = ["RequestAIEvaluation", "BasePayment", "CommitReceived", "CommitPhaseComplete", "RevealReceived", "FulfillAIEvaluation"];
   const topics = names.map((n) => agg.interface.getEvent(n).topicHash);
-  const logs = await getLogsChunked(provider, { address: argv.aggregator, topics: [topics] }, from, toResp,
-    argv.chunk, "aggregator");
+  const logs = await getLogsChunked(provider, { address: opts.aggregator, topics: [topics] }, from, toResp, chunk, "aggregator");
   logs.sort((a, b) => a.blockNumber - b.blockNumber || a.index - b.index);
-  console.log(`${logs.length} aggregator logs`);
+  log(`${logs.length} aggregator logs`);
 
   const rounds = new Map();
   const R = (id) => {
     id = lc(id);
-    if (!rounds.has(id)) rounds.set(id, { aggId: id, selected: [], commits: {}, revealReqs: [] });
+    if (!rounds.has(id)) rounds.set(id, { aggId: id, dispatched: [], commits: {}, revealEv: {} });
     return rounds.get(id);
   };
-  const revealReq = new Map(); // requestId -> {aggId, slot}
-  const counted = new Set();   // requestIds the aggregator accepted
-  let pendingTx = null, pendingIds = [];
-  for (const log of logs) {
-    const ev = agg.interface.parseLog(log);
+  for (const l of logs) {
+    const ev = agg.interface.parseLog(l);
     if (!ev) continue;
-    if (log.transactionHash !== pendingTx) { pendingTx = log.transactionHash; pendingIds = []; }
     const a = ev.args;
     switch (ev.name) {
-      case "ChainlinkRequested":
-        pendingIds.push(lc(a.id));
-        break;
-      case "RevealRequestDispatched": {
-        // dispatchOracleRequest emits ChainlinkRequested, then the aggregator emits
-        // RevealRequestDispatched for the same slot: pair with the latest unpaired id.
-        const rid = pendingIds.pop();
-        if (rid) {
-          revealReq.set(rid, { aggId: lc(a.aggRequestId), slot: Number(a.pollIndex) });
-          R(a.aggRequestId).revealReqs.push({ slot: Number(a.pollIndex), requestId: rid });
-        }
-        break;
-      }
-      case "RequestAIEvaluation":
-        Object.assign(R(a.aggRequestId), { cids: [...a.cids], reqBlock: log.blockNumber });
-        break;
-      case "OracleSelected":
-        R(a.aggRequestId).selected.push({ slot: Number(a.pollIndex), oracle: lc(a.oracle), jobId: lc(a.jobId) });
-        break;
-      case "CommitReceived":
-        R(a.aggRequestId).commits[Number(a.pollIndex)] = lc(a.commitHash);
-        break;
-      case "NewOracleResponseRecorded":
-        counted.add(lc(a.requestId));
-        break;
-      case "FulfillAIEvaluation":
-        R(a.aggRequestId).finalized = true;
-        break;
+      case "RequestAIEvaluation": Object.assign(R(a.aggRequestId), { cids: [...a.cids], reqBlock: l.blockNumber }); break;
+      case "BasePayment": R(a.aggRequestId).dispatched.push(Number(a.pollIndex)); break;
+      case "CommitReceived": R(a.aggRequestId).commits[Number(a.pollIndex)] = lc(a.commitHash); break;
+      case "CommitPhaseComplete": R(a.aggRequestId).promoted = true; break;
+      case "RevealReceived": R(a.aggRequestId).revealEv[Number(a.pollIndex)] = { late: a.late, qcode: Number(a.qcode) }; break;
+      case "FulfillAIEvaluation": R(a.aggRequestId).finalized = true; break;
     }
   }
-  console.log(`${revealReq.size} reveal requests in ${[...rounds.values()].filter((r) => r.revealReqs.length).length} rounds`);
+  // only rounds requested inside [from, to] (their slots and commits are all in the scan)
+  const live = [...rounds.values()].filter((r) => r.reqBlock != null && r.reqBlock <= to);
+
+  // ---- slots of promoted rounds: operator, key, flags, stored commit ----
+  const pairs = live.filter((r) => r.promoted).flatMap((r) => r.dispatched.map((slot) => ({ r, slot })));
+  const revealReq = new Map();   // reveal requestId -> {aggId, slot}
+  await pMap(live.filter((r) => r.promoted), async (r) => {
+    const j = await withRetry(() => agg.getJury(r.aggId));
+    r.jury = { K: Number(j.K), M: Number(j.M), N: Number(j.N), P: Number(j.P) };
+  }, conc);
+  await pMap(pairs, async ({ r, slot }) => {
+    const s = await withRetry(() => agg.getSlot(r.aggId, slot));
+    (r.selected = r.selected || []).push({ slot, oracle: lc(s.oracle), key: lc(s.key), flags: Number(s.flags), commitHash: lc(s.commitHash) });
+    if (Number(s.flags) & V2.SLOT_FLAGS.PROMOTED) {
+      revealReq.set(V2.requestIdFor(opts.aggregator, V2.roundIdOf(r.aggId), slot, true), { aggId: r.aggId, slot });
+    }
+  }, conc);
+  for (const r of live) (r.selected = r.selected || []).sort((a, b) => a.slot - b.slot);
+  log(`${revealReq.size} reveal requests in ${live.filter((r) => r.promoted).length} promoted rounds`);
 
   // ---- operator OracleResponse logs -> fulfill tx per reveal requestId ----
-  const operators = [...new Set([...rounds.values()].flatMap((r) => r.selected.map((s) => s.oracle)))];
+  const operators = [...new Set(live.flatMap((r) => r.selected.map((s) => s.oracle)))].filter((o) => o !== lc(ethers.ZeroAddress));
   const respTopic = OPERATOR_IFACE.getEvent("OracleResponse").topicHash;
   const respTx = new Map();
   for (let i = 0; i < operators.length; i += 20) {
     const part = operators.slice(i, i + 20);
-    const rl = await getLogsChunked(provider, { address: part, topics: [respTopic] }, from, toResp, argv.chunk, "operators");
+    const rl = await getLogsChunked(provider, { address: part, topics: [respTopic] }, from, toResp, chunk, "operators");
     for (const l of rl) {
       const rid = lc(l.topics[1]);
-      if (revealReq.has(rid)) respTx.set(rid, { tx: l.transactionHash, block: l.blockNumber, operator: lc(l.address) });
+      if (revealReq.has(rid) && !respTx.has(rid)) respTx.set(rid, { tx: l.transactionHash, block: l.blockNumber, operator: lc(l.address) });
     }
   }
-  console.log(`${respTx.size} of ${revealReq.size} reveal requests answered on-chain (${operators.length} operators)`);
+  log(`${respTx.size} of ${revealReq.size} reveal requests answered on-chain (${operators.length} operators)`);
 
   // ---- decode + verify each answered reveal ----
-  const reveals = new Map(); // aggId -> []
+  const reveals = new Map();   // aggId -> []
   let ok = 0, bad = 0, undec = 0;
   await pMap([...respTx.entries()], async ([rid, r]) => {
     const { aggId, slot } = revealReq.get(rid);
-    const rec = { slot, requestId: rid, operator: r.operator, block: r.block, counted: counted.has(rid) };
+    const round = rounds.get(aggId);
+    const sl = round.selected.find((x) => x.slot === slot);
+    const ev = round.revealEv[slot];
+    const rec = {
+      slot, requestId: rid, operator: r.operator, block: r.block,
+      counted: !!(sl.flags & V2.SLOT_FLAGS.COUNTED), late: !!(ev && ev.late),
+      accepted: !!(sl.flags & V2.SLOT_FLAGS.REVEALED),
+    };
     try {
       const tx = await withRetry(() => provider.getTransaction(r.tx));
       const dec = decodeOperatorFulfill(tx.data);
       if (dec.requestId !== rid) throw new Error("requestId mismatch");
       if (dec.callback !== aggAddr) throw new Error("callback is not this aggregator");
       rec.scores = dec.scores;
-      const cs = parseCidSalt(dec.cid);
-      const commit = rounds.get(aggId).commits[slot];
-      if (!cs) rec.hashOk = false;
-      else if (!commit) rec.hashOk = null;
-      else rec.hashOk = revealCommitHash(r.operator, dec.scores, cs.salt) === commit;
+      const commit = sl.commitHash && BigInt(sl.commitHash) !== 0n ? sl.commitHash : round.commits[slot];
+      if (!commit) rec.hashOk = null;
+      else {
+        const c = V2.checkReveal({ aggId, operator: r.operator, scores: dec.scores, cid: dec.cid, commitHash: commit });
+        rec.hashOk = c.ok;
+        if (!c.ok) rec.rejectReason = c.reason;
+      }
       rec.hashOk === false ? bad++ : ok++;
     } catch (e) {
       rec.decodeError = String(e.shortMessage || e.message).slice(0, 120);
@@ -184,43 +194,55 @@ async function collect(argv) {
     }
     if (!reveals.has(aggId)) reveals.set(aggId, []);
     reveals.get(aggId).push(rec);
-  }, argv.concurrency);
-  console.log(`reveals: ${ok} verified/unchecked, ${bad} failed the commit check, ${undec} undecodable`);
+  }, conc);
+  log(`reveals: ${ok} verified/unchecked, ${bad} failed the reveal check, ${undec} undecodable`);
 
-  // ---- classes from the keeper registry (round class = class shared by all polled arbiters) ----
+  // ---- classes from the keeper (round class = class shared by all its jurors) ----
   const classesOf = new Map();
   try {
-    const keeper = new ethers.Contract(await agg.reputationKeeper(), keeperAbi, provider);
-    const n = Number(await keeper.getRegisteredOraclesCount());
-    await pMap([...Array(n).keys()], async (i) => {
-      const id = await withRetry(() => keeper.registeredOracles(i));
-      const cls = await withRetry(() => keeper.getOracleClasses(i));
-      classesOf.set(`${lc(id.oracle)}:${lc(id.jobId)}`, cls.map((c) => c.toString()));
-    }, argv.concurrency);
+    const keeper = new ethers.Contract(await agg.keeper(),
+      ["function arbiterClasses(bytes32) view returns (uint64[])"], provider);
+    const keys = [...new Set(live.flatMap((r) => r.selected.map((s) => s.key)))].filter((k) => BigInt(k) !== 0n);
+    await pMap(keys, async (k) => {
+      const cls = await withRetry(() => keeper.arbiterClasses(k));
+      if (cls.length) classesOf.set(k, cls.map((c) => c.toString()));
+    }, conc);
   } catch (e) {
-    console.log(`(registry read failed, classes unknown: ${e.shortMessage || e.message})`);
+    log(`(registry read failed, classes unknown: ${e.shortMessage || e.message})`);
   }
 
   const out = [];
-  for (const r of rounds.values()) {
-    if (r.reqBlock == null || !r.revealReqs.length) continue;
-    const sets = r.selected.map((s) => classesOf.get(`${s.oracle}:${s.jobId}`)).filter(Boolean);
+  for (const r of live) {
+    if (!r.promoted) continue;
+    const sets = r.selected.map((s) => classesOf.get(s.key)).filter(Boolean);
     const shared = sets.length ? sets.reduce((acc, s) => acc.filter((c) => s.includes(c))) : [];
     const rv = (reveals.get(r.aggId) || []).sort((a, b) => a.block - b.block);
     for (const v of rv) v.ts = await T.ts(v.block);
     out.push({
       aggId: r.aggId, reqBlock: r.reqBlock, reqTs: await T.ts(r.reqBlock), cids: r.cids,
       class: shared.length === 1 ? shared[0] : shared.length ? shared.join("|") : null,
-      finalized: !!r.finalized, revealRequests: r.revealReqs.length,
-      selected: r.selected, reveals: rv,
+      jury: r.jury, finalized: !!r.finalized,
+      revealRequests: r.selected.filter((s) => s.flags & V2.SLOT_FLAGS.PROMOTED).length,
+      selected: r.selected.map(({ slot, oracle, key, flags }) => ({ slot, oracle, key, flags })), reveals: rv,
     });
   }
-  fs.writeFileSync(argv.out, jsonSafe({
-    meta: { network: hre.network.name, aggregator: argv.aggregator, fromBlock: from, toBlock: to,
+  out.sort((a, b) => a.reqBlock - b.reqBlock);
+  return {
+    meta: { version: 2, network: opts.network, aggregator: opts.aggregator, fromBlock: from, toBlock: to,
       blockTime: T.blockTime, collectedAt: new Date().toISOString() },
     rounds: out,
-  }));
-  console.log(`wrote ${out.length} rounds to ${argv.out}`);
+  };
+}
+
+async function collect(argv) {
+  const hre = require("hardhat");
+  const aggAbi = (await hre.artifacts.readArtifact("ReputationAggregator")).abi;
+  const data = await collectData({
+    provider: hre.ethers.provider, aggregator: argv.aggregator, aggAbi, network: hre.network.name,
+    fromBlock: argv["from-block"], toBlock: argv["to-block"], days: argv.days, chunk: argv.chunk, concurrency: argv.concurrency,
+  });
+  fs.writeFileSync(argv.out, jsonSafe(data));
+  console.log(`wrote ${data.rounds.length} rounds to ${argv.out}`);
 }
 
 /* ───────────────────────────── analyze ───────────────────────────── */
@@ -247,8 +269,8 @@ function pooled(rs) {
   };
 }
 
-function analyze(argv) {
-  const data = JSON.parse(fs.readFileSync(argv.data, "utf8"));
+function analyze(argv, data = JSON.parse(fs.readFileSync(argv.data, "utf8")), log = console.log) {
+  const console = { log };
   const include = (v) => v.scores && (v.hashOk === true || (v.hashOk === null && argv["include-unchecked"]));
   const per = [];
   let dropped = 0, failedHash = 0;
@@ -271,11 +293,13 @@ function analyze(argv) {
     per.push({
       aggId: r.aggId, ts: r.reqTs, class: r.class ?? "unknown", n: vs.length, L, var: vr,
       level: mean(comp[idx]), shares: comp[idx],
-      // arbiter identity = (operator, jobId) of the slot; one operator contract can host several jobs
+      // arbiter identity = the keeper key of the slot (v2), or (operator, jobId) in v1 data; one
+      // operator contract can host several jobs
       arbiters: vs.map((v) => {
         const s = r.selected.find((x) => x.slot === v.slot);
-        return s ? `${s.oracle}:${s.jobId}` : v.operator;
+        return s ? (s.key || `${s.oracle}:${s.jobId}`) : v.operator;
       }),
+      jury: r.jury,
       countedOnly: (() => {
         const c = vs.map((v, i) => (v.counted ? shares[i] : null)).filter(Boolean);
         return c.length >= 2 ? { n: c.length, var: mean([...Array(L).keys()].map((k) => variance(c.map((s) => s[k])))) } : null;
@@ -373,7 +397,7 @@ function analyze(argv) {
     passRate = passRateAt(per, argv);
     const pr = passRate;
     console.log(`\nPASS RATE AT NOMINAL ${pr.nominal}, THRESHOLD ${pr.threshold}  (outcome ${argv["outcome-index"]}; ` +
-      `rounds whose center is within +/-${pr.band} of the nominal; closest pair of ${pr.reveals}; ` +
+      `rounds whose center is within +/-${pr.band} of the nominal; cluster of ${pr.cluster} among ${pr.reveals}; ` +
       `$${fmt(pr.attemptCostUsd)} per attempt)`);
     console.log(`  ${"center".padEnd(8)} ${"rounds".padStart(6)} ${"P(pass)".padStart(8)} ${"95% CI".padStart(15)} ` +
       `${"band pooled sd".padStart(14)} ${"normal-sd equivalent".padStart(20)} ${"max safe V (re-submit)".padStart(22)}`);
@@ -382,10 +406,10 @@ function analyze(argv) {
         `${(fmt(100 * c.ciLo, 1) + "-" + fmt(100 * c.ciHi, 1) + "%").padStart(15)} ${fmt(c.bandPooledSd).padStart(14)} ` +
         `${fmt(c.normalSdEquivalent).padStart(20)} ${("$" + fmt(c.maxSafeValueUsd, 0)).padStart(22)}`);
     }
-    console.log("  median = nominal is the arbiters' typical answer (recommended: the closest-pair cluster follows the");
+    console.log("  median = nominal is the arbiters' typical answer (recommended: the cluster follows the");
     console.log("           majority and discards outliers); mean = nominal is their average answer.");
     console.log("  normal-sd equivalent = the sigma_within at which normal noise reproduces this pass rate under the");
-    console.log("           aggregator's closest-pair rule; use it as --sigma-within with --true/--threshold below.");
+    console.log("           aggregator's cluster rule; use it as --sigma-within with --true/--threshold below.");
   }
 
   console.log("\nFOR selection_randomness_risk.py");
@@ -421,16 +445,23 @@ function analyze(argv) {
     fs.writeFileSync(argv["csv-out"], lines.join("\n") + "\n");
     console.log(`wrote ${argv["csv-out"]}`);
   }
+  return result;
 }
 
-/* ---- pass-rate helpers (aggregator rule: closest pair among the first N=3 reveals) ---- */
-function closestPairMean(x) {
+/* ---- pass-rate helpers (aggregator rule: the cluster of P among the first N counted reveals) ---- */
+/** ScoringLib._cluster1D: sort, then the window of P consecutive values with the smallest sum of
+ *  pairwise squared differences (the first window on ties); the cluster's mean. P = 2 is v1's
+ *  closest pair. */
+function clusterMean(x, P = 2) {
+  const s = [...x].sort((a, b) => a - b);
+  P = Math.max(2, Math.min(P, s.length));
   let best = Infinity, m = NaN;
-  for (let i = 0; i < x.length - 1; i++)
-    for (let j = i + 1; j < x.length; j++) {
-      const d = (x[i] - x[j]) ** 2;
-      if (d < best) { best = d; m = (x[i] + x[j]) / 2; }
-    }
+  for (let i = 0; i + P <= s.length; i++) {
+    const w = s.slice(i, i + P);
+    const s1 = w.reduce((a, b) => a + b, 0), s2 = w.reduce((a, b) => a + b * b, 0);
+    const sc = P * s2 - s1 * s1;
+    if (sc < best - 1e-9) { best = sc; m = s1 / P; }
+  }
   return m;
 }
 
@@ -447,10 +478,10 @@ function subsets(arr, k) {
 
 /** P(final >= threshold) for one round's actual spread re-centered on `nominal`. Every N-subset of
  *  the round's reveals is treated as an equally likely "first N" (arrival order is not used). */
-function roundPassProb(shares, center, nominal, threshold, scale, N) {
+function roundPassProb(shares, center, nominal, threshold, scale, N, P) {
   const x = shares.map((s) => Math.min(100, Math.max(0, nominal + (s - center) * scale)));
   const subs = subsets(x, Math.min(N, x.length));
-  return subs.filter((c) => closestPairMean(c) >= threshold).length / subs.length;
+  return subs.filter((c) => clusterMean(c, P) >= threshold).length / subs.length;
 }
 
 function mulberry32(seed) {
@@ -464,25 +495,25 @@ function mulberry32(seed) {
 
 /** Same rule with N independent normal(nominal, sd) answers (the risk model's assumption).
  *  A fixed seed makes the curve deterministic, so the bisection below is stable. */
-function normalPassProb(sd, nominal, threshold, N, trials = 100000, seed = 7) {
+function normalPassProb(sd, nominal, threshold, N, P, trials = 100000, seed = 7) {
   const rnd = mulberry32(seed);
   const gauss = () => Math.sqrt(-2 * Math.log(rnd() || 1e-12)) * Math.cos(2 * Math.PI * rnd());
   let ok = 0;
   for (let t = 0; t < trials; t++) {
     const x = Array.from({ length: N }, () => Math.min(100, Math.max(0, nominal + sd * gauss())));
-    if (closestPairMean(x) >= threshold) ok++;
+    if (clusterMean(x, P) >= threshold) ok++;
   }
   return ok / trials;
 }
 
 /** Normal sd that reproduces pass probability p (bisection on a monotone curve). */
-function calibrateNormalSd(p, nominal, threshold, N) {
+function calibrateNormalSd(p, nominal, threshold, N, P) {
   if (!(p > 0 && p < 1)) return NaN;
   let lo = 0.01, hi = 60;
-  const rising = normalPassProb(hi, nominal, threshold, N) > normalPassProb(lo, nominal, threshold, N);
+  const rising = normalPassProb(hi, nominal, threshold, N, P) > normalPassProb(lo, nominal, threshold, N, P);
   for (let i = 0; i < 30; i++) {
     const mid = (lo + hi) / 2;
-    const above = normalPassProb(mid, nominal, threshold, N) > p;
+    const above = normalPassProb(mid, nominal, threshold, N, P) > p;
     if (above === rising) hi = mid; else lo = mid;
   }
   return (lo + hi) / 2;
@@ -495,8 +526,20 @@ function wilson(p, n, z = 1.96) {
   return [(c - h) / d, (c + h) / d];
 }
 
+/** The jury's N (counted) and P (cluster): --counted/--cluster, else the most common in v2 data, else
+ *  v1's 3 and 2. */
+function juryNP(per, argv) {
+  const modal = (f) => {
+    const c = {};
+    for (const r of per) if (r.jury) c[f(r.jury)] = (c[f(r.jury)] || 0) + 1;
+    const e = Object.entries(c).sort((a, b) => b[1] - a[1])[0];
+    return e ? Number(e[0]) : null;
+  };
+  return { N: argv.counted ?? modal((j) => j.N) ?? 3, P: argv.cluster ?? modal((j) => j.P) ?? 2 };
+}
+
 function passRateAt(per, argv) {
-  const N = 3;
+  const { N, P } = juryNP(per, argv);
   const { nominal, threshold, band } = argv;
   const cost = argv["attempt-cost-usd"];
   const one = (center) => {
@@ -504,18 +547,18 @@ function passRateAt(per, argv) {
     const rs = per.filter((r) => r.n >= 2 && Math.abs(cfn(r.shares) - nominal) <= band);
     // mean-centered residuals are shrunk by (n-1)/n in variance; rescale to the per-response spread
     const ps = rs.map((r) => roundPassProb(r.shares, cfn(r.shares), nominal, threshold,
-      center === "mean" ? Math.sqrt(r.n / (r.n - 1)) : 1, N));
+      center === "mean" ? Math.sqrt(r.n / (r.n - 1)) : 1, N, P));
     const p = mean(ps);
     const [ciLo, ciHi] = wilson(p, rs.length);
     let ss = 0, dof = 0;
     for (const r of rs) { ss += (r.n - 1) * variance(r.shares); dof += r.n - 1; }
     return {
       center, rounds: rs.length, p, ciLo, ciHi, bandPooledSd: dof ? Math.sqrt(ss / dof) : NaN,
-      normalSdEquivalent: rs.length ? calibrateNormalSd(p, nominal, threshold, N) : NaN,
+      normalSdEquivalent: rs.length ? calibrateNormalSd(p, nominal, threshold, N, P) : NaN,
       maxSafeValueUsd: p > 0 ? cost / p : Infinity,
     };
   };
-  return { nominal, threshold, band, reveals: N, attemptCostUsd: cost, median: one("median"), mean: one("mean") };
+  return { nominal, threshold, band, reveals: N, cluster: P, attemptCostUsd: cost, median: one("median"), mean: one("mean") };
 }
 
 function normCdf(x) { // Abramowitz-Stegun 7.1.26
@@ -525,7 +568,7 @@ function normCdf(x) { // Abramowitz-Stegun 7.1.26
 }
 
 /* ───────────────────────────── CLI ───────────────────────────── */
-yargs(hideBin(process.argv))
+if (require.main === module) yargs(hideBin(process.argv))
   .command("collect", "scan aggregator + operator history and recover every reveal", (y) => y
     .option("aggregator", { type: "string", demandOption: true })
     .option("from-block", { type: "number" })
@@ -546,6 +589,8 @@ yargs(hideBin(process.argv))
     .option("nominal", { type: "number", desc: "nominal score of the decision (0..100, outcome --outcome-index)" })
     .option("threshold", { type: "number", desc: "pass threshold of the decision (final >= threshold passes)" })
     .option("band", { type: "number", default: 5, desc: "use rounds whose center is within +/- band of --nominal" })
+    .option("counted", { type: "number", desc: "N: reveals counted per round (default: the data's most common jury N; v1 data 3)" })
+    .option("cluster", { type: "number", desc: "P: cluster size (default: the data's most common jury P; v1 data 2)" })
     .option("attempt-cost-usd", { type: "number", default: 0.59,
       desc: "submitter cost per attempt. Default measured on Base mainnet 2026-11-03: 6 x 0.00002 ETH base " +
         "+ 2 x 0.00006 ETH bonus + ~0.00002 ETH request gas, at $2,287/ETH (see selection_randomness_risk.py N6)" })
@@ -556,3 +601,5 @@ yargs(hideBin(process.argv))
   .demandCommand(1)
   .strict()
   .parse();
+
+module.exports = { collectData, analyze, clusterMean };

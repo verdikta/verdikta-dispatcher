@@ -183,12 +183,13 @@ use `ethers.getContractAt("ReputationAggregator", …)` now get the v2 ABI.
 | `register-oracle(-cl).js` | `registerOracle`, `getOracleInfo` | `registerArbiter` with a chain head, `getArbiter(key)` |
 | `unregister-oracle*.js` | `deregisterOracle` | `requestExit`, then `completeExit` after the unbonding period (2 days) |
 | `reset-oracle.js`, `reset-reputations-cl.js` | `resetAllReputations` | none (no reset in v2) |
-| `oracle-poller(-cl).js`, `arbiter-noise.js`, `arbiter-stats.js` | `registeredOracles`, `getRegisteredOraclesCount`, `getOracleInfo`, `getOracleClasses` | the `ArbiterRegistered` events, `classSize(cls)`, `getArbiter(key)` |
+| `oracle-poller(-cl).js`, `arbiter-stats.js` | `registeredOracles`, `getRegisteredOraclesCount`, `getOracleInfo`, `getOracleClasses` | the `ArbiterRegistered` events, `classSize(cls)`, `getArbiter(key)` |
+| `arbiter-noise.js` | **ported to v2** (`test/scripts.v2.test.js`) | `collect` finds rounds by `BasePayment`/`CommitPhaseComplete`, reads `getSlot`/`getJury`, computes the reveal request ids (`scripts/lib/v2-reveal.js`), checks reveals against the v2 commit and takes classes from `keeper().arbiterClasses(key)`; `analyze` models the jury's P-of-N cluster and still reads v1 data files |
 | `monitor-contracts(-cl).js`, `agg-history.js` | `getContractConfig`, `oraclesToPoll`, `getAggregationStatus`, v1 events | `getJury(aggId)` per round, `maxJury()`/`maxTimeout()`/`tPlus()`, `getRoundInfo`, v2 events |
 | `single-query.js`, `simultaneous-tests.js` | 7-argument request, `maxTotalFee(fee)` | 10-argument request (with the jury), `maxTotalFee(fee, floor, flag, K, P)`, then `drawJury` at B+2 (twice with beacons) and `promote` after the commit phase closes |
 | `refund.js` | `finalizeEvaluationTimeout`, `getAggregationStatus` | `settle`, `getRoundInfo` |
 | `configure-contracts.js`, `deploy_just_aggregator.js` | `approveContract`, `setConfig(5 args)`, `setMaxOracleFee` | `setApproved`, `setLimits`, `setParams`, `setContracts` (or `deploy/`) |
-| `reveal-forensics.js` | v1 reveal events (`RevealHashMismatch`, …) | v2 ignores bad reveals silently: only `RevealReceived` is emitted |
+| `reveal-forensics.js` | **ported to v2** (`test/scripts.v2.test.js`) | v2 ignores bad replies silently, so the script decodes each operator's fulfil calldata and replays the aggregator's checks (deadline, phase, slot flags, score count, cid length, `cid:salt` format, commit hash), for commits and reveals, and compares its verdicts with `CommitReceived`/`RevealReceived` |
 | `transfer-ownership.js`, `whoami.js`, `check-*.js`, `approve-link.js`, `withdraw-link-from-oracle.js`, `fork-base-sepolia.js`, `estimate-deploy-cost.js`, `show-gas.js` | none of the changed calls | check before use |
 
 The shell wrappers call these scripts. `deploy.sh` runs `deploy/` and works, but
