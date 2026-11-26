@@ -15,6 +15,9 @@ comparing the two ABIs and the code that calls them.
   version 2, same CBOR keys). Off-chain readers lose the aggregator's `ChainlinkRequested` and
   `ChainlinkFulfilled` events: use the operator's `OracleRequest`/`OracleResponse`, or compute the id as
   `keccak256(abi.encodePacked(aggregator, ((roundId << 8 | slot) << 1) | isReveal))`.
+- **Deploy the keeper and the aggregators together.** `selectArbiters` now returns each juror's job id
+  (`Selected` has four fields). An aggregator paired with an older keeper cannot decode the selection,
+  so every `drawJury` reverts and its rounds can only be cancelled to the pool.
 - **Compiled for Cancun** (`evmVersion: "cancun"`, for the transient-storage reentrancy guard). Deploy
   only to chains with Cancun; Base has it.
 - **`getSlot` keeps its tuple,** but `committedAt` is always 0 (use the `CommitReceived` block) and
