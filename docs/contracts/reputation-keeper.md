@@ -321,7 +321,7 @@ function setSelection(uint16 _shortlist, uint16 _maxScan, uint8 _liveRandom) ext
 function setStakeRequirement(uint256 s) external onlyOwner
 ```
 
-Approval matters beyond the operator gate: an approved contract can draw juries and change any arbiter's scores through `applyOutcomes`. Approve only contracts you trust. `isContractApproved` keeps v1's name because every deployed ArbiterOperator calls it, and checks that it exists when the keeper is added. The aggregator's `requestAIEvaluationWithApproval` reads `shortlistSize()` to bound K.
+Approval matters beyond the operator gate: an approved contract can draw juries and change any arbiter's scores through `applyOutcomes`. Approve only contracts you trust. `isContractApproved` keeps v1's name because every deployed ArbiterOperator calls it, and checks that it exists when the keeper is added. The aggregator's `requestAIEvaluationWithApproval` reads `shortlistSize()` to bound K. Lowering the shortlist therefore strands live bounties and listings whose K is above the new value: check first with the applications' `limitImpact.js` (see the aggregator's "Changing a limit later").
 
 ## Data Structures
 

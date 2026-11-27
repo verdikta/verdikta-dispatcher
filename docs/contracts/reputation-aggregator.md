@@ -84,6 +84,9 @@ K, M, N, P and the timeout are not protocol constants. The class presets that Ve
 
 They are application settings, and any jury that passes the check below is accepted.
 
+**Changing a limit later (owner runbook).** Applications store a jury when a bounty or listing is created and check only its structure; the live limits above (and the keeper's `shortlistSize`) are checked by each request. Tightening one (lowering `maxJury`, `maxTimeout` or the shortlist, raising `tPlus`) therefore strands every live bounty and listing whose jury then fails it: its starts and reveals revert, and a bounty's escrow waits for its deadline. The owner is trusted to do this only deliberately (external review 2026-11-26 finding 19, accepted). Before calling `setLimits` or the keeper's `setSelection`, list what the change would strand with the applications' read-only script: `node example-bounty-program/server/scripts/limitImpact.js --rpc <url> --aggregator <addr> --escrow <addr> --attestation <addr> --t-plus 200` (exit code 2 when something would be stranded). Hunters see the same check live through the escrow's and StakeAttestation's `juryProblem` views.
+
+
 ## Key Features
 
 - **Per-request jury**: one deployment serves every class of question
