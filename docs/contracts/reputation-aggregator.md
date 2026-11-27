@@ -65,7 +65,7 @@ The constructor sets these values, and [`deploy/03_config.js`](https://github.co
 | Draw reward, in fees | 2 | `drawRewardFees()` | `setRewards` |
 | Promote reward, in fees | 1 | `promoteRewardFees()` | `setRewards` |
 | Time in which only the requester earns the draw reward | 30 s | `requesterDrawPriority()` | `setRewards` |
-| Reveal time guaranteed after `promote` | 120 s | `revealWindow()` | `setRewards` |
+| Reveal time guaranteed after `promote` (at most `MAX_REVEAL_WINDOW()`, 2 h) | 120 s | `revealWindow()` | `setRewards` |
 
 There is no treasury setting: v2 has no `treasury()`. Prepay that is not refunded goes to the round's committers or to the [arbiter pool](#the-arbiter-pool), which no address controls.
 
@@ -346,12 +346,12 @@ function setParams(uint8 bonusMult, uint8 settlePerReq, uint32 dispatchGas_,
                    uint256 spreadFloor_, uint256 maxOracleFee_) external onlyOwner
 
 // Draw reward (fees), the requester's draw priority (s), promote reward (fees) and the reveal
-// window (s, not 0, else InvalidConfig())
+// window (s, 1 to MAX_REVEAL_WINDOW = 7,200, else InvalidConfig())
 function setRewards(uint8 drawFees_, uint40 priority, uint8 promoteFees_, uint40 revealWindow_) external onlyOwner
 
 // Keeper and beacon contract (0 = beacons off). The keeper must not be 0, else InvalidConfig().
 // Rounds in flight call the new contracts: change the keeper only when no round awaits settlement,
-// and the beacon contract only when no round is in its beacon stage
+// and the beacon contract only when no round is in its beacon stage. Not enforced: see the runbook below
 function setContracts(address keeper_, address beacons_) external onlyOwner
 
 // Stop and resume new requests. Draws, commits, reveals, settlement, cancellation and
@@ -361,6 +361,15 @@ function unpause() external onlyOwner
 ```
 
 The bonus multiplier, the draw and promote rewards and the beacon quorum are fixed in each round at its request, since its escrow was sized on them. The spread floor, the dispatch stipend, the draw priority and the reveal window apply to rounds in flight. A round keeps the T+ of its request: `checkJury` checks the timeout against it, the round holds it in `windowEnd` until the draw, and the draw adds the draw time. A T+ changed in between does not reach that round, so it can never push the commit window past the deadline. The `maxTimeout` in force at the request applies, and no timeout may exceed one day whatever it says. The shortlist that bounds K is read at the request, and again by the keeper at the draw. Ownership uses OpenZeppelin `Ownable` (`owner()`, `transferOwnership`, `renounceOwnership`).
+
+The reveal window is read when a round is promoted, so a new value reaches every round promoted after the change. `MAX_REVEAL_WINDOW` (2 h) bounds how far one mistaken value can stretch a round and hold up the settle queue behind it (external review 2026-11-26 finding 11). The keeper's 2-day minimum unbonding covers a draw up to a day after the request and a timeout of up to a day; the reveal window comes on top of that, so an arbiter that exits right after a draw could complete its exit up to the reveal window (plus the 30 s promote grace) before that round settles. With no stake burns that costs nothing; raise `unbondingPeriod` by the reveal window before enabling burns.
+
+**Changing the keeper or the beacon contract (owner runbook).** `setContracts` takes effect for rounds in flight: a round in its beacon stage asks the new beacon contract for a record only the old one holds (it can then only be cancelled, its prepay to the pool), and a drawn round looks up its operators in, and reports its outcomes to, the new keeper (a report the new keeper rejects is caught, and those reputation updates are lost). The contract does not stop this; the owner is trusted to swap only when nothing in flight depends on the old contract (external review 2026-11-26 finding 11, accepted). Without pausing:
+
+1. Point new work away from the old contract first if possible (for beacons, applications can request without beacons for a while).
+2. List rounds in flight: `RequestAIEvaluation` events from the last two days plus the reveal window, less those already settled or cancelled (`getRoundInfo` phase 7 or higher).
+3. Swap the beacon contract only when no listed round is in phase 2 (beacon stage); swap the keeper only when every listed round is settled. Rounds past their deadline can be settled by anyone (`settle(aggId)`).
+4. Call `setContracts`, then check `keeper()` and `beacons()`.
 
 **How requests go out.** The aggregator does not use Chainlink's `ChainlinkClient`. It builds one request per round as calldata for LINK's `transferAndCall(operator, 0, operatorRequest(...))`, byte for byte what `ChainlinkClient` would send (CBOR parameters `cid` and `aggId`, data version 2, callback `fulfill`), and writes in each slot's operator, job id and nonce. Each call gets the `dispatchGas` stipend; a slot whose operator reverts, burns the stipend or makes LINK return false is skipped (`SlotSkipped`). The nonce is `(roundId << 8 | slot) << 1 | r`, with `r` 0 for the commit request and 1 for the reveal, so a request id can be computed off-chain: `keccak256(abi.encodePacked(aggregator, nonce))`, as the operator computes it. `fulfill` accepts an answer only from the operator the request went to, and only once (`UnknownRequest()` otherwise).
 

@@ -1656,6 +1656,12 @@ keeper. Scores are clamped to 0–1000.
     dispatched. The cartel this penalty is for still pays it unless it can hold commits below M/2,
     and then it holds more than half the jury anyway. Repeated seats on one key are still scored
     per slot: an arbiter is an arbiter (owner decision, same day).
+- **Owner settings read live (external review 2026-11-26 finding 11; owner decision 2026-11-27).**
+  `revealWindow` is now capped at `MAX_REVEAL_WINDOW` = 2 h (it was any nonzero uint40: years, or a
+  panic in promote at 2^40 − 1). Keeper and beacon swaps stay live for rounds in flight, by a runbook
+  (docs/contracts/reputation-aggregator.md), not a pause or per-round pinning: the owner is trusted,
+  and swaps are rare. The keeper's selection settings read at the draw are an owner power, accepted.
+  No multisig or timelock is assumed by the contracts.
 - **Fake commits don't pay.** For a live arbiter that can't do the work in time in a K=6 / M=5
   round, not committing costs about −23 expected (the round fails for lack of commits about 6% of
   the time). A commit it can't reveal is promoted about 83% of the time and costs −200 in a round

@@ -164,6 +164,22 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
       expect((await agg.getRoundInfo(r.aggId))[0]).to.equal(7n);              // PH_SETTLED
     });
 
+    it("revealWindow is capped at MAX_REVEAL_WINDOW (2 h): a mistaken value cannot stretch a promoted round", async () => {
+      expect(await agg.MAX_REVEAL_WINDOW()).to.equal(7200n);
+      await expect(agg.setRewards(20, 30, 10, 7201)).to.be.revertedWithCustomError(agg, "InvalidConfig");
+      await expect(agg.setRewards(20, 30, 10, 0)).to.be.revertedWithCustomError(agg, "InvalidConfig");
+      await expect(agg.setRewards(20, 30, 10, 2n ** 40n - 1n)).to.be.revertedWithCustomError(agg, "InvalidConfig");
+      await agg.setRewards(20, 30, 10, 7200);
+      expect(await agg.revealWindow()).to.equal(7200n);
+      const r = await drv.requestOnly();                                     // promoted after the change: gets it
+      await drv.draw(r);
+      await drv.answerAll(r);
+      for (let s = 0; s < 6; s++) await drv.commit(r, s, V(600_000));
+      const rc = await drv.promote(r);
+      const t = BigInt((await ethers.provider.getBlock(rc.blockNumber)).timestamp);
+      expect((await agg.getRoundInfo(r.aggId)).deadline).to.equal(t + 7200n);   // the round's 300 s timeout is shorter
+    });
+
     it("rejects a scaling factor that would not fit its uint16 field", async () => {
       const v = await H.quote(agg, H.MAX_FEE, 0, false);
       await expect(agg.connect(requester).requestAIEvaluationWithApproval(["Qm"], "", 500, H.MAX_FEE, 0, H.BASE_COST, 65536, 1, false, H.JURY, { value: v }))
