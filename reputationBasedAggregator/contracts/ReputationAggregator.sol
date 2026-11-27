@@ -243,12 +243,12 @@ contract ReputationAggregator is Ownable, ReentrancyGuardTransient, Pausable {
     uint40 public requesterDrawPriority = 30;  // seconds in which only the requester earns the reward
     uint40 public tPlus = 155;                 // mean + 2 SD of honest commit latency (item 14, Oct-Nov 2026)
     uint40 public revealWindow = 120;          // reveal time guaranteed after promotion (reveal p90 54 s)
-    uint40 private constant DRAW_GRACE = 1 days;
+    uint40 private constant DRAW_GRACE = 1 days; // no draw after this; the round can then only be cancelled
     /// @notice Largest revealWindow the owner may set (2 hours). promote() reads revealWindow live, so a
     ///         change reaches rounds promoted after it; the cap bounds how far one can stretch a round
     ///         (and hold up the settle queue behind it). The keeper's 2-day minimum unbonding covers the
     ///         draw grace and the longest timeout; this window comes on top, which only matters for burns.
-    uint40 public constant MAX_REVEAL_WINDOW = 2 hours; // no draw after this; the round can then only be cancelled
+    uint40 public constant MAX_REVEAL_WINDOW = 2 hours;
     /// @dev stipend per oracle request: the LINK transferAndCall and the operator's onTokenTransfer (the request
     ///      is built once per round, outside the stipend); a gas-burning operator costs at most this
     uint32 public dispatchGas = 250_000;
