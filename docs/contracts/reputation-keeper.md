@@ -333,7 +333,7 @@ struct Points {
     uint16 minor;     // 50:  off (quality)
     uint16 major;     // 200: far (quality); promoted miss in a finished round (timeliness)
     uint16 fail;      // 500: promoted, no reveal, round failed (timeliness)
-    uint16 nocommit;  // 400: no commit, round failed for lack of commits, some slot committed (timeliness)
+    uint16 nocommit;  // 400: dispatched, no commit, round failed for lack of commits, at least half of M committed (timeliness)
     uint16 start;     // 500: starting score, and the restart after a block
     uint16 cap;       // 1000: highest score
 }
@@ -495,12 +495,12 @@ At settlement the aggregator sends one code per jury slot (see [ReputationAggreg
 | Promoted, revealed (also late) | +20 (`gain`) | by class, if the round finished |
 | Promoted, no reveal, round finished | −200 (`major`) | |
 | Promoted, no reveal, round failed | −500 (`fail`) | |
-| No commit, round failed for lack of commits, though some slot committed | −400 (`nocommit`) | |
+| Dispatched, no commit, round failed for lack of commits, though at least half of M committed | −400 (`nocommit`) | |
 | Quality class close (d ≤ 1.5 × spread) | | +20 (`gain`) |
 | Quality class off (d ≤ 3 × spread) | | −50 (`minor`) |
 | Quality class far | | −200 (`major`) |
 
-Scores are capped at `cap` (1,000). An arbiter that was not promoted, or whose round failed in the commit phase with M commits or with no commit at all, or in the promotion step, gets no points. The aggregator does not send `T_NOCOMMIT_FAILED` when no slot committed: that failure is the request's (one every honest arbiter refuses) or a shared outage's.
+Scores are capped at `cap` (1,000). An arbiter that was not promoted, or whose round failed in the commit phase with M commits or with no commit at all, or in the promotion step, gets no points. The aggregator sends `T_NOCOMMIT_FAILED` only to a slot that was dispatched and only when at least half of M committed (`2 × commits ≥ M`): with fewer commits, or none, the failure is the request's (one every honest arbiter refuses or cannot fetch, maybe with a lone colluding commit, which is never opened) or a shared outage's, and a slot whose dispatch failed was never sent the job.
 
 ### Consequences (Table 2)
 

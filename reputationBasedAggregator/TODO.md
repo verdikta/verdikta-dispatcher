@@ -1610,7 +1610,7 @@ for going silent.
 | … revealed score is **far** (more than 3 spreads) | | **−200** |
 | Promoted, no reveal, round still finished | **−200** | |
 | Promoted, no reveal, **round failed** | **−500** | |
-| Live, no commit, and the **round failed for lack of commits**, with at least one commit | **−400** | |
+| Live, dispatched, no commit, and the **round failed for lack of commits**, with at least half of M committed | **−400** | |
 | Anything else: committing, speed, not being promoted, not being selected | 0 | 0 |
 
 A **spread** is `max(1.48 × MAD, 3 points)`, where MAD is the median absolute deviation of the
@@ -1646,6 +1646,16 @@ keeper. Scores are clamped to 0–1000.
     push honest jurors toward blocks for one round's base fees. Now a round with zero commits
     charges nobody; a round with 1 to M − 1 commits still charges each silent, live
     non-committer −400 (frozen ones are skipped, as before).
+  - **2026-11-27: only with at least half of M committed, and only dispatched slots** (owner
+    decision, external review 2026-11-26 finding 7). A commit is any nonzero hash and is never
+    opened in a round that fails in the commit phase, so one committed key was enough to charge the
+    whole jury: a requester with one colluding key and a request honest nodes refuse, or one node
+    that alone could fetch the evidence, charged K − 1 healthy arbiters −400 a round (two hits
+    block; the third block bans). The charge also reached slots whose dispatch had failed, which
+    were never sent the job. Now −400 needs `2 × commits ≥ M` (and commits < M) and a slot that was
+    dispatched. The cartel this penalty is for still pays it unless it can hold commits below M/2,
+    and then it holds more than half the jury anyway. Repeated seats on one key are still scored
+    per slot: an arbiter is an arbiter (owner decision, same day).
 - **Fake commits don't pay.** For a live arbiter that can't do the work in time in a K=6 / M=5
   round, not committing costs about −23 expected (the round fails for lack of commits about 6% of
   the time). A commit it can't reveal is promoted about 83% of the time and costs −200 in a round

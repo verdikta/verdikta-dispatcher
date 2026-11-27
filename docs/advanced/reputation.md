@@ -34,7 +34,7 @@ Only the round's jurors are scored, once per jury slot. At settlement the aggreg
 | … **far** (more than 3 spreads) | | **−200** (`major`) |
 | Promoted, no reveal, round still finished | **−200** (`major`) | |
 | Promoted, no reveal, **round failed** | **−500** (`fail`) | |
-| No commit, and the **round failed for lack of commits** though at least one slot committed | **−400** (`nocommit`) | |
+| No commit (the slot was dispatched), and the **round failed for lack of commits** though at least half of M committed | **−400** (`nocommit`) | |
 | Anything else: committing, speed, not being promoted | 0 | 0 |
 
 The **spread** is `max(1.4826 × MAD, spreadFloor)`, where MAD is the median of each counted reveal's distance from the coordinate-wise median (for a vector, its largest coordinate deviation), and `spreadFloor` is 30,000 on the 0 to 1,000,000 scale (3 points). The median and spread are stored at finalization, so a late reveal is classed on arrival against the same median.
@@ -44,7 +44,7 @@ In a failed round a delivered reveal gets +20 timeliness and no quality points, 
 Why these rules (TODO item 14 gives the simulations):
 
 - **Commits never earn points.** A commit can't be checked unless it is promoted and revealed, so credit for committing would reward fake commits. A fake commit doesn't help either: if promoted it must be revealed, or it costs −200 or −500. Commits do earn ETH in one case: a round that had M commits but was never promoted shares its unspent prepay among the slots that committed (see [Fee Mechanisms](fees.md#refunds-and-the-arbiter-pool)). That pays the work done; it gives a committer no reason to block, since anyone may call `closeCommits` and `promote` and the `promote` caller is paid.
-- **The −400 for not committing applies only when the round failed for lack of commits**, the attack where a cartel blocks by never committing. A round that had M commits but died because nobody called `closeCommits` charges nobody, and so does a round in which no slot committed at all: that failure is the request's (one every honest arbiter refuses) or a shared outage's, not the jurors'.
+- **The −400 for not committing applies only when the round failed for lack of commits**, the attack where a cartel blocks by never committing. A round that had M commits but died because nobody called `closeCommits` charges nobody, and so does a round in which fewer than half of M committed: that failure is the request's (one every honest arbiter refuses or cannot fetch; a lone commit proves nothing, since a commit is never opened in that round) or a shared outage's, not the jurors'. A slot whose dispatch failed is never charged.
 - **Rare bad luck can't block a good arbiter.** An arbiter in good standing survives any single event; two failed rounds in quick succession block it.
 - **No round-size terms.** An honest arbiter nets on average about +18 timeliness and +10 quality per round it serves in, whatever the jury.
 

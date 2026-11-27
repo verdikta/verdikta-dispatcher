@@ -803,12 +803,16 @@ contract ReputationAggregator is Ownable, ReentrancyGuardTransient, Pausable {
             uint8 f = sl.flags;
             uint8 code;
             if (ph == PH_COMMIT) {
-                // -400 only if the round failed for lack of commits (not for want of a closeCommits call),
-                // and only if someone committed: with no commit at all the failure is the request's (one
-                // every honest arbiter refuses) or the network's (a shared outage), not the jurors'.
-                // commits - 1 < M - 1 is commits < M for commits >= 1, and false for 0 (it wraps; M >= 1)
-                unchecked {
-                    if (f & S_COMMITTED == 0 && uint256(r.commits) - 1 < uint256(r.M) - 1) code = T_NOCOMMIT_FAILED;
+                // -400 only to a slot that was DISPATCHED and did not commit, only if the round failed for
+                // lack of commits (not for want of a closeCommits call), and only if at least half of M
+                // committed. Fewer commits do not show the job could be done: with none, or a handful,
+                // the failure is the request's (evidence honest arbiters refuse or cannot fetch, maybe
+                // with a lone colluding commit, whose hash is never opened) or the network's (a shared
+                // outage), not the jurors'. Review 2026-11-26 #7. Downtime is the health calls' to catch.
+                // 2 * commits >= M implies commits >= 1 (M >= 1).
+                uint256 commits = r.commits;
+                if (f & (S_DISPATCHED | S_COMMITTED) == S_DISPATCHED && commits < r.M && 2 * commits >= r.M) {
+                    code = T_NOCOMMIT_FAILED;
                 }
             } else if (ph == PH_CLOSING) {
                 code = 0;   // enough commits arrived; nobody promoted, so nobody failed to deliver

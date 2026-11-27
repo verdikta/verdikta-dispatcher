@@ -120,7 +120,7 @@ Scores are applied at settlement, after the deadline, in one keeper call per rou
 
 Exits are bounded so penalties land: `requestExit` makes an arbiter ineligible at once and `completeExit` refunds the stake only after the unbonding period (at least 2 days: a day for the latest draw that can read a B from before the exit, and a day for that round to finish and settle). Blocks and bans still apply during unbonding, and a blocked arbiter cannot complete its exit. But an arbiter that completes its exit before a round it served in is settled escapes that round's points, because `applyOutcomes` skips unregistered keys. Settle rounds promptly.
 
-The −400 for not committing applies only when the round failed for lack of commits and at least one slot committed; a round in which nobody committed charges nobody, since that failure is the request's (one every honest arbiter refuses) or a shared outage's. The freeze is judged at the deadline, and a frozen arbiter that did not commit is not scored. A cartel member that never commits and ignores its health call therefore escapes the −400 (the abstain dodge, TODO item 14; open).
+The −400 for not committing applies only to a dispatched slot, when the round failed for lack of commits and at least half of M committed; a round with fewer commits charges nobody, since that failure is the request's (one every honest arbiter refuses or cannot fetch, perhaps with one colluding commit) or a shared outage's. The freeze is judged at the deadline, and a frozen arbiter that did not commit is not scored. A cartel member that never commits and ignores its health call therefore escapes the −400 (the abstain dodge, TODO item 14; open).
 
 ## ETH Escrow and Withdrawals
 

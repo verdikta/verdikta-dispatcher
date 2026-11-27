@@ -67,7 +67,7 @@ contract ReputationKeeper is Ownable {
     uint8 public constant T_DELIVERED = 1;      // promoted and the reveal arrived (even late)
     uint8 public constant T_MISS_FINISHED = 2;  // promoted, no reveal, round still finished
     uint8 public constant T_MISS_FAILED = 3;    // promoted, no reveal, round failed
-    uint8 public constant T_NOCOMMIT_FAILED = 4; // no commit, and the round failed for lack of commits
+    uint8 public constant T_NOCOMMIT_FAILED = 4; // dispatched, no commit, round failed for lack of commits (>= M/2 committed)
     uint8 public constant C_COMMITTED = 0x80;   // code flag: committed in this round, so scored even if frozen
     uint8 public constant Q_NONE = 0;
     uint8 public constant Q_CLOSE = 1;
@@ -115,7 +115,7 @@ contract ReputationKeeper is Ownable {
         uint16 minor;  // -50  off
         uint16 major;  // -200 far / promoted miss in a finished round
         uint16 fail;   // -500 promoted, no reveal, round failed
-        uint16 nocommit; // -400 no commit, round failed for lack of commits
+        uint16 nocommit; // -400 dispatched, no commit, round failed for lack of commits, >= M/2 committed
         uint16 start;  // 500
         uint16 cap;    // 1000
     }
