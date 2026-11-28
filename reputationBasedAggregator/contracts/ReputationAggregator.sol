@@ -464,7 +464,7 @@ contract ReputationAggregator is Ownable, ReentrancyGuardTransient, Pausable {
             r.phase = PH_FAILED;
             // After a beacon stage, a failure that could depend on the seed (the walk covers only part
             // of the class list) is a re-roll the beacons' timing could choose, so no refund then
-            _refund(r, aggId, r.beaconFees != 0 && !keeper.scansAll(r.cls) ? POOL : r.requester);
+            _refund(r, aggId, r.beaconFees != 0 && !keeper.scansAllAt(r.cls, atB) ? POOL : r.requester);
             emit EvaluationFailed(aggId, PH_DRAW);
             return;
         }

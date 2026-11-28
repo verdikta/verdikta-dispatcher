@@ -850,9 +850,16 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
       expect(await keeper.registryLength()).to.equal(12n);
       const seed = (i) => ethers.id(`seed ${i}`);
       const owners = new Set(await Promise.all(arbs.map((a) => a.op.owner())));
-      for (let i = 0; i < 4; i++) expect(owners.has(await keeper.poolPayee(seed(i)))).to.equal(true);
+      const asOfNow = async () => {
+        await ethers.provider.send("evm_mine", []);
+        const b = await ethers.provider.getBlock((await ethers.provider.getBlockNumber()) - 1);
+        return [b.number, b.timestamp];
+      };
+      let B = await asOfNow();
+      for (let i = 0; i < 4; i++) expect(owners.has(await keeper.poolPayeeAt(seed(i), B[0], B[1]))).to.equal(true);
       for (const a of arbs) await keeper.setPaused(a.key, true);
-      for (let i = 0; i < 4; i++) expect(await keeper.poolPayee(seed(i))).to.equal(POOL);
+      B = await asOfNow();
+      for (let i = 0; i < 4; i++) expect(await keeper.poolPayeeAt(seed(i), B[0], B[1])).to.equal(POOL);
     });
 
     it("a completed exit removes the arbiter from the registry", async () => {
@@ -862,7 +869,9 @@ describe("ReputationAggregator flow (items 14, 9 and 11)", function () {
       await keeper.completeExit(a0.key);
       expect(await keeper.registryLength()).to.equal(11n);
       for (const a of arbs.slice(1)) await keeper.setPaused(a.key, true);     // only a0 could win, and it left
-      for (let i = 0; i < 4; i++) expect(await keeper.poolPayee(ethers.id(`s${i}`))).to.equal(POOL);
+      await ethers.provider.send("evm_mine", []);
+      const b = await ethers.provider.getBlock((await ethers.provider.getBlockNumber()) - 1);
+      for (let i = 0; i < 4; i++) expect(await keeper.poolPayeeAt(ethers.id(`s${i}`), b.number, b.timestamp)).to.equal(POOL);
     });
   });
 

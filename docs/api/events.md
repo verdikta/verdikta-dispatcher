@@ -111,7 +111,7 @@ event PoolPayment(bytes32 indexed aggRequestId, address indexed payee, uint256 a
 | `payee` | `address` | Yes | The winning arbiter's operator `owner()` |
 | `amount` | `uint256` | No | An eighth of the arbiter pool, `ethOwed(address(0)) / 8`, at most the draw's base fees, credited to `ethOwed[payee]` |
 
-**When it fires:** In a `drawJury` that draws a jury, just before `JuryDrawn`, when the pool holds at least 8 wei and the keeper's `poolPayee(seed)` found an available registered arbiter in its two picks. Declared in `AggregatorLib` and emitted in the aggregator's context, so it appears in the aggregator's logs and ABI. No event fires when nobody was picked: the pool waits for the next draw.
+**When it fires:** In a `drawJury` that draws a jury, just before `JuryDrawn`, when the pool holds at least 8 wei and the keeper's `poolPayeeAt(seed, B, time of B)` found an available registered arbiter in its two picks. Declared in `AggregatorLib` and emitted in the aggregator's context, so it appears in the aggregator's logs and ABI. No event fires when nobody was picked: the pool waits for the next draw.
 
 ### CommitReceived
 
@@ -286,6 +286,22 @@ event ArbiterRemoved(bytes32 indexed key, uint256 refunded);
 ```
 
 **When it fires:** On `completeExit`. `refunded` is the stake left after burns, sent in VDKA to the operator's `owner()`.
+
+### ArbiterListed
+
+```solidity
+event ArbiterListed(bytes32 indexed key);
+```
+
+**When it fires:** When the arbiter joins its class lists and can be drawn: on `registerArbiter` (unless it registers with head 0, then at its first answered health call), and when an evicted arbiter returns by `setPaused(key, false)` or by answering a health call.
+
+### ArbiterUnlisted
+
+```solidity
+event ArbiterUnlisted(bytes32 indexed key);
+```
+
+**When it fires:** When the arbiter leaves its class lists: on `evict(key)` (anyone, once it has been paused, frozen or banned for `evictAfter`, or is past its `exitAt`), or on `completeExit` if it was still listed. Eviction changes nothing else: the registration, stake and scores stay.
 
 ### HealthCall
 

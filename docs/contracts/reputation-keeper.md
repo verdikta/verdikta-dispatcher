@@ -227,15 +227,16 @@ Both revert with `NotApproved()` for a caller that `setApproved` has not approve
 ### The arbiter pool draw
 
 ```solidity
-// A registered arbiter picked uniformly from seed, returned as its payee (its operator's owner()),
-// or address(0) if neither of two picks is available
-function poolPayee(bytes32 seed) external view returns (address)
+// A registered arbiter picked uniformly from seed, from the registry and the arbiters' state as of
+// the request block, returned as its payee (its operator's owner()), or address(0) if neither of
+// two picks is available
+function poolPayeeAt(bytes32 seed, uint256 atBlock, uint256 atTime) external view returns (address)
 
 // Registered arbiters (exited ones are removed; banned ones stay until they complete their exit)
 function registryLength() external view returns (uint256)
 ```
 
-The keeper keeps a registry of every registered arbiter: `registerArbiter` adds the key and `completeExit` removes it. The aggregator calls `poolPayee` at each draw that draws a jury, with a seed derived from that draw's seed, to pay an eighth of its arbiter pool, at most that draw's base fees (the forfeits that earlier v2 drafts sent to a treasury; see [ReputationAggregator](reputation-aggregator.md#the-arbiter-pool)). `poolPayee` makes at most two picks and returns the first arbiter that is registered and not paused, banned, exiting or understaked; otherwise address(0), and the pool waits for the next draw. Anyone may call it. The aggregator caps the call at 80,000 gas and catches its failure, so an operator's `owner()` cannot make the draw fail.
+The keeper keeps a registry of every registered arbiter: `registerArbiter` adds the key and `completeExit` removes it. The aggregator calls `poolPayeeAt` at each draw that draws a jury, with a seed derived from that draw's seed, to pay an eighth of its arbiter pool, at most that draw's base fees (the forfeits that earlier v2 drafts sent to a treasury; see [ReputationAggregator](reputation-aggregator.md#the-arbiter-pool)). `poolPayeeAt` makes at most two picks and returns the first arbiter that was, as of the request block, registered and not paused, banned, exiting, understaked, blocked or frozen; otherwise address(0), and the pool waits for the next draw. Anyone may call it. The aggregator caps the call at 80,000 gas and catches its failure, so an operator's `owner()` cannot make the draw fail.
 
 ### Outcomes (approved contracts only)
 
@@ -276,10 +277,15 @@ function arbiterClasses(bytes32 key) external view returns (uint64[] memory)
 function isFrozen(bytes32 key) external view returns (bool)
 function isEligible(bytes32 key, uint256 maxFee) external view returns (bool)          // now
 function eligibleCount(uint64 cls, uint256 maxFee) external view returns (uint256)    // off-chain view
-function classSize(uint64 cls) external view returns (uint256)       // list slots, freed ones included
-function freeSlotCount(uint64 cls) external view returns (uint256)
+function classSize(uint64 cls) external view returns (uint256)       // list slots, holes included
+function freeSlotCount(uint64 cls) external view returns (uint256)   // slots that hold no listed arbiter
+function classStats(uint64 cls) external view returns (uint256 slots, uint256 listed, uint256 ghosts)
 function slotIn(bytes32 key, uint64 cls) external view returns (uint256)   // slot index + 1, 0 = none
-function scansAll(uint64 cls) external view returns (bool)                 // classSize <= maxScan
+function isListed(bytes32 key) external view returns (bool)                // in its class lists
+function scansAll(uint64 cls) external view returns (bool)                 // classSize <= maxScan, now
+function scansAllAt(uint64 cls, uint256 atBlock) external view returns (bool)   // as of a request block
+function registryLength() external view returns (uint256)                  // registered arbiters
+function registrySlots() external view returns (uint256)                   // registry slots, holes included
 function revealAfter(bytes32 key, uint256 b)
     external view returns (bytes32 value, uint256 blk, uint256 at, address oracle)
 function isContractApproved(address c) external view returns (bool)        // = approvedContracts(c)
@@ -319,7 +325,83 @@ function setSelection(uint16 _shortlist, uint16 _maxScan, uint8 _liveRandom) ext
 
 // Applies to new registrations, and to an existing arbiter at its next stake change
 function setStakeRequirement(uint256 s) external onlyOwner
+
+// How long an arbiter must be idle before anyone may evict it from its class lists (default 2 days);
+// at least MIN_EVICT_AFTER (MAX_DRAW_AGE + 1 hour), else BadParams()
+function setEvictAfter(uint40 t) external onlyOwner
 ```
+
+### Dense lists and eviction
+
+A selection visits at most `maxScan` (400) slots of the class list. A slot that holds no arbiter,
+or an arbiter that cannot be drawn, still costs a visit, so a list much longer than its eligible
+arbiters gives thin juries: fewer distinct arbiters, repeated to fill the jury. (Before 2026-11-28
+an exit left a hole in the list for good. Registering junk keys in a class and exiting them after
+the 2-day unbonding returned all the stake and thinned every later jury of the class: with 20
+arbiters and 3,000 such holes, 35 of 200 juries of six were one arbiter repeated.)
+
+```solidity
+// Take an idle arbiter out of its class lists (anyone). NotEvictable() unless it is listed and:
+//   paused for evictAfter; or frozen (an unanswered health call) for evictAfter;
+//   or banned, evictAfter after its block ended; or exiting, from its exitAt.
+function evict(bytes32 key) external
+
+// Close up to `budget` holes of a class list, or of the registry, by moving arbiters from the end,
+// clear moved arbiters' old slots once a day has passed, and trim the end (anyone)
+function compact(uint64 cls, uint256 budget) external
+function compactRegistry(uint256 budget) external
+```
+
+- **Listed.** A class list holds the arbiters *listed* in the class (`isListed(key)`). A
+  registration lists the arbiter at once, except one registered with head 0, which is frozen until
+  its node re-syncs: it is listed when it answers its first call. `completeExit` and `evict` unlist.
+- **Eviction is not a penalty.** The registration, stake, scores and offenses stay, and
+  `arbiterClasses(key)` still names its classes. The arbiter is listed again, in the same
+  transaction, when it unpauses (`setPaused(key, false)`) or answers a health call. A banned or
+  exiting arbiter does not return. `ArbiterUnlisted(key)` and `ArbiterListed(key)` report both.
+- **Holes close themselves.** When an arbiter leaves a list, the last listed arbiter is moved
+  into its slot when that is possible in the same transaction; `compact` does the rest after many
+  exits at once. A moved arbiter's old slot (a "ghost") is cleared a day later and the end of the
+  list is trimmed, so a list ends as long as its listed arbiters. `classStats(cls)` shows where a
+  list stands: `slots` (what a draw walks, against `maxScan`), `listed`, and `ghosts`.
+- **A draw still reads the list as of its request block B.** Three rules make that hold (no draw
+  reads a B older than `MAX_DRAW_AGE`, one day):
+    - an arbiter *leaves* a list only when it has been ineligible at every block a draw can still
+      read: by `completeExit` (exiting for at least 2 days) or by `evict` (idle for `evictAfter`,
+      which is why it cannot be set below a day plus an hour);
+    - an arbiter *joins* (a registration, or a return) into a hole or at the end. It was
+      ineligible at every block before it joined, so nothing needs remembering;
+    - a *move* is the one change to an arbiter that may be eligible, so both slots record it for
+      a day: a draw from before the move reads the arbiter at its old slot and a hole at the new
+      one, a later draw the reverse. A slot with a move on record is not moved again until then.
+  `test/keeper.lists.test.js` checks this with random sequences of registrations, pauses, exits,
+  evictions, returns and compaction: the jury, the beacon pick and the pool payee as of an earlier
+  block never change, and a draw as of now meets every eligible arbiter exactly once.
+- **Cost.** While a class has a move on record (or a ghost not yet cleared), each visit of a draw
+  reads one more storage word: about 6% more selection gas at K = 50 on a 300-arbiter class.
+  `completeExit` costs about 0.36M gas (it was 0.13M).
+- **What it does not stop.** An operator that keeps stake locked in keys that are listed but never
+  eligible (paused, then unpaused and paused again before each eviction; or priced above every
+  request's fee ceiling) still costs draws visits for as long as the stake stays. That needs
+  standing capital and a transaction per key every `evictAfter`, where the old attack needed
+  capital for two days and left its damage for good.
+
+#### Runbook: keeping the lists dense
+
+`scripts/tidy-classes.js` reads every class's `classStats`, lists the arbiters that can be evicted
+now, and with `--send` evicts them and compacts each class and the registry. It needs no role and
+moves no funds: run it from any funded account, daily (or from a cron job, which can alert on exit
+code 2: something to evict or compact, or a class longer than `maxScan`).
+
+```bash
+HARDHAT_NETWORK=base node scripts/tidy-classes.js --keeper 0x...            # report
+HARDHAT_NETWORK=base node scripts/tidy-classes.js --keeper 0x... --send     # evict and compact
+```
+
+If a class is still longer than `maxScan` after that (it has more than `maxScan` listed
+arbiters, or idle ones not yet evictable), the owner can raise `maxScan` with `setSelection`: a
+draw's selection gas grows by about 7k per extra visit of a listed arbiter. The arbiters site's
+class table (Slots / listed) and the bounty site's class check show the same numbers.
 
 Approval matters beyond the operator gate: an approved contract can draw juries and change any arbiter's scores through `applyOutcomes`. Approve only contracts you trust. `isContractApproved` keeps v1's name because every deployed ArbiterOperator calls it, and checks that it exists when the keeper is added. The aggregator's `requestAIEvaluationWithApproval` reads `shortlistSize()` to bound K. Lowering the shortlist therefore strands live bounties and listings whose K is above the new value: check first with the applications' `limitImpact.js` (see the aggregator's "Changing a limit later").
 
@@ -345,6 +427,8 @@ struct Points {
 event ArbiterRegistered(bytes32 indexed key, address indexed oracle, bytes32 jobId, uint256 fee);
 event ArbiterRemoved(bytes32 indexed key, uint256 refunded);
 event ExitRequested(bytes32 indexed key, uint256 exitAt);
+event ArbiterListed(bytes32 indexed key);     // joined its class lists (a registration, or a return)
+event ArbiterUnlisted(bytes32 indexed key);   // left them (an eviction, or completeExit)
 event HealthCall(bytes32 indexed key, uint256 sentAt);
 event HealthAnswered(bytes32 indexed key, uint256 answeredAt);
 event ChainResynced(bytes32 indexed key);
@@ -526,6 +610,7 @@ Scores are capped at `cap` (1,000). An arbiter that was not promoted, or whose r
 | `burnOnBan` | false | Burn the whole stake on a ban | `setPenalties` |
 | `shortlistSize` | 60 | Most arbiters weighed per selection; also bounds a request's K | `setSelection` |
 | `maxScan` | 400 | Most list entries visited per selection | `setSelection` |
+| `evictAfter` | 2 days | Idle time before anyone may evict an arbiter from its class lists (at least 1 day + 1 hour) | `setEvictAfter` |
 | `liveRandom` | 3 | Extra random health calls per selection | `setSelection` |
 
 ## Security Considerations

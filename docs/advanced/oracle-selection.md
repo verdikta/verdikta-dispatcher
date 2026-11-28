@@ -73,10 +73,10 @@ Blocked and banned arbiters are never admitted to fill a jury, even in a shortag
 
 Two different things are called classes:
 
-- **Arbiter classes** are protocol data. Each arbiter registers in 1 to 5 classes (`uint64` identifiers, `registerArbiter(..., classes, ...)`), and each request names one (`requestedClass`). The keeper keeps one list per class and draws only from that list. What a class means (a model family, a capability, a language) is a convention between requesters and operators; v1's arbiters on Base all listed class 128. `arbiterClasses(key)` lists an arbiter's classes, `classSize(class)` a list's length including freed slots.
+- **Arbiter classes** are protocol data. Each arbiter registers in 1 to 5 classes (`uint64` identifiers, `registerArbiter(..., classes, ...)`), and each request names one (`requestedClass`). The keeper keeps one list per class and draws only from that list. What a class means (a model family, a capability, a language) is a convention between requesters and operators; v1's arbiters on Base all listed class 128. `arbiterClasses(key)` lists an arbiter's classes, `classSize(class)` a list's slots and `classStats(class)` its slots against the arbiters listed in it.
 - **Jury sizes** (the bounty program's Small, Medium, Large and Jumbo) are application presets: `K/M/N/P/timeout` and the beacon flag, sent with each request. The aggregator knows nothing of them; one deployment serves every size.
 
-Exits free slots: `completeExit` empties the arbiter's slot in each of its classes, and the next registration in that class takes a freed slot before the list grows. A draw at B still reads B's occupants correctly, because an exiting arbiter has been ineligible since `requestExit`, at least the unbonding period (2 days) before its slot is freed, and no draw reads a B older than a day.
+Lists stay dense: when an arbiter leaves a class list (`completeExit`, or an eviction after 2 days idle: `evict`), the last listed arbiter is moved into its slot, and the move is kept on record for a day so that a draw at B still reads the list as of B (a draw from before the move reads the arbiter at its old slot). An arbiter only leaves once it has been ineligible at every block a draw can still read (no draw reads a B older than a day), and one that joins was ineligible before it joined. See [ReputationKeeper, "Dense lists and eviction"](../contracts/reputation-keeper.md#dense-lists-and-eviction).
 
 ## The Keeper's Shortlist
 
@@ -108,7 +108,7 @@ if ratio > 1e18:  weight = weight × ratio / 1e18
 
 The keeper draws K arbiters from the shortlist of m, without replacement, each draw with `pivot = keccak256(seed, k) % remainingWeight`. Every juror gets a health call, and so do `liveRandom` (3) other shortlisted arbiters, chosen from the seed: these calls are how the keeper learns that an arbiter is down (it freezes if it does not answer within `callDeadline`).
 
-If `m` is 0 the keeper reverts with `NoEligibleArbiters()`. The aggregator catches it: the round fails (phase 8) and the requester is refunded, since no jury could be drawn and the refund is no re-roll. After a beacon stage, the refund goes to the arbiter pool unless `scansAll(class)` holds, because then whether a jury could be found depended on the seed the beacons helped choose.
+If `m` is 0 the keeper reverts with `NoEligibleArbiters()`. The aggregator catches it: the round fails (phase 8) and the requester is refunded, since no jury could be drawn and the refund is no re-roll. After a beacon stage, the refund goes to the arbiter pool unless `scansAllAt(class, B)` holds (the list as of the request block), because then whether a jury could be found depended on the seed the beacons helped choose.
 
 ### A Thin Pool Repeats Arbiters
 

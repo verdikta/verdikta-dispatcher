@@ -129,7 +129,7 @@ comparing the two ABIs and the code that calls them.
 | (none; v2 drafts until 2026-11-25 had `treasury()`) | none: `treasury()` is removed and there is no treasury. Prepay that is not refunded goes to the committers of a never-promoted round or to the arbiter pool (changed 2026-11-25) |
 | (none; v2 drafts had `setContracts(keeper, beacons, treasury)`) | `setContracts(keeper, beacons)`: two arguments; reverts `InvalidConfig` only for a zero keeper. The deploy no longer reads `TREASURY_ADDRESS` (changed 2026-11-25) |
 | (none) | new events: `CommitPayment(aggId, payee, amount)`, one per committed slot of a never-promoted round, at settlement; `PoolPayment(aggId, payee, amount)`, an arbiter pool payout at a draw (declared in `AggregatorLib`, emitted in the aggregator's context: include it in the ABI you decode with). `RequesterRefunded(aggId, address(0), amount)` now marks a credit to the pool (added 2026-11-25) |
-| (none) | the arbiter pool: `ethOwed(address(0))`, which nobody can withdraw (`withdrawEthFor(address(0))` reverts `NotAuthorized`). Each `drawJury` that draws a jury pays an eighth of it (at most that draw's base fees) to one registered arbiter picked by the keeper's new `poolPayee(seed)`; the keeper also has `registryLength()` (added 2026-11-25) |
+| (none) | the arbiter pool: `ethOwed(address(0))`, which nobody can withdraw (`withdrawEthFor(address(0))` reverts `NotAuthorized`). Each `drawJury` that draws a jury pays an eighth of it (at most that draw's base fees) to one registered arbiter picked by the keeper's new `poolPayeeAt(seed, B, time of B)`; the keeper also has `registryLength()` (added 2026-11-25) |
 
 Behaviour BountyEscrow must allow for:
 
@@ -147,7 +147,7 @@ Behaviour BountyEscrow must allow for:
     - a missed beacon quorum (phase 8, `EvaluationFailed(aggId, 2)`);
     - a cancelled round (phase 9: never sealed within ~27 min, or sealed but undrawn for a day);
     - a beacon round whose jury can't be drawn once the beacon values are in, when the class list is
-      longer than the keeper's `maxScan` (`keeper.scansAll(cls)` is false). The beacons are still paid.
+      longer than the keeper's `maxScan` (`keeper.scansAllAt(cls, B)` is false, as of the request block). The beacons are still paid.
 
   The hunter may re-run (item 12), but its `refundLeftoverEth` gets nothing back for that round.
 - **Refunds land in `ethOwed[wallet]`:**

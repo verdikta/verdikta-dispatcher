@@ -70,27 +70,6 @@ describe("ReputationKeeper security PoCs", function () {
       expect(steered).to.equal(base);
     });
 
-    it("legacy poolPayee(seed) reads live state: registrations after the seed is known steer it (PoC)", async () => {
-      const atk = signers[5];
-      const A = await attacker(1, atk);
-      let base = 0, steered = 0;
-      const N = 40;
-      for (let s = 0; s < N; s++) {
-        const seed = rndSeed();
-        const snap = await ethers.provider.send("evm_snapshot", []);
-        if ((await keeper.poolPayee(seed)) === atk.address) base++;
-        let won = false;
-        for (let k = 0; k < 6 && !won; k++) {
-          await reg(A.op, atk, 2000 + s * 10 + k);
-          won = (await keeper.poolPayee(seed)) === atk.address;
-        }
-        if (won) steered++;
-        await ethers.provider.send("evm_revert", [snap]);
-      }
-      console.log(`      legacy pick: attacker (1 of 13 keys) wins ${base}/${N} honestly, ${steered}/${N} steering with <= 6 extra registrations`);
-      expect(steered).to.be.greaterThan(base * 2);
-    });
-
     it("frozen (dead) and blocked arbiters do not win the pool; paused ones do not either", async () => {
       const [bn0] = await at();
       // freeze all but arbs[0]; block arbs[1] instead of freezing it
@@ -115,17 +94,25 @@ describe("ReputationKeeper security PoCs", function () {
       }
     });
 
-    it("exits keep the registry slots dense in use: a freed slot is reused and registryLength counts registered arbiters", async () => {
+    it("exits keep the registry dense: the hole is closed by a move, and registryLength counts registered arbiters", async () => {
       const a = arbs[3];
       await keeper.requestExit(a.key);
       await time.increase(2 * DAY + 1);
       await keeper.completeExit(a.key);
       expect(await keeper.registryLength()).to.equal(11n);
       await expect(keeper.completeExit(a.key)).to.be.reverted;   // nothing left to exit
+      // the last key moved into the hole; its old slot is a ghost for a day (draws from before read it)
+      expect(await keeper.registrySlots()).to.equal(12n);
       const atk = signers[5];
       await attacker(1, atk);
       expect(await keeper.registryLength()).to.equal(12n);
-      expect(await keeper.registrySlots()).to.equal(12n);   // took the freed slot
+      expect(await keeper.registrySlots()).to.equal(13n);   // appended behind the ghost
+      for (let i = 0; i < 2; i++) {                         // the ghost ages out; closing its slot moves the
+        await time.increase(DAY + 1);                       // last key and leaves one more ghost for a day
+        await keeper.compactRegistry(8);
+      }
+      expect(await keeper.registrySlots()).to.equal(12n);
+      expect(await keeper.registryLength()).to.equal(12n);
     });
   });
 

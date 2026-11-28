@@ -37,13 +37,24 @@ interface IBurnableToken { function burn(uint256 amount) external; }
  *         lists have checkpointed lengths, so state changes between B and the draw cannot shift the
  *         result.
  *
- *         Slot reuse: completeExit frees the arbiter's slot in each of its classes, and the next
- *         registration in that class takes a freed slot before appending. A draw reads a slot's current
- *         occupant as of B, which is still the as-of-B answer: the old occupant has been ineligible
- *         (exiting) since requestExit, at least `unbondingPeriod` (>= MIN_UNBONDING, 2 days) before its
- *         slot was freed, and a new occupant was not registered at B, or was exiting or gone. Both hold
- *         for any B less than `unbondingPeriod` old, and no draw reads a B older than MAX_DRAW_AGE
- *         (1 day; the aggregator stops draws then, and selection refuses an older B).
+ *         Lists stay dense (review 2026-11-27, item 1). A class list holds the arbiters LISTED in the
+ *         class: registered, and not unlisted by an exit or an eviction. Three rules keep a draw's
+ *         answer the as-of-B one while the list changes under it (no draw reads a B older than
+ *         MAX_DRAW_AGE, 1 day: the aggregator stops draws then, and selection refuses an older B):
+ *           - a key LEAVES a list only when it has been ineligible for every readable B: by
+ *             completeExit (exiting for `unbondingPeriod` >= 2 days) or by evict (paused, frozen,
+ *             banned or exit-ready for `evictAfter` > MAX_DRAW_AGE). So its slot may read as the key
+ *             or as a hole: the same draw either way;
+ *           - a key JOINS (a registration, or the return of an evicted key when it unpauses or
+ *             answers) into a hole or at the end. It was ineligible at every B before it joined, so no
+ *             history is needed;
+ *           - a hole is closed by MOVING the last listed key into it. That key may be eligible, so the
+ *             move is recorded for MAX_DRAW_AGE: a draw from before it reads the key at its old slot
+ *             (a "ghost") and a hole at the new one, a later draw the reverse. A slot with a move on
+ *             record is not moved again until the record has aged out. Ghosts are then cleared and
+ *             trailing holes trimmed (the length is checkpointed), so a list ends as long as its
+ *             listed arbiters. Before this, an exit left a hole for good: registering junk keys and
+ *             exiting them thinned every later jury of the class, with all the stake returned.
  *
  * @dev Selection visits the requested class's list (as of B) in a seed-derived random order (random
  *      positions without repeats, see _nextPos) and stops once the shortlist is full or after `maxScan`
@@ -92,7 +103,9 @@ contract ReputationKeeper is Ownable {
         uint8 offenses;
         uint40 cleanFrom;       // decay anchor: end of the last block (or registration)
         uint40 exitAt;          // unbonding release time (0 = not exiting)
+        bool listed;            // in its class lists (see the contract notes; evict, _list)
         uint96 stake;
+        uint40 pausedAt;        // when it was last paused (eviction counts from it)
         bytes32 jobId;
     }
 
@@ -109,6 +122,37 @@ contract ReputationKeeper is Ownable {
         uint32 fromBlock;
         uint224 len;
     }
+
+    /// @dev a slot's last move, kept for MAX_DRAW_AGE: ARRIVED = the key was moved INTO this slot at
+    ///      sinceBlock (a draw from before reads a hole); GHOST = the key was moved OUT at sinceBlock and
+    ///      is still stored here (a draw from before reads it, a later one a hole)
+    struct SlotMeta {
+        uint32 sinceBlock;
+        uint40 sinceTime;
+        uint8 kind;
+    }
+
+    struct Cool {
+        uint32 pos;
+        uint40 at;
+    }
+
+    /// @dev a dense list of keys with as-of-block reads (a class list, or the registry)
+    struct SlotList {
+        bytes32[] slots;                      // 0 = a hole; trailing holes are trimmed
+        LenCk[] len;                          // slots.length, checkpointed
+        uint32[] free;                        // holes, checked when taken (an entry may be stale)
+        mapping(uint256 => SlotMeta) meta;
+        Cool[] cooling;                       // ghosts, oldest first, from coolHead on
+        mapping(bytes32 => uint32) posOf;     // slot index + 1 (0 = not in the list)
+        // one word, read once per draw:
+        uint40 dirtyUntil;                    // a move is on record until then (reads check meta)
+        uint32 live;                          // keys in the list
+        uint32 coolHead;
+        uint32 ghosts;                        // ghosts not cleared yet
+    }
+    uint8 private constant ARRIVED = 1;
+    uint8 private constant GHOST = 2;
 
     struct Points {
         uint16 gain;   // +20  delivered / close
@@ -154,6 +198,7 @@ contract ReputationKeeper is Ownable {
     error FutureBlock();
     error StaleBlock();
     error StaleAnswer();
+    error NotEvictable();
 
     // ------------------------------------------------------------------ events
     event ArbiterRegistered(bytes32 indexed key, address indexed oracle, bytes32 jobId, uint256 fee);
@@ -166,6 +211,10 @@ contract ReputationKeeper is Ownable {
     event ArbiterBanned(bytes32 indexed key, uint256 burned);
     event OutcomeSkippedFrozen(bytes32 indexed key);
     event ExitRequested(bytes32 indexed key, uint256 exitAt);
+    /// @notice The arbiter joined its class lists (a registration, or the return of an evicted key)
+    event ArbiterListed(bytes32 indexed key);
+    /// @notice The arbiter left its class lists: evicted after `evictAfter` idle, or by completeExit
+    event ArbiterUnlisted(bytes32 indexed key);
     event ContractApproval(address indexed aggregator, bool approved);
     event RolesSet(address indexed account, uint8 roles);
 
@@ -175,11 +224,8 @@ contract ReputationKeeper is Ownable {
     mapping(bytes32 => Ck[]) internal cks;
     mapping(bytes32 => Meta) internal metas;
     mapping(bytes32 => HeadCk[]) internal heads;
-    mapping(uint64 => bytes32[]) internal classList;     // slots: 0 = freed by an exit, reused by the next join
-    mapping(uint64 => LenCk[]) internal classLen;
-    mapping(uint64 => uint32[]) internal freeSlots;      // freed slot indices per class
-    mapping(bytes32 => uint64[]) internal classesOf;
-    mapping(bytes32 => mapping(uint64 => uint32)) internal slotOf;   // slot index + 1 (0 = not listed)
+    mapping(uint64 => SlotList) internal lists;          // the listed arbiters of each class
+    mapping(bytes32 => uint64[]) internal classesOf;     // kept while evicted; cleared by completeExit
     /// @notice What each contract may do (least privilege): ROLE_GATE answers ArbiterOperator's
     ///         isContractApproved, ROLE_SELECT draws juries and beacons (and sends their health calls),
     ///         ROLE_SCORE reports outcomes (rewrites scores, blocks, bans, burns). The aggregator needs all
@@ -193,13 +239,9 @@ contract ReputationKeeper is Ownable {
     /// @dev beacon picks awaiting their stage's end: keccak256(caller, keys, atBlock, time picked) -> count.
     ///      Only a pick recorded here can be charged for silent beacons (missedBeacons), once.
     mapping(bytes32 => uint256) internal beaconPicks;
-    /// @dev every registered arbiter once (the arbiter pool's draw), in slots like the class lists: an
-    ///      exit frees its slot (0) for the next registration, and the length is checkpointed, so the pool
-    ///      pick reads the registry as of the request block with the class lists' slot-reuse argument
-    bytes32[] internal registry;
-    mapping(bytes32 => uint256) internal registryPos;   // index + 1 (0 = not listed)
-    uint32[] internal freeRegSlots;
-    LenCk[] internal registryLen;
+    /// @dev every registered arbiter once (the arbiter pool's draw), a list like the class lists: the
+    ///      pool pick reads it as of the request block
+    SlotList internal reg;
 
     Points public points = Points(20, 50, 200, 500, 400, 500, 1000);
     uint256 public stakeRequirement = 100e18;
@@ -219,6 +261,13 @@ contract ReputationKeeper is Ownable {
     uint16 public shortlistSize = 60;
     uint16 public maxScan = 400;              // bound on entries walked per selection
     uint8 public liveRandom = 3;              // extra random health calls per selection
+    /// @notice How long an arbiter must have been paused, frozen, banned (past its block) before anyone
+    ///         may evict it from its class lists (owner-set, above MIN_EVICT_AFTER). An exiting arbiter
+    ///         is evictable from its exitAt.
+    uint40 public evictAfter = 2 days;
+    /// @notice Shortest evictAfter: an evicted key must have been ineligible at every block a draw can
+    ///         still read (MAX_DRAW_AGE), with a margin.
+    uint40 public constant MIN_EVICT_AFTER = MAX_DRAW_AGE + 1 hours;
     address public constant DEAD = 0x000000000000000000000000000000000000dEaD;
 
     constructor(address token) Ownable(msg.sender) {
@@ -272,7 +321,207 @@ contract ReputationKeeper is Ownable {
     }
 
     function _lenAt(uint64 cls, uint256 b) internal view returns (uint256) {
-        return _lenAtOf(classLen[cls], b);
+        return _lenAtOf(lists[cls].len, b);
+    }
+
+    // ================================================================== dense lists (see the contract notes)
+    /// @dev the key at `pos` as of block `b` (0 = a hole). `dirty`: a move is on record (_dirty)
+    function _slot(SlotList storage L, uint256 pos, uint256 b, bool dirty) internal view returns (bytes32 k) {
+        if (pos >= L.slots.length) return bytes32(0);     // trimmed since b: it was a hole
+        k = L.slots[pos];
+        if (dirty && k != bytes32(0)) {
+            SlotMeta memory m = L.meta[pos];
+            if (m.kind == ARRIVED ? b < m.sinceBlock : (m.kind == GHOST && b >= m.sinceBlock)) return bytes32(0);
+        }
+    }
+
+    /// @dev whether reads must check the slots' move records: a move is younger than MAX_DRAW_AGE, or a
+    ///      ghost has not been cleared yet (it still holds its key, which now lives in another slot)
+    function _dirty(SlotList storage L) internal view returns (bool) {
+        return block.timestamp <= L.dirtyUntil || L.ghosts != 0;
+    }
+
+    /// @dev add `key`: into a hole if one is waiting, else at the end. The caller guarantees the key was
+    ///      ineligible at every block before this one.
+    function _join(SlotList storage L, bytes32 key) internal {
+        _tidy(L, 2);
+        uint256 n = L.slots.length;
+        uint256 pos = n;
+        for (uint256 tries = 0; tries < 8 && L.free.length > 0; tries++) {
+            uint256 f = L.free[L.free.length - 1];
+            L.free.pop();
+            if (f < n && L.slots[f] == bytes32(0)) {      // else stale: trimmed, or filled since
+                pos = f;
+                break;
+            }
+        }
+        if (pos == n) {
+            L.slots.push(key);
+            _pushLen(L.len, n + 1);
+        } else {
+            L.slots[pos] = key;
+        }
+        L.posOf[key] = uint32(pos + 1);
+        L.live++;
+    }
+
+    /// @dev remove `key` (no-op if absent). The caller guarantees the key has been ineligible at every
+    ///      block a draw can still read. The hole is closed at once when the last key can be moved.
+    function _leave(SlotList storage L, bytes32 key) internal {
+        uint256 p = L.posOf[key];
+        if (p == 0) return;
+        p -= 1;
+        delete L.posOf[key];
+        L.live--;
+        L.slots[p] = bytes32(0);
+        _tidy(L, 2);
+        if (p < L.slots.length) {
+            // only a hole among the first `live` slots is worth a move: a dense list ends there, so a
+            // key moved further back would have to move again
+            bool moved;
+            if (p < L.live) (moved, ) = _fill(L, p, L.slots.length, 6);
+            if (!moved) L.free.push(uint32(p));
+        }
+    }
+
+    /// @dev move the last key of the list into the hole `p`: the last one below slot `i` that is after
+    ///      `p`, found within `steps` slots, and whose slot has no move on record. Both slots record the
+    ///      move (SlotMeta). Returns whether it moved one, and where the search stopped (for the next hole).
+    function _fill(SlotList storage L, uint256 p, uint256 i, uint256 steps) internal returns (bool, uint256) {
+        for (; steps > 0 && i > p + 1; steps--) {
+            i--;
+            bytes32 k = L.slots[i];
+            if (k == bytes32(0)) continue;
+            SlotMeta memory m = L.meta[i];
+            if (m.kind == GHOST) continue;                                   // a ghost: its key is elsewhere
+            if (uint256(m.sinceTime) + MAX_DRAW_AGE >= block.timestamp) return (false, i + 1);   // moved within a day
+            L.slots[p] = k;
+            L.posOf[k] = uint32(p + 1);
+            L.meta[p] = SlotMeta(uint32(block.number), uint40(block.timestamp), ARRIVED);
+            L.meta[i] = SlotMeta(uint32(block.number), uint40(block.timestamp), GHOST);
+            L.cooling.push(Cool(uint32(i), uint40(block.timestamp)));
+            L.ghosts++;
+            L.dirtyUntil = uint40(block.timestamp) + MAX_DRAW_AGE;
+            return (true, i);
+        }
+        return (false, i);
+    }
+
+    /// @dev clear up to `budget` ghosts whose move has aged out, then trim up to 4 x budget trailing holes
+    function _tidy(SlotList storage L, uint256 budget) internal {
+        uint256 h = L.coolHead;
+        uint256 n = L.cooling.length;
+        for (uint256 k = 0; k < budget && h < n; k++) {
+            Cool memory c = L.cooling[h];
+            if (uint256(c.at) + MAX_DRAW_AGE >= block.timestamp) break;
+            L.slots[c.pos] = bytes32(0);
+            delete L.meta[c.pos];
+            L.free.push(c.pos);
+            delete L.cooling[h];
+            h++;
+        }
+        if (h != L.coolHead) {
+            L.ghosts -= uint32(h - L.coolHead);
+            L.coolHead = uint32(h);
+        }
+        uint256 len = L.slots.length;
+        uint256 t;
+        while (len > 0 && t < 4 * budget && L.slots[len - 1] == bytes32(0)) {
+            L.slots.pop();
+            len--;
+            t++;
+        }
+        if (t > 0) _pushLen(L.len, len);
+    }
+
+    /// @dev close up to `budget` holes by moving keys from the end (and tidy with the same budget). One
+    ///      pass from the end of the list: a hole at or after the last key that can move is left for the trim.
+    function _compact(SlotList storage L, uint256 budget) internal {
+        _tidy(L, budget);
+        uint256 i = L.slots.length;
+        uint256 steps = 8 * budget;
+        uint256 n = L.free.length;
+        // Each free entry is looked at once: taken (a move), dropped (stale), or kept for later.
+        // Only holes among the first `live` slots are filled (a dense list ends there); later ones wait
+        // for the trim.
+        uint256 at;
+        uint256 looks = 8 * budget;
+        for (uint256 moved = 0; at < n && moved < budget && steps > 0 && looks > 0; looks--) {
+            uint256 f = L.free[at];
+            bool drop = f >= L.slots.length || L.slots[f] != bytes32(0);     // stale: trimmed, or filled since
+            if (!drop && f >= L.live) {
+                at++;
+                continue;
+            }
+            if (!drop) {
+                uint256 before = i;
+                (drop, i) = _fill(L, f, i, steps);
+                steps -= before - i < steps ? before - i : steps;
+                if (drop) moved++;
+            }
+            if (drop) {
+                L.free[at] = L.free[n - 1];
+                L.free.pop();
+                n--;
+            } else {
+                at++;
+            }
+        }
+    }
+
+    /// @notice Close holes in a class list (anyone; `budget` bounds the work). Exits and evictions close
+    ///         their own hole when they can; this does the rest after many of them.
+    function compact(uint64 cls, uint256 budget) external {
+        _compact(lists[cls], budget);
+    }
+
+    /// @notice As compact, for the registry the arbiter pool's pick reads.
+    function compactRegistry(uint256 budget) external {
+        _compact(reg, budget);
+    }
+
+    /// @dev put a registered key into its class lists
+    function _list(bytes32 key, Meta storage m) internal {
+        if (m.listed) return;
+        m.listed = true;
+        uint64[] storage cs = classesOf[key];
+        for (uint256 i = 0; i < cs.length; i++) _join(lists[cs[i]], key);
+        emit ArbiterListed(key);
+    }
+
+    function _unlist(bytes32 key, Meta storage m) internal {
+        if (!m.listed) return;
+        m.listed = false;
+        uint64[] storage cs = classesOf[key];
+        for (uint256 i = 0; i < cs.length; i++) _leave(lists[cs[i]], key);
+        emit ArbiterUnlisted(key);
+    }
+
+    /// @dev an evicted (or never listed) key returns once it can be selected again
+    function _relist(bytes32 key, Meta storage m, Ck memory c) internal {
+        if (m.listed || c.flags & (F_REGISTERED | F_PAUSED | F_BANNED | F_EXITING) != F_REGISTERED) return;
+        if (_frozenAt(c, block.timestamp)) return;
+        _list(key, m);
+    }
+
+    /**
+     * @notice Take an idle arbiter out of its class lists (anyone). Not a penalty: the registration,
+     *         stake and scores stay, and the arbiter returns by itself when it unpauses or answers a
+     *         health call. Evictable: paused for `evictAfter`; frozen (an unanswered health call) for
+     *         `evictAfter`; banned, `evictAfter` after its block ended; or exiting, from its exitAt.
+     *         Each means the key has been ineligible at every block a draw can still read, so taking
+     *         it out changes no draw. An idle key in a list costs every draw of the class a visit.
+     */
+    function evict(bytes32 key) external {
+        Meta storage m = metas[key];
+        Ck memory c = _cur(key);
+        uint256 ea = evictAfter;
+        bool ok = (c.flags & F_EXITING != 0 && m.exitAt != 0 && block.timestamp >= m.exitAt)
+            || (c.flags & F_PAUSED != 0 && block.timestamp > uint256(m.pausedAt) + ea)
+            || (c.flags & F_BANNED != 0 && block.timestamp > uint256(c.blockedUntil) + ea)
+            || (c.flags & F_CALL_PENDING != 0 && block.timestamp > uint256(c.callSentAt) + callDeadline + ea);
+        if (!m.listed || !ok) revert NotEvictable();
+        _unlist(key, m);
     }
 
     function _lenAtOf(LenCk[] storage a, uint256 b) internal view returns (uint256) {
@@ -332,42 +581,19 @@ contract ReputationKeeper is Ownable {
         // head 0: the node sets its chain with its first answer (a re-sync); frozen until then
         if (chainHead == bytes32(0)) _resyncFreeze(c);
         _write(key, c);
-        {
-            uint256 nf = freeRegSlots.length;
-            uint256 rp;
-            if (nf > 0) {
-                rp = freeRegSlots[nf - 1];
-                freeRegSlots.pop();
-                registry[rp] = key;
-            } else {
-                rp = registry.length;
-                registry.push(key);
-                _pushLen(registryLen, registry.length);
-            }
-            registryPos[key] = rp + 1;
-        }
-        // a freed slot first (see the contract notes), else append. A returning arbiter's slots were
-        // freed at its exit, so it takes its classes from this registration like a new one
+        _join(reg, key);
+        // A returning arbiter's classes were cleared at its exit, so it takes them from this
+        // registration like a new one (a class named twice counts once)
+        uint64[] storage cs = classesOf[key];
         for (uint256 i = 0; i < classes.length; i++) {
             uint64 cl = classes[i];
-            if (slotOf[key][cl] != 0) continue;
-            classesOf[key].push(cl);
-            bytes32[] storage list = classList[cl];
-            uint32[] storage free = freeSlots[cl];
-            uint256 nf = free.length;
-            uint256 pos;
-            if (nf > 0) {
-                pos = free[nf - 1];
-                free.pop();
-                list[pos] = key;
-            } else {
-                pos = list.length;
-                list.push(key);
-                _pushLen(classLen[cl], list.length);
-            }
-            slotOf[key][cl] = uint32(pos + 1);
+            bool dup;
+            for (uint256 j = 0; j < cs.length; j++) if (cs[j] == cl) dup = true;
+            if (!dup) cs.push(cl);
         }
         emit ArbiterRegistered(key, oracle, jobId, fee);
+        // listed now, unless it starts frozen (head 0): then at its first answer to a call (_answer)
+        if (chainHead != bytes32(0)) _list(key, m);
     }
 
     function _pushLen(LenCk[] storage lc, uint256 len) internal {
@@ -377,10 +603,12 @@ contract ReputationKeeper is Ownable {
     }
 
     function setPaused(bytes32 key, bool paused) external {
-        _onlyArbiterOwner(key);
+        Meta storage m = _onlyArbiterOwner(key);
         Ck memory c = _cur(key);
+        if (paused && c.flags & F_PAUSED == 0) m.pausedAt = uint40(block.timestamp);   // eviction counts from here
         c.flags = paused ? (c.flags | F_PAUSED) : (c.flags & ~F_PAUSED);
         _write(key, c);
+        if (!paused) _relist(key, m, c);       // an evicted key returns
     }
 
     function setFee(bytes32 key, uint64 fee) external {
@@ -432,25 +660,15 @@ contract ReputationKeeper is Ownable {
         Ck memory c = _cur(key);
         if (c.flags & F_EXITING == 0 || block.timestamp < m.exitAt) revert StillBonded();
         if (c.blockedUntil > block.timestamp) revert Blocked();
-        uint256 rp = registryPos[key];
-        if (rp == 0) revert NotRegistered();         // a banned key's tombstone has exited already
+        if (reg.posOf[key] == 0) revert NotRegistered();   // a banned key's tombstone has exited already
         uint256 refund = m.stake;
         address to = IOracleOwner(m.oracle).owner();
         m.stake = 0;
         if (c.flags & F_BANNED == 0) c.flags = 0;     // unregistered; may register again later
         _write(key, c);
-        uint64[] storage cs = classesOf[key];
-        for (uint256 i = 0; i < cs.length; i++) {
-            uint64 cl = cs[i];
-            uint256 pos = slotOf[key][cl] - 1;
-            classList[cl][pos] = bytes32(0);
-            freeSlots[cl].push(uint32(pos));
-            delete slotOf[key][cl];
-        }
+        _unlist(key, m);                              // if an eviction has not taken it out already
         delete classesOf[key];
-        registry[rp - 1] = bytes32(0);
-        freeRegSlots.push(uint32(rp - 1));
-        delete registryPos[key];
+        _leave(reg, key);
         if (refund > 0 && !verdiktaToken.transfer(to, refund)) revert TransferFailed();
         emit ArbiterRemoved(key, refund);
     }
@@ -535,6 +753,7 @@ contract ReputationKeeper is Ownable {
             c.callAnsweredAt = uint40(block.timestamp);
             c.flags &= ~F_CALL_PENDING;
             _write(key, c);
+            _relist(key, m, c);                          // a key registered with head 0, or evicted, joins its lists
         }
         emit HealthAnswered(key, block.timestamp);
     }
@@ -672,9 +891,10 @@ contract ReputationKeeper is Ownable {
             revert BadParams();
         if (atBlock >= block.number) revert FutureBlock();
         if (atTime + MAX_DRAW_AGE < block.timestamp) revert StaleBlock();
-        bytes32[] storage list = classList[sp.requestedClass];
-        uint256 n = _lenAt(sp.requestedClass, atBlock);
+        SlotList storage list = lists[sp.requestedClass];
+        uint256 n = _lenAtOf(list.len, atBlock);
         if (n == 0) revert NoEligibleArbiters();
+        bool dirty = _dirty(list);
 
         uint256 s = uint256(seed);
         uint256 cap = shortlistSize;
@@ -686,8 +906,8 @@ contract ReputationKeeper is Ownable {
         uint256 m;
         uint256 total;
         for (uint256 i = 0; i < scanLimit && m < cap; i++) {
-            bytes32 key = list[_nextPos(wk)];
-            if (key == bytes32(0)) continue;          // a freed slot (counts as a visit)
+            bytes32 key = _slot(list, _nextPos(wk), atBlock, dirty);
+            if (key == bytes32(0)) continue;          // a hole (counts as a visit)
             Ck memory c = _at(key, atBlock);
             if (_eligibleAt(c, sp.maxFee, atTime)) {
                 sk[m] = key;
@@ -758,12 +978,13 @@ contract ReputationKeeper is Ownable {
         uint256 n = _lenAt(cls, atBlock);
         uint256 m;
         if (n > 0) {
-            bytes32[] storage list = classList[cls];
+            SlotList storage list = lists[cls];
+            bool dirty = _dirty(list);
             uint256 scanLimit = maxScan < n ? maxScan : n;
             Walk memory wk = _walk(seed, n, scanLimit);
             for (uint256 i = 0; i < scanLimit && m < count; i++) {
-                bytes32 key = list[_nextPos(wk)];
-                if (key == bytes32(0)) continue;      // a freed slot (counts as a visit)
+                bytes32 key = _slot(list, _nextPos(wk), atBlock, dirty);
+                if (key == bytes32(0)) continue;      // a hole (counts as a visit)
                 Ck memory c = _at(key, atBlock);
                 if (_eligibleAt(c, maxFee, atTime)) {
                     keys[m] = key;
@@ -1018,33 +1239,54 @@ contract ReputationKeeper is Ownable {
 
     /// @notice Number of arbiters currently eligible for `cls` at fee ceiling `maxFee` (off-chain view).
     function eligibleCount(uint64 cls, uint256 maxFee) external view returns (uint256 c) {
-        bytes32[] storage list = classList[cls];
-        for (uint256 i = 0; i < list.length; i++) {
-            bytes32 k = list[i];
-            if (_eligibleAt(_cur(k), maxFee, block.timestamp)) c++;
+        SlotList storage list = lists[cls];
+        bool dirty = _dirty(list);
+        for (uint256 i = 0; i < list.slots.length; i++) {
+            bytes32 k = _slot(list, i, block.number, dirty);
+            if (k != bytes32(0) && _eligibleAt(_cur(k), maxFee, block.timestamp)) c++;
         }
     }
 
-    /// @notice Slots in the class list, including freed ones (what a selection walks)
+    /// @notice Slots in the class list, holes included (what a selection walks)
     function classSize(uint64 cls) external view returns (uint256) {
-        return classList[cls].length;
+        return lists[cls].slots.length;
     }
 
-    /// @notice Freed slots waiting for the next registration in `cls`
+    /// @notice Slots of `cls` that hold no listed arbiter: holes, and ghosts waiting out their day
     function freeSlotCount(uint64 cls) external view returns (uint256) {
-        return freeSlots[cls].length;
+        return lists[cls].slots.length - lists[cls].live;
     }
 
-    /// @notice The arbiter's slot index in `cls` plus one (0 = not listed)
+    /// @notice A class list's health: its slots (what a selection walks, against maxScan), the arbiters
+    ///         listed in it, and the ghosts still waiting out their day. slots - listed is what a draw
+    ///         wastes visits on; it falls to 0 as holes are closed (compact) and ghosts age out. Listed
+    ///         arbiters that are paused, frozen or priced out also cost visits: see eligibleCount, evict.
+    function classStats(uint64 cls) external view returns (uint256 slots, uint256 listed, uint256 ghosts) {
+        SlotList storage L = lists[cls];
+        return (L.slots.length, L.live, L.ghosts);
+    }
+
+    /// @notice The arbiter's slot index in `cls` plus one (0 = not in the list)
     function slotIn(bytes32 key, uint64 cls) external view returns (uint256) {
-        return slotOf[key][cls];
+        return lists[cls].posOf[key];
     }
 
-    /// @notice Whether a selection walks the whole class list, so that whether it finds enough
-    ///         eligible arbiters does not depend on the seed (lists never shrink, freed slots are reused,
-    ///         so this holds as of B too)
+    /// @notice Whether the arbiter is in its class lists (false while evicted, or before its first answer
+    ///         when registered with head 0)
+    function isListed(bytes32 key) external view returns (bool) {
+        return metas[key].listed;
+    }
+
+    /// @notice Whether a selection walks the whole class list now (see scansAllAt)
     function scansAll(uint64 cls) external view returns (bool) {
-        return classList[cls].length <= maxScan;
+        return lists[cls].slots.length <= maxScan;
+    }
+
+    /// @notice Whether a selection as of block `atBlock` walks the whole class list, so that whether it
+    ///         finds enough eligible arbiters does not depend on the seed. As of the request block, since
+    ///         a list can shrink after it.
+    function scansAllAt(uint64 cls, uint256 atBlock) external view returns (bool) {
+        return _lenAt(cls, atBlock) <= maxScan;
     }
 
     /// @notice The arbiter pool's draw (the aggregator's forfeits, paid out a share per draw): a registered
@@ -1059,10 +1301,11 @@ contract ReputationKeeper is Ownable {
     ///         MAX_DRAW_AGE, or not yet complete, gives address(0).
     function poolPayeeAt(bytes32 seed, uint256 atBlock, uint256 atTime) external view returns (address) {
         if (atBlock >= block.number || atTime + MAX_DRAW_AGE < block.timestamp) return address(0);
-        uint256 n = _lenAtOf(registryLen, atBlock);
+        uint256 n = _lenAtOf(reg.len, atBlock);
+        bool dirty = _dirty(reg);
         for (uint256 t = 0; t < 2 && n != 0; t++) {
-            bytes32 key = registry[uint256(keccak256(abi.encodePacked(seed, t))) % n];
-            if (key == bytes32(0)) continue;          // a freed slot
+            bytes32 key = _slot(reg, uint256(keccak256(abi.encodePacked(seed, t))) % n, atBlock, dirty);
+            if (key == bytes32(0)) continue;          // a hole
             Ck memory c = _at(key, atBlock);
             if (c.flags & (F_REGISTERED | F_PAUSED | F_BANNED | F_EXITING | F_UNDERSTAKED) == F_REGISTERED
                 && c.blockedUntil <= atTime && !_frozenAt(c, atTime)) return IOracleOwner(metas[key].oracle).owner();
@@ -1070,28 +1313,14 @@ contract ReputationKeeper is Ownable {
         return address(0);
     }
 
-    /// @notice Deprecated (the current aggregator's call): the pick from the live state, which can be
-    ///         steered once the seed is public. Kept until the aggregator passes the request block to
-    ///         poolPayeeAt(seed, atBlock, atTime).
-    function poolPayee(bytes32 seed) external view returns (address) {
-        uint256 n = registry.length;
-        for (uint256 t = 0; t < 2 && n != 0; t++) {
-            bytes32 key = registry[uint256(keccak256(abi.encodePacked(seed, t))) % n];
-            if (key == bytes32(0)) continue;
-            if (_cur(key).flags & (F_REGISTERED | F_PAUSED | F_BANNED | F_EXITING | F_UNDERSTAKED) == F_REGISTERED)
-                return IOracleOwner(metas[key].oracle).owner();
-        }
-        return address(0);
-    }
-
     /// @notice Registered arbiters (exited ones are removed; banned ones stay until they complete their exit)
     function registryLength() external view returns (uint256) {
-        return registry.length - freeRegSlots.length;
+        return reg.live;
     }
 
-    /// @notice Registry slots, freed ones included (what the pool pick draws from)
+    /// @notice Registry slots, holes included (what the pool pick draws from)
     function registrySlots() external view returns (uint256) {
-        return registry.length;
+        return reg.slots.length;
     }
 
     // ================================================================== owner configuration
@@ -1138,6 +1367,12 @@ contract ReputationKeeper is Ownable {
         maxOffenses = _maxOffenses;
         burnPerBlock = _burnPerBlock;
         burnOnBan = _burnOnBan;
+    }
+
+    /// @notice How long an arbiter must be idle before anyone may evict it (at least MIN_EVICT_AFTER).
+    function setEvictAfter(uint40 t) external onlyOwner {
+        if (t < MIN_EVICT_AFTER) revert BadParams();
+        evictAfter = t;
     }
 
     function setSelection(uint16 _shortlist, uint16 _maxScan, uint8 _liveRandom) external onlyOwner {

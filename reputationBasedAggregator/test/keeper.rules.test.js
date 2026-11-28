@@ -254,47 +254,62 @@ describe("ReputationKeeper rules (item 14)", function () {
     });
   });
 
-  describe("slot reuse", () => {
+  describe("dense lists (review 2026-11-27, item 1)", () => {
     async function exit(a) {
       await keeper.requestExit(a.key);
       await time.increase(2 * DAY + 1);
       await keeper.completeExit(a.key);
     }
+    const stats = async (cls = 1) => (await keeper.classStats(cls)).map(Number);
 
-    it("an exited arbiter's slot goes to the next registration, so exits and joins do not grow the list", async () => {
+    it("an exit's hole is closed by moving the last arbiter; its ghost ages out and the list is as long as its arbiters", async () => {
       const slot = await keeper.slotIn(arbs[3].key, 1);
+      const last = arbs[11];
       await exit(arbs[3]);
+      expect(await keeper.slotIn(last.key, 1)).to.equal(slot);    // moved into the hole
+      expect(await stats()).to.deep.equal([12, 11, 1]);            // 12 slots, 11 arbiters, 1 ghost
       expect(await keeper.freeSlotCount(1)).to.equal(1n);
+      expect(await selectedKeys(11)).to.have.members(arbs.filter((x) => x !== arbs[3]).map((x) => x.key));   // each once
       const [fresh] = await H.registerArbiters(core, 1);
-      expect(await keeper.slotIn(fresh.key, 1)).to.equal(slot);
-      expect(await keeper.freeSlotCount(1)).to.equal(0n);
-      expect(await keeper.classSize(1)).to.equal(12n);
-      expect(await selectedKeys(12)).to.include(fresh.key);    // all 12 eligible are drawn
-      // the same key leaving and returning three times, and a join with no free slot
+      expect(await keeper.slotIn(fresh.key, 1)).to.equal(13n);     // behind the ghost
+      await time.increase(DAY + 1);
+      await keeper.compact(1, 8);     // the ghost aged out: its slot is a hole, closed by moving `fresh` (a new ghost)
+      expect(await stats()).to.deep.equal([13, 12, 1]);
+      expect(await keeper.slotIn(fresh.key, 1)).to.equal(12n);
+      await time.increase(DAY + 1);
+      await keeper.compact(1, 8);     // that ghost was the last slot: trimmed
+      expect(await stats()).to.deep.equal([12, 12, 0]);
+      expect(await selectedKeys(12)).to.include(fresh.key);
+      // the same key leaving and returning three times does not grow the list
       const a = arbs[5];
       for (let i = 0; i < 3; i++) {
         await exit(a);
         await keeper.registerArbiter(a.opAddr, a.jobId, H.FEE, [1], a.ch.head);
       }
-      expect(await keeper.classSize(1)).to.equal(12n);
-      await H.registerArbiters(core, 1);
-      expect(await keeper.classSize(1)).to.equal(13n);
+      for (let i = 0; i < 4; i++) {
+        await time.increase(DAY + 1);
+        await keeper.compact(1, 16);
+      }
+      expect(await stats()).to.deep.equal([12, 12, 0]);
     });
 
-    it("a freed slot is skipped by the walk and the beacon pick", async () => {
+    it("holes and ghosts are skipped by the walk and the beacon pick: every arbiter once", async () => {
       for (const a of arbs.slice(0, 6)) await exit(a);
-      expect(await keeper.freeSlotCount(1)).to.equal(6n);
+      expect((await stats())[1]).to.equal(6);
       const keys = await selectedKeys(6);
       expect(new Set(keys).size).to.equal(6);
       expect(keys).to.not.include(ethers.ZeroHash);
       const [bn, ts] = await at();
       const beacons = await keeper.connect(fakeAgg).pickBeacons.staticCall(rndSeed(), 1, bn, ts, 6, H.MAX_FEE);
       expect([...beacons].sort()).to.deep.equal(arbs.slice(6).map((a) => a.key).sort());
+      await time.increase(DAY + 1);
+      await keeper.compact(1, 32);
+      expect(await stats()).to.deep.equal([6, 6, 0]);
     });
 
-    it("a draw at B gives the same jury after slots are freed and reused since B", async () => {
-      // arbs[1] and arbs[2] were exiting at B; after B they leave and three arbiters join, two of them
-      // into the freed slots. Within the draw age limit, selection as of B must not change
+    it("a draw at B gives the same jury after exits, moves and joins since B", async () => {
+      // arbs[1] and arbs[2] were exiting at B; after B they leave (the last arbiters are moved into
+      // their slots) and three arbiters join. Within the draw age limit, selection as of B must not change
       await keeper.requestExit(arbs[1].key);
       await keeper.requestExit(arbs[2].key);
       await time.increase(2 * DAY + 1);
@@ -305,13 +320,13 @@ describe("ReputationKeeper rules (item 14)", function () {
       await keeper.completeExit(arbs[1].key);
       await keeper.completeExit(arbs[2].key);
       const joined = await H.registerArbiters(core, 3);
-      expect(await keeper.freeSlotCount(1)).to.equal(0n);
-      expect(await keeper.classSize(1)).to.equal(13n);
       expect(await selectedKeys(10, seed, B)).to.deep.equal(all);
       expect(await selectedKeys(6, seed, B)).to.deep.equal(some);
       for (const j of joined) expect(all).to.not.include(j.key);
-      // the same seed now sees the joiners
-      expect(await selectedKeys(13, seed)).to.include.members(joined.map((j) => j.key));
+      // the same seed now sees the joiners, and every arbiter once
+      const now = await selectedKeys(13, seed);
+      expect(now).to.include.members(joined.map((j) => j.key));
+      expect(new Set(now).size).to.equal(13);
     });
 
     it("selection refuses a request block older than a day", async () => {

@@ -11,7 +11,7 @@ arbiter node, the operator contract and the scripts.
 
 | Contract | Role |
 |---|---|
-| `ReputationKeeper` | Arbiter registry (and `healthState(key)`, what a node needs to answer its health calls), stake, unbonding, burns, two scores (Table 1 via `applyOutcomes`, −400 for a live, dispatched non-committer when the round failed for lack of commits and at least half of M committed), blocks / bans / 90-day decay (Table 2), hash-chain health calls (each reveal recorded with its block and time), freeze and chain rotation, reputation-weighted selection (the fee weight scored on what the requester pays, item 8) from a bounded walk of the class list in random order, and the beacon pick, and the arbiter pool's pick (`poolPayee`, over a registry of registered arbiters; `registryLength()`). Selection state is checkpointed by block, so a draw reads the state as of the request block (item 9). Answers `isContractApproved`, which every deployed `ArbiterOperator` uses to gate requests |
+| `ReputationKeeper` | Arbiter registry (and `healthState(key)`, what a node needs to answer its health calls), stake, unbonding, burns, two scores (Table 1 via `applyOutcomes`, −400 for a live, dispatched non-committer when the round failed for lack of commits and at least half of M committed), blocks / bans / 90-day decay (Table 2), hash-chain health calls (each reveal recorded with its block and time), freeze and chain rotation, reputation-weighted selection (the fee weight scored on what the requester pays, item 8) from a bounded walk of the class list in random order, and the beacon pick, and the arbiter pool's pick (`poolPayeeAt`, over a registry of registered arbiters; `registryLength()`). Selection state is checkpointed by block, so a draw reads the state as of the request block (item 9). Answers `isContractApproved`, which every deployed `ArbiterOperator` uses to gate requests |
 | `ReputationAggregator` | Two-phase request (escrow at block B; `drawJury` from B+2, seeded by `blockhash(B+1)`, read through EIP-2935 after 256 blocks; 2 x fee draw reward; `sealSeed`, `cancelUnsealed`), the optional beacon stage, M+ / T+ promotion (closes at the M+-th commit or after T+ with at least M; `promote` from C+2 draws M of all commits), late reveals, settlement after the deadline with one batched keeper call, a settlement queue drained by new requests, `getOutcomeScores` (item 11), the requester-set fee floor (item 8), no treasury: a never-promoted round's unspent prepay to its committers (`CommitPayment`), other forfeits to the arbiter pool `ethOwed(address(0))`, an eighth of which goes to one random registered arbiter at each jury draw (`PoolPayment`) |
 | `JuryBeacons` | Item 9's beacon flag, kept out of the aggregator for bytecode: picks 4 beacons through the keeper (which sends each a health call), reads their answers from the keeper, and reports the mix of the first 2 |
 | `ScoringLib` | External library: finalization in one call (v1's length normalization, cluster, mean, quality classes), the promotion draw. One-number answers get the exact 1-D cluster; longer vectors item 10's nearest-neighbour rule, which replaces v1's greedy one |
@@ -39,7 +39,7 @@ network. `deploy.sh` runs the same three tags against `NET` (default `base_sepol
 Tests:
 - `size.test.js`: EIP-170 / 3860 limits.
 - `keeper.rules.test.js`: Tables 1 and 2, decay, burns, unbonding (the 2-day floor), re-registration,
-  slot reuse (a draw at B unchanged by later exits and joins; the 1-day age limit), freeze,
+  dense lists (a draw at B unchanged by later exits, moves and joins; the 1-day age limit), freeze,
   same-second calls, chain rotation, selection (including a back-to-back cartel block against the
   random-sample tails, and a walk that must reach every entry), the operator gate.
 - `aggregator.flow.test.js`:
@@ -103,13 +103,17 @@ timeout), so one deployment serves every class. Local networks get a `MockLinkTo
   offense, so one incident cannot escalate to a ban.
 - **A returning key** (after `completeExit`) keeps its scores and offenses. Its classes come from the
   new registration, since its old slots were freed at the exit.
-- **Exited slots are reused.** `completeExit` frees the arbiter's slot in each of its classes, and the
-  next registration in that class takes it before the list grows, so exits and joins don't lengthen
-  the walk. A freed slot costs the walk ~2k gas, not ~8.5k. A draw still reads the state as of B: the
-  old occupant has been ineligible (exiting) since `requestExit`, at least the unbonding period
-  before its slot was freed, and the new one was not registered at B or was already exiting.
-  `freeSlotCount(cls)` and `slotIn(key, cls)` show the state. A node that dies without exiting holds
-  its slot until its owner or the keeper owner exits it (below).
+- **Lists stay dense, and idle arbiters can be evicted (2026-11-28; review 2026-11-27, item 1).**
+  An exit used to leave a hole in each class list for good, and a walk visits at most `maxScan`
+  slots, holes included: junk keys registered and exited (all stake back after 2 days) thinned every
+  later jury of the class. Now the last listed arbiter is moved into the slot of one that leaves,
+  the move is on record for a day so a draw at B still reads the list as of B, old slots are cleared
+  and the end trimmed (`compact(cls, budget)`, anyone), and anyone may `evict(key)` an arbiter that
+  has been paused, frozen or banned for `evictAfter` (2 days, owner-set, above a day) or is past its
+  `exitAt`. Eviction is no penalty: the arbiter returns when it unpauses or answers. An arbiter
+  registered with head 0 is listed at its first answer. `classStats(cls)`, `isListed(key)`,
+  `slotIn(key, cls)` show the state; `scripts/tidy-classes.js` is the runbook's check. Details and
+  what it does not stop: `docs/contracts/reputation-keeper.md`, "Dense lists and eviction".
 - **Unbonding is 2 days by default, owner-set (`setTiming`), never below 2 days.** A day covers the
   latest draw that can read a B from before the exit, and a day covers that round finishing and
   settling, so its penalties land before the stake is refunded. A new period applies to exits
@@ -215,7 +219,7 @@ timeout), so one deployment serves every class. Local networks get a `MockLinkTo
   credit `ethOwed(address(0))`. Nobody can withdraw it: `withdrawEthFor(address(0))` reverts
   `NotAuthorized`, and `msg.sender` is never address(0). Each `drawJury` that draws a jury pays an
   eighth of it, at most the drawn round's base fees, to one registered arbiter's payee (`PoolPayment`), picked uniformly by the keeper's
-  `poolPayee` from the draw's seed: two picks at most, skipping paused, banned, exiting and
+  `poolPayeeAt` from the draw's seed: two picks at most, skipping paused, banned, exiting and
   understaked arbiters; with none, the pool waits for the next draw. The keeper call gets 80k gas and
   its failure is caught, so it cannot make the draw fail. The seed is fixed by a block hash after the
   request and is the same whoever draws, and a forfeiting round never picks its own winner. But the
@@ -293,7 +297,7 @@ timeout), so one deployment serves every class. Local networks get a `MockLinkTo
 - **Pool shortage.** If fewer than 2 candidates qualify, the round fails with a refund, as for an empty
   jury pool.
 - **Jury shortage after the stage.** If the jury can't be drawn once the values are in, the beacons
-  are paid. The rest is refunded only if selection walks the whole class list (`keeper.scansAll`), so
+  are paid. The rest is refunded only if selection walks the whole class list as of the request block (`keeper.scansAllAt`), so
   the failure did not depend on the seed. Otherwise it goes to the arbiter pool: a beacon could choose by
   its timing between a jury and a refund.
 - **Cost.** The stage costs the requester ~0.39M gas to start. A beacon's answer is an ordinary health

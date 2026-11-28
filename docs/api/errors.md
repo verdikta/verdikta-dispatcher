@@ -99,6 +99,7 @@ These are declared in the libraries. The aggregator's inputs never trigger the g
 |-------|---------|---------|
 | `NotAuthorizedResponder()` | `answerHealthCall`, `rotateChain` or `requestHealthCall` from neither the operator's `owner()` nor an address for which the operator's `isAuthorizedSender` returns true (or that call reverts) | Send from the node's authorized key |
 | `BadPreimage()` | `rotateChain(key, preimage, newHead)` with `newHead != preimage` and a `preimage` that does not hash to the head | A rotation needs a valid answer. An invalid value with `newHead == preimage`, or `answerHealthCall` with one, re-syncs the chain instead of reverting |
+| `NotEvictable()` | `evict(key)` for a key that is not in its class lists, or that has not been paused, frozen or banned for `evictAfter` and is not past its `exitAt` | Wait until it is idle that long (`scripts/tidy-classes.js` lists the keys that are) |
 
 ### Selection and Outcomes (approved contracts only)
 

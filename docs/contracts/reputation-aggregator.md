@@ -205,7 +205,7 @@ function cancelUnsealed(bytes32 aggId) external
 
     One operator can then hold several slots, or every slot. Each slot is paid, committed, revealed and scored separately, and a Q-of-N rule over `getOutcomeScores` counts slots, not distinct arbiters. Selection fails (`NoEligibleArbiters`) only when it finds none.
 - If the keeper finds no eligible arbiter, the round fails (phase 8, `EvaluationFailed(aggId, 1)`). The prepay is refunded, since no jury could be drawn and so the refund is no re-roll.
-    - After a beacon stage, the refund goes to the requester only if the selection walk covers the whole class list (`keeper.scansAll(cls)`). Otherwise it goes to the arbiter pool, because the failure could depend on the beacon seed.
+    - After a beacon stage, the refund goes to the requester only if the selection walk covers the whole class list as of the request block (`keeper.scansAllAt(cls, B)`). Otherwise it goes to the arbiter pool, because the failure could depend on the beacon seed.
 - If the beacon stage finds fewer beacon candidates than the quorum, the round fails at the first call and is refunded.
 - **Arbiter pool payout:** a call that draws a jury also pays an eighth of the [arbiter pool](#the-arbiter-pool), at most that draw's base fees, to one registered arbiter's payee (`PoolPayment`). The first call of a beacon round and a failed draw pay nothing from the pool.
 - **Draw reward:** `eff × drawRewardFees()` (2 fees) is credited to the caller. Within `requesterDrawPriority()` (30 s) of the request, or of the quorum-th beacon value, only the requester earns it; a third party that draws in that time earns nothing. After it, whoever draws earns it. The first call of a beacon round earns no reward.
@@ -759,7 +759,7 @@ With the defaults (bonus 3, draw 2, promote 1, quorum 2) that is `juror × (K + 
 |---------------------|------------------------|------|
 | Finalized | the requester | at finalization |
 | No eligible arbiter, or fewer beacon candidates than the quorum | the requester | at the draw |
-| Draw failed after a beacon stage, and `keeper.scansAll(cls)` is false | the arbiter pool | at the draw |
+| Draw failed after a beacon stage, and `keeper.scansAllAt(cls, B)` is false | the arbiter pool | at the draw |
 | Beacon quorum missed | the arbiter pool | at the second `drawJury` |
 | Commit phase with fewer than M commits | the requester | at settlement |
 | M commits but never promoted (closed and not promoted, or not closed after T+) | the slots that committed, in equal shares (`CommitPayment`); the remainder of under one wei per committer to the arbiter pool | at settlement |
@@ -773,7 +773,7 @@ Each credit of the rest emits `RequesterRefunded(aggId, to, amount)` when the am
 The pool replaces the treasury of earlier v2 drafts (v1 had neither). It is the ledger entry `ethOwed(address(0))`, and no address can withdraw it. It is paid out at draws:
 
 - every `drawJury` that draws a jury pays `min(ethOwed(address(0)) / 8, the draw's base fees)` to one registered arbiter (`PoolPayment(aggId, payee, amount)`);
-- the keeper's `poolPayee(seed)` picks the arbiter uniformly from the draw's seed and returns its payee, its operator's `owner()`;
+- the keeper's `poolPayeeAt(seed, B, time of B)` picks the arbiter uniformly from the draw's seed and returns its payee, its operator's `owner()`;
 - it makes at most two picks and skips arbiters that are paused, banned, exiting or understaked; if both miss, nobody is paid and the pool waits for the next draw;
 - the keeper call is capped at 80,000 gas and its failure is caught, so it can never make the draw fail.
 
